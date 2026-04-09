@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/blew",
+    "crates/tauri-plugin-blew",
+]
+resolver = "2"

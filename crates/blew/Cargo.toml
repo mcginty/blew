@@ -1,0 +1,66 @@
+[package]
+name = "blew"
+version = "0.1.0-alpha.1"
+edition = "2024"
+authors = ["Jake McGinty <me@jakebot.org>"]
+license = "AGPL-3.0-or-later"
+description = "Cross-platform async BLE library for Rust (Apple, Linux, Android)"
+repository = "https://github.com/mcginty/blew"
+keywords = ["bluetooth", "ble", "gatt", "l2cap"]
+categories = ["hardware-support", "network-programming"]
+
+[features]
+testing = []
+
+[dependencies]
+uuid = { version = "1", features = ["v4"] }
+bitflags = "2"
+thiserror = "2"
+tracing = "0.1"
+tokio = { version = "1", features = [
+    "sync",
+    "rt",
+    "io-util",
+    "macros",
+    "time",
+] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-core = "0.3"
+bytes = "1"
+parking_lot = "0.12"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSData",
+    "NSString",
+    "NSUUID",
+    "NSArray",
+    "NSDictionary",
+    "NSObject",
+    "NSError",
+    "NSValue",
+    "NSStream",
+] }
+objc2-core-bluetooth = "0.3"
+dispatch2 = { version = "0.3", features = ["alloc", "objc2"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bluer = { version = "0.17", features = ["full"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.22"
+ndk-context = "0.1"
+serde_json = "1"
+
+[lints.clippy]
+unseparated_literal_suffix = "warn"
+pedantic = { level = "warn", priority = -1 }
+doc_markdown = "allow"
+used_underscore_items = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+default_trait_access = "allow"

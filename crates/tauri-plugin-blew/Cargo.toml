@@ -1,0 +1,23 @@
+[package]
+name = "tauri-plugin-blew"
+version = "0.1.0-alpha.1"
+edition = "2021"
+authors = ["Jake McGinty <me@jakebot.org>"]
+license = "AGPL-3.0-or-later"
+description = "Tauri plugin for Android BLE setup via blew"
+repository = "https://github.com/mcginty/blew"
+links = "tauri-plugin-blew"
+keywords = ["bluetooth", "ble", "gatt", "l2cap", "tauri", "plugin"]
+categories = ["hardware-support", "network-programming"]
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }
+
+[dependencies]
+tauri = "2"
+tracing = "0.1"
+
+[target.'cfg(target_os = "android")'.dependencies]
+blew = { path = "../blew" }
+jni = "0.22"
+ndk-context = "0.1"
