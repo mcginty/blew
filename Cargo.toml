@@ -1,6 +1,7 @@
 [workspace]
-members = [
-    "crates/blew",
-    "crates/tauri-plugin-blew",
-]
+members = ["crates/blew", "crates/tauri-plugin-blew"]
 resolver = "2"
+
+[workspace.metadata.release]
+tag-message = "{{crate_name}}: release {{version}}"
+pre-release-commit-message = "{{crate_name}}: release {{version}}"
