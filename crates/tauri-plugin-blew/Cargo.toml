@@ -7,7 +7,7 @@ license = "AGPL-3.0-or-later"
 description = "Tauri plugin for the blew BLE library"
 repository = "https://github.com/mcginty/blew"
 links = "tauri-plugin-blew"
-keywords = ["bluetooth", "ble", "gatt", "l2cap", "tauri", "plugin"]
+keywords = ["bluetooth", "ble", "gatt", "l2cap", "tauri"]
 categories = ["hardware-support", "network-programming"]
 
 [build-dependencies]
