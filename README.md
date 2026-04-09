@@ -1,5 +1,7 @@
-[![Crates.io](https://img.shields.io/crates/v/blew.svg)](https://crates.io/crates/blew)
-[![Docs.rs](https://docs.rs/blew/badge.svg)](https://docs.rs/blew)
+[![blew Crates.io](https://img.shields.io/crates/v/blew?label=blew)](https://crates.io/crates/blew)
+[![tauri-plugin-blew Crates.io](https://img.shields.io/crates/v/tauri-plugin-blew?label=tauri-plugin-blew)](https://crates.io/crates/tauri-plugin-blew)
+[![blew Docs.rs](https://img.shields.io/docsrs/blew?label=blew%20docs)](https://docs.rs/blew)
+[![tauri-plugin-blew Docs.rs](https://img.shields.io/docsrs/tauri-plugin-blew?label=tauri-plugin-blew%20docs)](https://docs.rs/tauri-plugin-blew)
 
 # `blew` (and `tauri-plugin-blew`)
 
