@@ -9,6 +9,7 @@ cargo-binstall = "latest"
 "cargo:cargo-deny" = "latest"
 "cargo:cargo-nextest" = "latest"
 ktlint = "latest"
+"cargo:cargo-release" = "latest"
 
 [tasks.build]
 description = "Build all crates"
