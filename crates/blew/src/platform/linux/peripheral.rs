@@ -221,11 +221,11 @@ impl PeripheralBackend for LinuxPeripheral {
         let event_tx_clone = Arc::clone(&event_tx);
         let adapter_clone = adapter.clone();
         let adapter_task = tokio::spawn(async move {
+            use tokio_stream::StreamExt as _;
             let Ok(events) = adapter_clone.events().await else {
                 warn!("failed to subscribe to adapter events");
                 return;
             };
-            use tokio_stream::StreamExt as _;
             let mut events = Box::pin(events);
             while let Some(event) = events.next().await {
                 if let bluer::AdapterEvent::PropertyChanged(bluer::AdapterProperty::Powered(

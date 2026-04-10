@@ -26,7 +26,7 @@ struct CentralInner {
     event_fanout: EventFanout<CentralEvent>,
     scan_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     notify_tasks: Mutex<HashMap<(DeviceId, Uuid), tokio::task::JoinHandle<()>>>,
-    _adapter_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    adapter_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 pub struct LinuxCentral(Arc<CentralInner>);
@@ -138,7 +138,7 @@ impl CentralBackend for LinuxCentral {
             event_fanout,
             scan_task: Mutex::new(None),
             notify_tasks: Mutex::new(HashMap::new()),
-            _adapter_task: Mutex::new(None),
+            adapter_task: Mutex::new(None),
         });
         let inner_clone = Arc::clone(&inner);
         let adapter_task = tokio::spawn(async move {
@@ -158,7 +158,7 @@ impl CentralBackend for LinuxCentral {
                 }
             }
         });
-        *inner._adapter_task.lock().unwrap() = Some(adapter_task);
+        *inner.adapter_task.lock().unwrap() = Some(adapter_task);
         Ok(LinuxCentral(inner))
     }
 
