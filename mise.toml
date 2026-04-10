@@ -17,7 +17,7 @@ run = "cargo build"
 
 [tasks.check]
 description = "Type-check all crates (no codegen)"
-run = "cargo check --workspace"
+run = "cargo check --workspace --all-targets"
 
 [tasks.lint]
 description = "Run clippy and ktlint on all code"
