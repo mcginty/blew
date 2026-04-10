@@ -8,6 +8,8 @@ use uuid::Uuid;
 /// when fanning out to multiple subscribers.
 #[derive(Debug, Clone)]
 pub enum CentralEvent {
+    /// The local Bluetooth adapter was powered on or off.
+    AdapterStateChanged { powered: bool },
     /// A new peripheral was discovered or its advertising data was updated.
     DeviceDiscovered(BleDevice),
     /// A connection to a peripheral was established.

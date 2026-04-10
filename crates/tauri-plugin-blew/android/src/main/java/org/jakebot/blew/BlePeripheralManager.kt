@@ -6,7 +6,10 @@ import android.bluetooth.le.AdvertiseCallback
 import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
 import android.bluetooth.le.BluetoothLeAdvertiser
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.Build
 import android.os.ParcelUuid
 import android.util.Log
@@ -136,6 +139,22 @@ object BlePeripheralManager {
     @JvmStatic
     external fun nativeOnL2capChannelClosed(socketId: Int)
 
+    private val adapterStateReceiver =
+        object : BroadcastReceiver() {
+            override fun onReceive(
+                context: Context,
+                intent: Intent,
+            ) {
+                if (intent.action == BluetoothAdapter.ACTION_STATE_CHANGED) {
+                    val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
+                    when (state) {
+                        BluetoothAdapter.STATE_ON -> nativeOnAdapterStateChanged(true)
+                        BluetoothAdapter.STATE_OFF -> nativeOnAdapterStateChanged(false)
+                    }
+                }
+            }
+        }
+
     fun init(ctx: Context) {
         context = ctx
         bluetoothManager = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
@@ -144,6 +163,8 @@ object BlePeripheralManager {
             advertiser = adapter.bluetoothLeAdvertiser
         }
         Log.d(TAG, "initialized, adapter=${adapter != null}, advertiser=${advertiser != null}")
+        val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+        ctx.registerReceiver(adapterStateReceiver, filter)
     }
 
     private val gattCallback =

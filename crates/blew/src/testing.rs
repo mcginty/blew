@@ -97,12 +97,15 @@ impl MockLink {
         let (central_event_tx, central_event_rx) = mpsc::unbounded_channel();
         let (periph_event_tx, periph_event_rx) = mpsc::unbounded_channel();
 
+        let _ = central_event_tx.send(CentralEvent::AdapterStateChanged { powered: true });
+
         let central = MockCentral {
             link: Arc::clone(&link),
             event_tx: central_event_tx.clone(),
             _event_rx: Mutex::new(Some(periph_event_tx.clone())),
             central_rx: Mutex::new(Some(central_event_rx)),
             periph_event_tx,
+            powered: Mutex::new(true),
         };
 
         let peripheral = MockPeripheral {
@@ -133,6 +136,7 @@ pub struct MockCentral {
     _event_rx: Mutex<Option<mpsc::UnboundedSender<PeripheralEvent>>>,
     central_rx: Mutex<Option<mpsc::UnboundedReceiver<CentralEvent>>>,
     periph_event_tx: mpsc::UnboundedSender<PeripheralEvent>,
+    powered: Mutex<bool>,
 }
 
 impl backend::private::Sealed for MockCentral {}
@@ -531,6 +535,11 @@ mod tests {
             .unwrap();
 
         let mut events = central.events();
+        // Drain the initial AdapterStateChanged event emitted on construction.
+        assert!(matches!(
+            events.next().await.unwrap(),
+            CentralEvent::AdapterStateChanged { powered: true }
+        ));
         central.start_scan(ScanFilter::default()).await.unwrap();
 
         let event = events.next().await.expect("should get discovery event");
@@ -550,6 +559,11 @@ mod tests {
         let _peripheral = Peripheral::from_backend(p.peripheral);
 
         let mut events = central.events();
+        // Drain the initial AdapterStateChanged event emitted on construction.
+        assert!(matches!(
+            events.next().await.unwrap(),
+            CentralEvent::AdapterStateChanged { powered: true }
+        ));
         let device_id = DeviceId::from("mock-peripheral");
 
         central.connect(&device_id).await.unwrap();
@@ -735,6 +749,11 @@ mod tests {
         let device_id = DeviceId::from("mock-peripheral");
 
         let mut events = central.events();
+        // Drain the initial AdapterStateChanged event emitted on construction.
+        assert!(matches!(
+            events.next().await.unwrap(),
+            CentralEvent::AdapterStateChanged { powered: true }
+        ));
         central
             .subscribe_characteristic(&device_id, char_uuid)
             .await
@@ -958,6 +977,11 @@ mod tests {
 
         let char_uuid = Uuid::from_u128(0x8888);
         let mut events = central.events();
+        // Drain the initial AdapterStateChanged event emitted on construction.
+        assert!(matches!(
+            events.next().await.unwrap(),
+            CentralEvent::AdapterStateChanged { powered: true }
+        ));
 
         peripheral
             .notify_characteristic(char_uuid, b"too-early".to_vec())
@@ -1034,7 +1058,9 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_millis(50), events.next()).await;
 
         match result {
-            Err(_) | Ok(Some(CentralEvent::DeviceDisconnected { .. })) => {}
+            Err(_)
+            | Ok(Some(CentralEvent::DeviceDisconnected { .. }))
+            | Ok(Some(CentralEvent::AdapterStateChanged { .. })) => {}
             Ok(Some(CentralEvent::CharacteristicNotification { .. })) => {
                 panic!("notification should not arrive after disconnect");
             }
@@ -1137,6 +1163,11 @@ mod tests {
         let device_id = DeviceId::from("mock-peripheral");
 
         let mut events = central.events();
+        // Drain the initial AdapterStateChanged event emitted on construction.
+        assert!(matches!(
+            events.next().await.unwrap(),
+            CentralEvent::AdapterStateChanged { powered: true }
+        ));
         central
             .subscribe_characteristic(&device_id, char_uuid)
             .await
@@ -1220,5 +1251,16 @@ mod tests {
             .open_l2cap_channel(&device_id, crate::l2cap::types::Psm(0x1001))
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_central_emits_adapter_state_on_init() {
+        let (central_ep, _periph_ep) = MockLink::pair();
+        let central: crate::Central<_> = crate::Central::from_backend(central_ep.central);
+        let mut events = central.events();
+        match events.next().await {
+            Some(CentralEvent::AdapterStateChanged { powered: true }) => {}
+            other => panic!("expected AdapterStateChanged(powered=true), got {other:?}"),
+        }
     }
 }

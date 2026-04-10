@@ -26,6 +26,7 @@ struct CentralInner {
     event_fanout: EventFanout<CentralEvent>,
     scan_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     notify_tasks: Mutex<HashMap<(DeviceId, Uuid), tokio::task::JoinHandle<()>>>,
+    _adapter_task: tokio::task::JoinHandle<()>,
 }
 
 pub struct LinuxCentral(Arc<CentralInner>);
@@ -129,6 +130,23 @@ impl CentralBackend for LinuxCentral {
 
         check_bluez_config();
         let (event_tx, event_fanout) = EventFanout::new(64);
+        let event_tx_clone = event_tx.clone();
+        let adapter_clone = adapter.clone();
+        let adapter_task = tokio::spawn(async move {
+            let Ok(events) = adapter_clone.events().await else {
+                warn!("failed to subscribe to adapter events");
+                return;
+            };
+            let mut events = Box::pin(events);
+            while let Some(event) = events.next().await {
+                if let AdapterEvent::PropertyChanged(bluer::AdapterProperty::Powered(powered)) =
+                    event
+                {
+                    debug!(powered, "central adapter state changed");
+                    event_tx_clone.send(CentralEvent::AdapterStateChanged { powered });
+                }
+            }
+        });
         Ok(LinuxCentral(Arc::new(CentralInner {
             _session: session,
             adapter,
@@ -137,6 +155,7 @@ impl CentralBackend for LinuxCentral {
             event_fanout,
             scan_task: Mutex::new(None),
             notify_tasks: Mutex::new(HashMap::new()),
+            _adapter_task: adapter_task,
         })))
     }
 

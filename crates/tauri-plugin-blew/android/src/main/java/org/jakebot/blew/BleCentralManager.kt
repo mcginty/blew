@@ -6,7 +6,10 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.ParcelUuid
 import android.util.Log
 import java.util.UUID
@@ -126,6 +129,9 @@ object BleCentralManager {
         mtu: Int,
     )
 
+    @JvmStatic
+    external fun nativeOnAdapterStateChanged(powered: Boolean)
+
     // ── L2CAP JNI hooks ──
 
     @JvmStatic
@@ -150,11 +156,29 @@ object BleCentralManager {
         errorMessage: String,
     )
 
+    private val adapterStateReceiver =
+        object : BroadcastReceiver() {
+            override fun onReceive(
+                context: Context,
+                intent: Intent,
+            ) {
+                if (intent.action == BluetoothAdapter.ACTION_STATE_CHANGED) {
+                    val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
+                    when (state) {
+                        BluetoothAdapter.STATE_ON -> nativeOnAdapterStateChanged(true)
+                        BluetoothAdapter.STATE_OFF -> nativeOnAdapterStateChanged(false)
+                    }
+                }
+            }
+        }
+
     fun init(ctx: Context) {
         context = ctx
         bluetoothManager = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
         adapter = bluetoothManager?.adapter
         Log.d(TAG, "initialized, adapter=${adapter != null}")
+        val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+        ctx.registerReceiver(adapterStateReceiver, filter)
     }
 
     // ── GATT operation serialization helpers ──

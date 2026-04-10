@@ -142,7 +142,9 @@ define_class!(
         unsafe fn centralManagerDidUpdateState(&self, central: &CBCentralManager) {
             let powered = central.state() == CBManagerState::PoweredOn;
             debug!(powered, "central adapter state changed");
-            let _ = self.ivars().powered_tx.send(powered);
+            let inner = self.ivars();
+            let _ = inner.powered_tx.send(powered);
+            inner.emit(CentralEvent::AdapterStateChanged { powered });
         }
 
         #[unsafe(method(centralManager:didDiscoverPeripheral:advertisementData:RSSI:))]

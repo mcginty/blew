@@ -256,6 +256,21 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnAdap
 // Central hooks (called from BleCentralManager.kt)
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnAdapterStateChanged(
+    _env: EnvUnowned,
+    _class: JClass,
+    powered: jboolean,
+) {
+    trace!(
+        powered = powered == JNI_TRUE,
+        "central adapter state changed"
+    );
+    super::central::send_event(CentralEvent::AdapterStateChanged {
+        powered: powered == JNI_TRUE,
+    });
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnDeviceDiscovered(
     mut env: EnvUnowned,
     _class: JClass,

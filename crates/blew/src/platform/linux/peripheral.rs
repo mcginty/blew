@@ -33,7 +33,8 @@ struct PeripheralInner {
     adv_handle: Mutex<Option<bluer::adv::AdvertisementHandle>>,
     app_handle: Mutex<Option<ApplicationHandle>>,
     notifiers: Mutex<HashMap<Uuid, Vec<SharedNotifier>>>,
-    event_tx: Mutex<Option<mpsc::UnboundedSender<PeripheralEvent>>>,
+    event_tx: Arc<Mutex<Option<mpsc::UnboundedSender<PeripheralEvent>>>>,
+    _adapter_task: tokio::task::JoinHandle<()>,
 }
 
 pub struct LinuxPeripheral(Arc<PeripheralInner>);
@@ -215,6 +216,30 @@ impl PeripheralBackend for LinuxPeripheral {
             .await
             .map_err(|_| BlewError::AdapterNotFound)?;
         debug!(adapter = %adapter.name(), "BLE adapter initialized");
+        let event_tx: Arc<Mutex<Option<mpsc::UnboundedSender<PeripheralEvent>>>> =
+            Arc::new(Mutex::new(None));
+        let event_tx_clone = Arc::clone(&event_tx);
+        let adapter_clone = adapter.clone();
+        let adapter_task = tokio::spawn(async move {
+            let Ok(events) = adapter_clone.events().await else {
+                warn!("failed to subscribe to adapter events");
+                return;
+            };
+            use tokio_stream::StreamExt as _;
+            let mut events = Box::pin(events);
+            while let Some(event) = events.next().await {
+                if let bluer::AdapterEvent::PropertyChanged(bluer::AdapterProperty::Powered(
+                    powered,
+                )) = event
+                {
+                    debug!(powered, "peripheral adapter state changed");
+                    let guard = event_tx_clone.lock().unwrap();
+                    if let Some(tx) = guard.as_ref() {
+                        let _ = tx.send(PeripheralEvent::AdapterStateChanged { powered });
+                    }
+                }
+            }
+        });
         Ok(LinuxPeripheral(Arc::new(PeripheralInner {
             _session: session,
             adapter,
@@ -222,7 +247,8 @@ impl PeripheralBackend for LinuxPeripheral {
             adv_handle: Mutex::new(None),
             app_handle: Mutex::new(None),
             notifiers: Mutex::new(HashMap::new()),
-            event_tx: Mutex::new(None),
+            event_tx,
+            _adapter_task: adapter_task,
         })))
     }
 
