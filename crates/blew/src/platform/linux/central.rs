@@ -26,7 +26,7 @@ struct CentralInner {
     event_fanout: EventFanout<CentralEvent>,
     scan_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     notify_tasks: Mutex<HashMap<(DeviceId, Uuid), tokio::task::JoinHandle<()>>>,
-    _adapter_task: tokio::task::JoinHandle<()>,
+    _adapter_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 pub struct LinuxCentral(Arc<CentralInner>);
@@ -130,10 +130,19 @@ impl CentralBackend for LinuxCentral {
 
         check_bluez_config();
         let (event_tx, event_fanout) = EventFanout::new(64);
-        let event_tx_clone = event_tx.clone();
-        let adapter_clone = adapter.clone();
+        let inner = Arc::new(CentralInner {
+            _session: session,
+            adapter,
+            discovered: Mutex::new(HashMap::new()),
+            event_tx,
+            event_fanout,
+            scan_task: Mutex::new(None),
+            notify_tasks: Mutex::new(HashMap::new()),
+            _adapter_task: Mutex::new(None),
+        });
+        let inner_clone = Arc::clone(&inner);
         let adapter_task = tokio::spawn(async move {
-            let Ok(events) = adapter_clone.events().await else {
+            let Ok(events) = inner_clone.adapter.events().await else {
                 warn!("failed to subscribe to adapter events");
                 return;
             };
@@ -143,20 +152,14 @@ impl CentralBackend for LinuxCentral {
                     event
                 {
                     debug!(powered, "central adapter state changed");
-                    event_tx_clone.send(CentralEvent::AdapterStateChanged { powered });
+                    inner_clone
+                        .event_tx
+                        .send(CentralEvent::AdapterStateChanged { powered });
                 }
             }
         });
-        Ok(LinuxCentral(Arc::new(CentralInner {
-            _session: session,
-            adapter,
-            discovered: Mutex::new(HashMap::new()),
-            event_tx,
-            event_fanout,
-            scan_task: Mutex::new(None),
-            notify_tasks: Mutex::new(HashMap::new()),
-            _adapter_task: adapter_task,
-        })))
+        *inner._adapter_task.lock().unwrap() = Some(adapter_task);
+        Ok(LinuxCentral(inner))
     }
 
     fn is_powered(&self) -> impl Future<Output = BlewResult<bool>> + Send {
