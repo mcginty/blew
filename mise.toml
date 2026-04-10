@@ -53,6 +53,10 @@ run = "cargo deny check"
 
 # --- CI ---------------------------------------------------------------
 
+[tasks.ci]
+description = "Run all the checks that CI would run"
+depends = ["lint", "fmt:check", "deny", "test"]
+
 [tasks."ci:lint"]
 description = "Run clippy on all crates"
 run = "cargo clippy --workspace -- -D warnings"
