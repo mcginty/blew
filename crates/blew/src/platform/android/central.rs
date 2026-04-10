@@ -190,6 +190,22 @@ impl CentralBackend for AndroidCentral {
         }
     }
 
+    fn is_powered(&self) -> impl Future<Output = BlewResult<bool>> + Send {
+        async {
+            jvm()
+                .attach_current_thread(|env| {
+                    let result = env.call_static_method(
+                        central_class(),
+                        jni_str!("isPowered"),
+                        jni_sig!("()Z"),
+                        &[],
+                    )?;
+                    Ok(result.z()?)
+                })
+                .map_err(jni_err)
+        }
+    }
+
     fn start_scan(&self, filter: ScanFilter) -> impl Future<Output = BlewResult<()>> + Send {
         async move {
             let low_power = filter.mode == crate::central::types::ScanMode::LowPower;

@@ -37,6 +37,11 @@ impl<B: CentralBackend> Central<B> {
         })
     }
 
+    /// Returns `true` if the local Bluetooth adapter is powered on.
+    pub async fn is_powered(&self) -> BlewResult<bool> {
+        self.backend.is_powered().await
+    }
+
     /// Start scanning for peripherals matching `filter`.
     /// Discovered devices are emitted on the stream returned by [`events`](Self::events).
     pub async fn start_scan(&self, filter: ScanFilter) -> BlewResult<()> {

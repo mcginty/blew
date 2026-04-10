@@ -536,6 +536,14 @@ impl CentralBackend for AppleCentral {
         })))
     }
 
+    fn is_powered(&self) -> impl Future<Output = BlewResult<bool>> + Send {
+        let handle = Arc::clone(&self.0);
+        async move {
+            let state = unsafe { handle.manager.state() };
+            Ok(state == CBManagerState::PoweredOn)
+        }
+    }
+
     fn start_scan(&self, filter: ScanFilter) -> impl Future<Output = BlewResult<()>> + Send {
         let handle = Arc::clone(&self.0);
         async move {

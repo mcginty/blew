@@ -159,6 +159,19 @@ impl CentralBackend for LinuxCentral {
         })))
     }
 
+    fn is_powered(&self) -> impl Future<Output = BlewResult<bool>> + Send {
+        let handle = Arc::clone(&self.0);
+        async move {
+            handle
+                .adapter
+                .is_powered()
+                .await
+                .map_err(|e| BlewError::Central {
+                    source: Box::new(e),
+                })
+        }
+    }
+
     fn start_scan(&self, filter: ScanFilter) -> impl Future<Output = BlewResult<()>> + Send {
         let handle = Arc::clone(&self.0);
         async move {

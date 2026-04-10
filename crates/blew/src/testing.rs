@@ -151,6 +151,11 @@ impl CentralBackend for MockCentral {
         Err(BlewError::Internal("use MockLink::pair() instead".into()))
     }
 
+    fn is_powered(&self) -> impl Future<Output = BlewResult<bool>> + Send {
+        let powered = *self.powered.lock().unwrap();
+        async move { Ok(powered) }
+    }
+
     fn start_scan(&self, _filter: ScanFilter) -> impl Future<Output = BlewResult<()>> + Send {
         let link = self.link.lock().unwrap();
         let advertising = link.advertising;

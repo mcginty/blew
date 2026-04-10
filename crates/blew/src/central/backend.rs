@@ -27,6 +27,9 @@ pub trait CentralBackend: private::Sealed + Send + Sync + 'static {
     where
         Self: Sized;
 
+    /// Returns `true` if the local Bluetooth adapter is powered on.
+    fn is_powered(&self) -> impl Future<Output = BlewResult<bool>> + Send;
+
     /// Start scanning; discovered devices arrive on the event stream.
     fn start_scan(&self, filter: ScanFilter) -> impl Future<Output = BlewResult<()>> + Send;
 

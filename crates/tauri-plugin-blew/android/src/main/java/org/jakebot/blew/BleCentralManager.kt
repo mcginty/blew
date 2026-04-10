@@ -553,6 +553,9 @@ object BleCentralManager {
     }
 
     @JvmStatic
+    fun isPowered(): Boolean = adapter?.isEnabled == true
+
+    @JvmStatic
     fun getMtu(deviceAddr: String): Int = mtuMap[deviceAddr] ?: 23
 
     // ── L2CAP ──
