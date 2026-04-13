@@ -27,7 +27,8 @@ pub mod testing;
 pub mod types;
 pub mod util;
 
-pub use central::Central;
+pub use central::{Central, CentralConfig, DisconnectCause};
 pub use error::{BlewError, BlewResult};
+pub use l2cap::L2capChannel;
 pub use peripheral::Peripheral;
 pub use types::{BleDevice, DeviceId};

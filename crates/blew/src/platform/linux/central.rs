@@ -1,5 +1,5 @@
 use crate::central::backend::{self, CentralBackend};
-use crate::central::types::{CentralEvent, ScanFilter, WriteType};
+use crate::central::types::{CentralConfig, CentralEvent, DisconnectCause, ScanFilter, WriteType};
 use crate::error::{BlewError, BlewResult};
 use crate::gatt::props::{AttributePermissions, CharacteristicProperties};
 use crate::gatt::service::{GattCharacteristic, GattService};
@@ -30,6 +30,12 @@ struct CentralInner {
 }
 
 pub struct LinuxCentral(Arc<CentralInner>);
+
+impl LinuxCentral {
+    pub async fn with_config(_config: CentralConfig) -> crate::error::BlewResult<Self> {
+        Self::new().await
+    }
+}
 
 impl backend::private::Sealed for LinuxCentral {}
 
@@ -261,9 +267,14 @@ impl CentralBackend for LinuxCentral {
                             let device_id = DeviceId(addr.to_string());
                             debug!(device_id = %device_id, "device removed");
                             handle.discovered.lock().unwrap().remove(&device_id);
+                            let cause = if handle.adapter.is_powered().await.unwrap_or(true) {
+                                DisconnectCause::LinkLoss
+                            } else {
+                                DisconnectCause::AdapterOff
+                            };
                             handle
                                 .event_tx
-                                .send(CentralEvent::DeviceDisconnected { device_id });
+                                .send(CentralEvent::DeviceDisconnected { device_id, cause });
                         }
                         AdapterEvent::PropertyChanged(_) => {}
                     }
@@ -338,9 +349,10 @@ impl CentralBackend for LinuxCentral {
                 source: Box::new(e),
             })?;
             debug!(device_id = %device_id, "device disconnected");
-            handle
-                .event_tx
-                .send(CentralEvent::DeviceDisconnected { device_id });
+            handle.event_tx.send(CentralEvent::DeviceDisconnected {
+                device_id,
+                cause: DisconnectCause::LocalClose,
+            });
             Ok(())
         }
     }

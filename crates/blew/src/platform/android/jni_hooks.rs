@@ -11,7 +11,7 @@ use tokio::sync::oneshot;
 use tracing::trace;
 use uuid::Uuid;
 
-use crate::central::types::CentralEvent;
+use crate::central::types::{CentralEvent, DisconnectCause};
 use crate::l2cap::types::Psm;
 use crate::peripheral::types::{PeripheralEvent, ReadResponder, WriteResponder};
 use crate::types::{BleDevice, DeviceId};
@@ -314,6 +314,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnConnect
     _class: JClass,
     device_addr: JString,
     connected: jboolean,
+    gatt_status: jint,
 ) {
     env.with_env(|env| {
         let Some(addr) = jstring_to_string(env, &device_addr) else {
@@ -336,8 +337,17 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnConnect
                 &addr,
                 Err(crate::error::BlewError::NotConnected(device_id.clone())),
             );
+            let cause = match gatt_status {
+                0 => DisconnectCause::LocalClose, // GATT_SUCCESS + local disconnect
+                8 => DisconnectCause::LinkLoss,   // GATT_CONN_TIMEOUT
+                19 => DisconnectCause::RemoteClose, // GATT_CONN_TERMINATE_PEER_USER
+                22 => DisconnectCause::LocalClose, // GATT_CONN_TERMINATE_LOCAL_HOST
+                133 => DisconnectCause::Gatt133,  // the infamous
+                other => DisconnectCause::Unknown(other),
+            };
             super::central::send_event(CentralEvent::DeviceDisconnected {
                 device_id: device_id.clone(),
+                cause,
             });
         }
 

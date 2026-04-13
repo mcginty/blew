@@ -2,6 +2,34 @@ use crate::types::{BleDevice, DeviceId};
 use bytes::Bytes;
 use uuid::Uuid;
 
+/// Configuration for initialising the central role.
+#[derive(Debug, Clone, Default)]
+pub struct CentralConfig {
+    /// On Apple platforms, passed as `CBCentralManagerOptionRestoreIdentifierKey` to
+    /// `initWithDelegate:queue:options:`, enabling state restoration for the app's
+    /// background BLE central session. Ignored on all other platforms.
+    pub restore_identifier: Option<String>,
+}
+
+/// Reason a peripheral disconnected. Used by [`CentralEvent::DeviceDisconnected`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DisconnectCause {
+    /// We called `disconnect()` locally.
+    LocalClose,
+    /// Peer sent LL_TERMINATE.
+    RemoteClose,
+    /// Supervision timeout (link loss).
+    LinkLoss,
+    /// Bluetooth adapter powered off.
+    AdapterOff,
+    /// Android `onConnectionStateChange` status 133.
+    Gatt133,
+    /// Connection setup timed out.
+    Timeout,
+    /// Platform-specific code we don't map to any category above.
+    Unknown(i32),
+}
+
 /// Events emitted by the central (scanner/client) role.
 ///
 /// `CentralEvent` is `Clone`; notification payloads use [`Bytes`] to avoid copies
@@ -15,13 +43,18 @@ pub enum CentralEvent {
     /// A connection to a peripheral was established.
     DeviceConnected { device_id: DeviceId },
     /// A peripheral disconnected.
-    DeviceDisconnected { device_id: DeviceId },
+    DeviceDisconnected {
+        device_id: DeviceId,
+        cause: DisconnectCause,
+    },
     /// A subscribed characteristic sent a notification or indication.
     CharacteristicNotification {
         device_id: DeviceId,
         char_uuid: Uuid,
         value: Bytes,
     },
+    /// Fired during OS-level state restoration (iOS only) when the system relaunches the app with preserved BLE state.
+    Restored { devices: Vec<BleDevice> },
 }
 
 /// Scan duty cycle / power trade-off.
@@ -52,4 +85,30 @@ pub enum WriteType {
     WithResponse,
     /// ATT Write Command -- no acknowledgement; lower latency.
     WithoutResponse,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disconnect_cause_is_debug_clone_eq() {
+        let a = DisconnectCause::LinkLoss;
+        let b = a.clone();
+        assert_eq!(a, b);
+        let _ = format!("{a:?}");
+    }
+
+    #[test]
+    fn disconnected_event_carries_cause() {
+        let ev = CentralEvent::DeviceDisconnected {
+            device_id: DeviceId::from("test"),
+            cause: DisconnectCause::LocalClose,
+        };
+        if let CentralEvent::DeviceDisconnected { cause, .. } = ev {
+            assert_eq!(cause, DisconnectCause::LocalClose);
+        } else {
+            panic!("wrong variant");
+        }
+    }
 }

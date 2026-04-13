@@ -11,7 +11,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::central::backend::{self, CentralBackend};
-use crate::central::types::{CentralEvent, ScanFilter, WriteType};
+use crate::central::types::{CentralConfig, CentralEvent, ScanFilter, WriteType};
 use crate::error::{BlewError, BlewResult};
 use crate::gatt::props::CharacteristicProperties;
 use crate::gatt::service::{GattCharacteristic, GattService};
@@ -173,6 +173,45 @@ fn gatt_status_to_error(status: i32, device_id: &DeviceId, char_uuid: Uuid) -> B
 }
 
 pub struct AndroidCentral;
+
+impl AndroidCentral {
+    pub async fn with_config(_config: CentralConfig) -> crate::error::BlewResult<Self> {
+        Self::new().await
+    }
+
+    /// Clear the GATT cache for `device_id` by calling the hidden
+    /// `BluetoothGatt.refresh()` method via reflection on the Kotlin side.
+    ///
+    /// Returns [`BlewError::NotSupported`] if the reflective call fails or
+    /// no active GATT handle exists for the device.
+    #[allow(clippy::unused_self)]
+    pub(crate) fn refresh(
+        &self,
+        device_id: &DeviceId,
+    ) -> impl Future<Output = BlewResult<()>> + Send {
+        let addr = device_id.as_str().to_owned();
+        async move {
+            let ok = jvm()
+                .attach_current_thread(|env| {
+                    let j_addr = env.new_string(&addr)?;
+                    let result = env.call_static_method(
+                        central_class(),
+                        jni_str!("refresh"),
+                        jni_sig!("(Ljava/lang/String;)Z"),
+                        &[(&j_addr).into()],
+                    )?;
+                    result.z()
+                })
+                .map_err(jni_err)?;
+
+            if ok {
+                Ok(())
+            } else {
+                Err(BlewError::NotSupported)
+            }
+        }
+    }
+}
 
 impl backend::private::Sealed for AndroidCentral {}
 

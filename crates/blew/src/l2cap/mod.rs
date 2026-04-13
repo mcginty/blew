@@ -14,6 +14,12 @@ pub struct L2capChannel {
     inner: DuplexStream,
 }
 
+impl std::fmt::Debug for L2capChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("L2capChannel").finish_non_exhaustive()
+    }
+}
+
 impl L2capChannel {
     /// Create a connected in-memory pair for testing.
     #[must_use]

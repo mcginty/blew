@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::central::backend::{self, CentralBackend};
-use crate::central::types::{CentralEvent, ScanFilter, WriteType};
+use crate::central::types::{CentralEvent, DisconnectCause, ScanFilter, WriteType};
 use crate::error::{BlewError, BlewResult};
 use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, types::Psm};
@@ -102,17 +102,18 @@ impl MockLink {
         let central = MockCentral {
             link: Arc::clone(&link),
             event_tx: central_event_tx.clone(),
-            _event_rx: Mutex::new(Some(periph_event_tx.clone())),
-            central_rx: Mutex::new(Some(central_event_rx)),
+            periph_sender_keepalive: Arc::new(Mutex::new(Some(periph_event_tx.clone()))),
+            central_rx: Arc::new(Mutex::new(Some(central_event_rx))),
             periph_event_tx,
-            powered: Mutex::new(true),
+            powered: Arc::new(Mutex::new(true)),
         };
 
         let peripheral = MockPeripheral {
             link: Arc::clone(&link),
-            event_tx: Mutex::new(Some(periph_event_rx)),
-            _central_event_tx: central_event_tx.clone(),
-            powered: Mutex::new(true),
+            event_tx: Arc::new(Mutex::new(Some(periph_event_rx))),
+            emit_tx: None,
+            central_sender_keepalive: central_event_tx.clone(),
+            powered: Arc::new(Mutex::new(true)),
         };
 
         (
@@ -133,10 +134,86 @@ impl MockLink {
 pub struct MockCentral {
     link: SharedLink,
     event_tx: mpsc::UnboundedSender<CentralEvent>,
-    _event_rx: Mutex<Option<mpsc::UnboundedSender<PeripheralEvent>>>,
-    central_rx: Mutex<Option<mpsc::UnboundedReceiver<CentralEvent>>>,
+    periph_sender_keepalive: Arc<Mutex<Option<mpsc::UnboundedSender<PeripheralEvent>>>>,
+    central_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<CentralEvent>>>>,
     periph_event_tx: mpsc::UnboundedSender<PeripheralEvent>,
-    powered: Mutex<bool>,
+    powered: Arc<Mutex<bool>>,
+}
+
+impl Clone for MockCentral {
+    fn clone(&self) -> Self {
+        Self {
+            link: Arc::clone(&self.link),
+            event_tx: self.event_tx.clone(),
+            periph_sender_keepalive: Arc::clone(&self.periph_sender_keepalive),
+            central_rx: Arc::clone(&self.central_rx),
+            periph_event_tx: self.periph_event_tx.clone(),
+            powered: Arc::clone(&self.powered),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl MockCentral {
+    /// Construct a standalone powered mock central (not linked to any peripheral).
+    #[must_use]
+    pub fn new_powered() -> crate::central::Central<Self> {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (periph_event_tx, _periph_event_rx) = mpsc::unbounded_channel();
+        let link = Arc::new(Mutex::new(LinkState {
+            services: Vec::new(),
+            char_values: std::collections::HashMap::new(),
+            subscriptions: std::collections::HashMap::new(),
+            advertising: false,
+            adv_config: None,
+            connected: false,
+            l2cap_policy: MockL2capPolicy::default(),
+            l2cap_psm: None,
+            l2cap_accept_tx: None,
+        }));
+        crate::central::Central::from_backend(Self {
+            link,
+            event_tx,
+            periph_sender_keepalive: Arc::new(Mutex::new(None)),
+            central_rx: Arc::new(Mutex::new(Some(event_rx))),
+            periph_event_tx,
+            powered: Arc::new(Mutex::new(true)),
+        })
+    }
+
+    /// Construct a standalone unpowered mock central (not linked to any peripheral).
+    #[must_use]
+    pub fn new_unpowered() -> crate::central::Central<Self> {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (periph_event_tx, _periph_event_rx) = mpsc::unbounded_channel();
+        let link = Arc::new(Mutex::new(LinkState {
+            services: Vec::new(),
+            char_values: std::collections::HashMap::new(),
+            subscriptions: std::collections::HashMap::new(),
+            advertising: false,
+            adv_config: None,
+            connected: false,
+            l2cap_policy: MockL2capPolicy::default(),
+            l2cap_psm: None,
+            l2cap_accept_tx: None,
+        }));
+        crate::central::Central::from_backend(Self {
+            link,
+            event_tx,
+            periph_sender_keepalive: Arc::new(Mutex::new(None)),
+            central_rx: Arc::new(Mutex::new(Some(event_rx))),
+            periph_event_tx,
+            powered: Arc::new(Mutex::new(false)),
+        })
+    }
+
+    /// Emit an `AdapterStateChanged` event and update the powered flag.
+    pub fn mock_emit_adapter_state(&self, powered: bool) {
+        *self.powered.lock().unwrap() = powered;
+        let _ = self
+            .event_tx
+            .send(CentralEvent::AdapterStateChanged { powered });
+    }
 }
 
 impl backend::private::Sealed for MockCentral {}
@@ -202,7 +279,10 @@ impl CentralBackend for MockCentral {
         let id = device_id.clone();
         let tx = self.event_tx.clone();
         async move {
-            let _ = tx.send(CentralEvent::DeviceDisconnected { device_id: id });
+            let _ = tx.send(CentralEvent::DeviceDisconnected {
+                device_id: id,
+                cause: DisconnectCause::Unknown(0),
+            });
             Ok(())
         }
     }
@@ -392,9 +472,76 @@ impl CentralBackend for MockCentral {
 /// In-memory mock [`PeripheralBackend`].
 pub struct MockPeripheral {
     link: SharedLink,
-    event_tx: Mutex<Option<mpsc::UnboundedReceiver<PeripheralEvent>>>,
-    _central_event_tx: mpsc::UnboundedSender<CentralEvent>,
-    powered: Mutex<bool>,
+    event_tx: Arc<Mutex<Option<mpsc::UnboundedReceiver<PeripheralEvent>>>>,
+    /// Sender for standalone (non-paired) mock peripherals; `None` in pair mode.
+    emit_tx: Option<mpsc::UnboundedSender<PeripheralEvent>>,
+    central_sender_keepalive: mpsc::UnboundedSender<CentralEvent>,
+    powered: Arc<Mutex<bool>>,
+}
+
+impl Clone for MockPeripheral {
+    fn clone(&self) -> Self {
+        Self {
+            link: Arc::clone(&self.link),
+            event_tx: Arc::clone(&self.event_tx),
+            emit_tx: self.emit_tx.clone(),
+            central_sender_keepalive: self.central_sender_keepalive.clone(),
+            powered: Arc::clone(&self.powered),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl MockPeripheral {
+    fn make_link() -> SharedLink {
+        Arc::new(Mutex::new(LinkState {
+            services: Vec::new(),
+            char_values: std::collections::HashMap::new(),
+            subscriptions: std::collections::HashMap::new(),
+            advertising: false,
+            adv_config: None,
+            connected: false,
+            l2cap_policy: MockL2capPolicy::default(),
+            l2cap_psm: None,
+            l2cap_accept_tx: None,
+        }))
+    }
+
+    /// Construct a standalone powered mock peripheral (not linked to any central).
+    #[must_use]
+    pub fn new_powered() -> crate::peripheral::Peripheral<Self> {
+        let (central_event_tx, _central_event_rx) = mpsc::unbounded_channel::<CentralEvent>();
+        let (periph_event_tx, periph_event_rx) = mpsc::unbounded_channel();
+        crate::peripheral::Peripheral::from_backend(Self {
+            link: Self::make_link(),
+            event_tx: Arc::new(Mutex::new(Some(periph_event_rx))),
+            emit_tx: Some(periph_event_tx),
+            central_sender_keepalive: central_event_tx,
+            powered: Arc::new(Mutex::new(true)),
+        })
+    }
+
+    /// Construct a standalone unpowered mock peripheral (not linked to any central).
+    #[must_use]
+    pub fn new_unpowered() -> crate::peripheral::Peripheral<Self> {
+        let (central_event_tx, _central_event_rx) = mpsc::unbounded_channel::<CentralEvent>();
+        let (periph_event_tx, periph_event_rx) = mpsc::unbounded_channel();
+        crate::peripheral::Peripheral::from_backend(Self {
+            link: Self::make_link(),
+            event_tx: Arc::new(Mutex::new(Some(periph_event_rx))),
+            emit_tx: Some(periph_event_tx),
+            central_sender_keepalive: central_event_tx,
+            powered: Arc::new(Mutex::new(false)),
+        })
+    }
+
+    /// Emit an `AdapterStateChanged` event and update the powered flag.
+    pub fn mock_emit_adapter_state(&self, powered: bool) {
+        *self.powered.lock().unwrap() = powered;
+        if let Some(tx) = &self.emit_tx {
+            let _ = tx.send(PeripheralEvent::AdapterStateChanged { powered });
+        }
+    }
 }
 
 impl periph_backend::private::Sealed for MockPeripheral {}
@@ -500,10 +647,48 @@ impl<B: CentralBackend> crate::central::Central<B> {
     }
 }
 
+impl<B: CentralBackend + Clone> Clone for crate::central::Central<B> {
+    fn clone(&self) -> Self {
+        Self {
+            backend: self.backend.clone(),
+        }
+    }
+}
+
+impl crate::central::Central<MockCentral> {
+    /// Emit an `AdapterStateChanged` event and update the powered flag.
+    pub fn mock_emit_adapter_state(&self, powered: bool) {
+        self.backend.mock_emit_adapter_state(powered);
+    }
+}
+
 impl<B: PeripheralBackend> crate::peripheral::Peripheral<B> {
     /// Create a `Peripheral` from a pre-constructed backend (for testing).
     pub fn from_backend(backend: B) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            #[cfg(debug_assertions)]
+            events_taken: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl<B: PeripheralBackend + Clone> Clone for crate::peripheral::Peripheral<B> {
+    fn clone(&self) -> Self {
+        Self {
+            backend: self.backend.clone(),
+            #[cfg(debug_assertions)]
+            events_taken: std::sync::atomic::AtomicBool::new(
+                self.events_taken.load(std::sync::atomic::Ordering::SeqCst),
+            ),
+        }
+    }
+}
+
+impl crate::peripheral::Peripheral<MockPeripheral> {
+    /// Emit an `AdapterStateChanged` event and update the powered flag.
+    pub fn mock_emit_adapter_state(&self, powered: bool) {
+        self.backend.mock_emit_adapter_state(powered);
     }
 }
 #[cfg(test)]
@@ -1064,8 +1249,9 @@ mod tests {
 
         match result {
             Err(_)
-            | Ok(Some(CentralEvent::DeviceDisconnected { .. }))
-            | Ok(Some(CentralEvent::AdapterStateChanged { .. })) => {}
+            | Ok(Some(
+                CentralEvent::DeviceDisconnected { .. } | CentralEvent::AdapterStateChanged { .. },
+            )) => {}
             Ok(Some(CentralEvent::CharacteristicNotification { .. })) => {
                 panic!("notification should not arrive after disconnect");
             }

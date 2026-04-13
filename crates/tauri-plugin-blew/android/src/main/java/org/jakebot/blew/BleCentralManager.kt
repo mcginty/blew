@@ -93,6 +93,7 @@ object BleCentralManager {
     external fun nativeOnConnectionStateChanged(
         deviceAddr: String,
         connected: Boolean,
+        gattStatus: Int,
     )
 
     @JvmStatic
@@ -295,7 +296,7 @@ object BleCentralManager {
                         Log.w(TAG, "requestMtu failed for $addr, proceeding without MTU negotiation")
                         mtuHoldDevices.remove(addr)
                         releaseGatt()
-                        nativeOnConnectionStateChanged(addr, true)
+                        nativeOnConnectionStateChanged(addr, true, 0)
                     }
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     gattConnections.remove(addr)
@@ -308,7 +309,7 @@ object BleCentralManager {
                     // For regular operations, gatt.close() triggers pending
                     // callbacks (with error status) which release the semaphore.
                     gatt.close()
-                    nativeOnConnectionStateChanged(addr, false)
+                    nativeOnConnectionStateChanged(addr, false, status)
                 }
             }
 
@@ -326,7 +327,7 @@ object BleCentralManager {
                 mtuHoldDevices.remove(addr)
                 releaseGatt()
                 // NOW notify Rust — MTU is negotiated, GATT is ready for operations.
-                nativeOnConnectionStateChanged(addr, true)
+                nativeOnConnectionStateChanged(addr, true, 0)
             }
 
             override fun onServicesDiscovered(
@@ -427,7 +428,7 @@ object BleCentralManager {
         val gatt = device.connectGatt(ctx, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
         if (gatt == null) {
             Log.e(TAG, "connectGatt returned null for $deviceAddr")
-            nativeOnConnectionStateChanged(deviceAddr, false)
+            nativeOnConnectionStateChanged(deviceAddr, false, 0)
             return
         }
         Log.d(TAG, "connecting to $deviceAddr")
@@ -438,6 +439,25 @@ object BleCentralManager {
         gattConnections[deviceAddr]?.let { gatt ->
             gatt.disconnect()
             Log.d(TAG, "disconnecting from $deviceAddr")
+        }
+    }
+
+    /**
+     * Clear the GATT service cache for [deviceAddr] by invoking the hidden
+     * `BluetoothGatt.refresh()` method via reflection. Returns false if no
+     * active GATT handle exists or the reflective call throws. Used to
+     * recover from stale cached service tables after peer reboots (status
+     * 133 errors).
+     */
+    @JvmStatic
+    fun refresh(deviceAddr: String): Boolean {
+        val gatt = gattConnections[deviceAddr] ?: return false
+        return try {
+            val method = gatt.javaClass.getMethod("refresh")
+            method.invoke(gatt) as Boolean
+        } catch (e: Exception) {
+            Log.w(TAG, "refresh failed for $deviceAddr: ${e.message}")
+            false
         }
     }
 

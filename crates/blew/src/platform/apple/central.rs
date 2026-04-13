@@ -24,11 +24,14 @@ use objc2::define_class;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, ProtocolObject};
 use objc2::{AnyThread, DefinedClass};
+#[cfg(target_os = "ios")]
+use objc2_core_bluetooth::CBCentralManagerOptionRestoreIdentifierKey;
+use objc2_core_bluetooth::CBCentralManagerRestoredStatePeripheralsKey;
 use objc2_core_bluetooth::{
     CBAdvertisementDataLocalNameKey, CBAdvertisementDataServiceUUIDsKey, CBCentralManager,
     CBCentralManagerDelegate, CBCharacteristic, CBCharacteristicProperties,
-    CBCharacteristicWriteType, CBL2CAPChannel, CBManagerState, CBPeripheral, CBPeripheralDelegate,
-    CBService, CBUUID,
+    CBCharacteristicWriteType, CBError, CBErrorDomain, CBL2CAPChannel, CBManagerState,
+    CBPeripheral, CBPeripheralDelegate, CBService, CBUUID,
 };
 use objc2_foundation::{
     NSArray, NSData, NSDictionary, NSError, NSNumber, NSObjectProtocol, NSString,
@@ -41,7 +44,7 @@ use uuid::Uuid;
 use tracing::{debug, trace, warn};
 
 use crate::central::backend::{self, CentralBackend};
-use crate::central::types::{CentralEvent, ScanFilter, WriteType};
+use crate::central::types::{CentralConfig, CentralEvent, DisconnectCause, ScanFilter, WriteType};
 use crate::error::{BlewError, BlewResult};
 use crate::gatt::props::{AttributePermissions, CharacteristicProperties};
 use crate::gatt::service::{GattCharacteristic, GattService};
@@ -240,15 +243,80 @@ define_class!(
         #[unsafe(method(centralManager:didDisconnectPeripheral:error:))]
         unsafe fn centralManager_didDisconnectPeripheral_error(
             &self,
-            _central: &CBCentralManager,
+            central: &CBCentralManager,
             peripheral: &CBPeripheral,
-            _error: Option<&NSError>,
+            error: Option<&NSError>,
         ) {
             let id = peripheral_device_id(peripheral);
             debug!(device_id = %id, "device disconnected");
             let inner = self.ivars();
             inner.peripherals.lock().unwrap().remove(&id);
-            inner.emit(CentralEvent::DeviceDisconnected { device_id: id });
+            let cause = if central.state() == CBManagerState::PoweredOn {
+                match error {
+                    Some(err) => {
+                        let code = err.code();
+                        let is_cb_domain = &*err.domain() == unsafe { CBErrorDomain };
+                        if is_cb_domain {
+                            match CBError(code) {
+                                CBError::ConnectionTimeout => DisconnectCause::Timeout,
+                                CBError::PeripheralDisconnected => DisconnectCause::RemoteClose,
+                                CBError::ConnectionFailed => DisconnectCause::LinkLoss,
+                                _ => DisconnectCause::Unknown(
+                                    i32::try_from(code).unwrap_or(i32::MIN),
+                                ),
+                            }
+                        } else {
+                            DisconnectCause::Unknown(i32::try_from(code).unwrap_or(i32::MIN))
+                        }
+                    }
+                    None => DisconnectCause::LocalClose,
+                }
+            } else {
+                DisconnectCause::AdapterOff
+            };
+            inner.emit(CentralEvent::DeviceDisconnected { device_id: id, cause });
+        }
+
+        #[unsafe(method(centralManager:willRestoreState:))]
+        unsafe fn centralManager_willRestoreState(
+            &self,
+            _central: &CBCentralManager,
+            dict: &NSDictionary<NSString, AnyObject>,
+        ) {
+            let key = unsafe { CBCentralManagerRestoredStatePeripheralsKey };
+            let Some(obj) = dict.objectForKey(key) else {
+                return;
+            };
+            // SAFETY: CoreBluetooth guarantees this key's value is NSArray<CBPeripheral>.
+            let arr: Retained<NSArray<CBPeripheral>> = Retained::cast_unchecked(obj);
+            let mut recovered = Vec::new();
+            let inner = self.ivars();
+            for peripheral in arr.to_vec() {
+                let id = peripheral_device_id(&peripheral);
+                let name = peripheral.name().map(|n| n.to_string());
+                let device = BleDevice {
+                    id: id.clone(),
+                    name,
+                    rssi: None,
+                    services: vec![],
+                };
+                inner
+                    .peripherals
+                    .lock()
+                    .unwrap()
+                    .insert(id.clone(), unsafe { retain_send(&*peripheral) });
+                inner
+                    .discovered
+                    .lock()
+                    .unwrap()
+                    .insert(id.clone(), device.clone());
+                recovered.push(device);
+            }
+            debug!(
+                count = recovered.len(),
+                "OS-level state restoration recovered peripherals"
+            );
+            inner.emit(CentralEvent::Restored { devices: recovered });
         }
     }
 
@@ -476,6 +544,9 @@ struct CentralHandle {
     /// Retained here so the CB manager's weak-ref delegate stays alive.
     delegate: ObjcSend<CentralDelegate>,
     inner: Arc<CentralInner>,
+    /// Read by the `willRestoreState:` delegate (Task 4) to correlate restored peripherals.
+    #[allow(dead_code)]
+    restore_identifier: Option<String>,
 }
 
 unsafe impl Send for CentralHandle {}
@@ -492,48 +563,7 @@ impl CentralBackend for AppleCentral {
     where
         Self: Sized,
     {
-        let (inner, mut powered_rx) = CentralInner::new();
-        let delegate = CentralDelegate::new(Arc::clone(&inner));
-        let queue = DispatchQueue::new("blew.central", DispatchQueueAttr::SERIAL);
-
-        let manager = ObjcSend(unsafe {
-            CBCentralManager::initWithDelegate_queue(
-                CBCentralManager::alloc(),
-                Some(ProtocolObject::from_ref(&*delegate)),
-                Some(&queue),
-            )
-        });
-        let delegate = ObjcSend(delegate);
-
-        let timeout = tokio::time::sleep(std::time::Duration::from_secs(15));
-        tokio::pin!(timeout);
-        loop {
-            tokio::select! {
-                res = powered_rx.changed() => {
-                    if res.is_err() { break; }
-                    if *powered_rx.borrow() { break; }
-                    let state = unsafe { manager.state() };
-                    if matches!(
-                        state,
-                        CBManagerState::Unsupported | CBManagerState::Unauthorized
-                    ) {
-                        return Err(BlewError::AdapterNotFound);
-                    }
-                }
-                () = &mut timeout => {
-                    if unsafe { manager.state() } == CBManagerState::PoweredOn {
-                        break;
-                    }
-                    return Err(BlewError::NotPowered);
-                }
-            }
-        }
-
-        Ok(AppleCentral(Arc::new(CentralHandle {
-            manager,
-            delegate,
-            inner,
-        })))
+        Self::with_config(CentralConfig::default()).await
     }
 
     fn is_powered(&self) -> impl Future<Output = BlewResult<bool>> + Send {
@@ -864,6 +894,76 @@ impl CentralBackend for AppleCentral {
 }
 
 impl AppleCentral {
+    pub async fn with_config(config: CentralConfig) -> BlewResult<Self> {
+        let (inner, mut powered_rx) = CentralInner::new();
+        let delegate = CentralDelegate::new(Arc::clone(&inner));
+        let queue = DispatchQueue::new("blew.central", DispatchQueueAttr::SERIAL);
+
+        // State restoration (CBCentralManagerOptionRestoreIdentifierKey) is an iOS-only
+        // feature; passing it on macOS causes CoreBluetooth to throw an NSException.
+        #[cfg(target_os = "ios")]
+        let manager = ObjcSend(unsafe {
+            if let Some(ref id) = config.restore_identifier {
+                let key: &NSString = CBCentralManagerOptionRestoreIdentifierKey;
+                let value = NSString::from_str(id);
+                let v_any: &AnyObject = &value;
+                let options = NSDictionary::from_slices(&[key], &[v_any]);
+                CBCentralManager::initWithDelegate_queue_options(
+                    CBCentralManager::alloc(),
+                    Some(ProtocolObject::from_ref(&*delegate)),
+                    Some(&queue),
+                    Some(&options),
+                )
+            } else {
+                CBCentralManager::initWithDelegate_queue(
+                    CBCentralManager::alloc(),
+                    Some(ProtocolObject::from_ref(&*delegate)),
+                    Some(&queue),
+                )
+            }
+        });
+        #[cfg(not(target_os = "ios"))]
+        let manager = ObjcSend(unsafe {
+            CBCentralManager::initWithDelegate_queue(
+                CBCentralManager::alloc(),
+                Some(ProtocolObject::from_ref(&*delegate)),
+                Some(&queue),
+            )
+        });
+        let delegate = ObjcSend(delegate);
+
+        let timeout = tokio::time::sleep(std::time::Duration::from_secs(15));
+        tokio::pin!(timeout);
+        loop {
+            tokio::select! {
+                res = powered_rx.changed() => {
+                    if res.is_err() { break; }
+                    if *powered_rx.borrow() { break; }
+                    let state = unsafe { manager.state() };
+                    if matches!(
+                        state,
+                        CBManagerState::Unsupported | CBManagerState::Unauthorized
+                    ) {
+                        return Err(BlewError::AdapterNotFound);
+                    }
+                }
+                () = &mut timeout => {
+                    if unsafe { manager.state() } == CBManagerState::PoweredOn {
+                        break;
+                    }
+                    return Err(BlewError::NotPowered);
+                }
+            }
+        }
+
+        Ok(AppleCentral(Arc::new(CentralHandle {
+            manager,
+            delegate,
+            inner,
+            restore_identifier: config.restore_identifier,
+        })))
+    }
+
     async fn set_notify_impl(
         handle: Arc<CentralHandle>,
         device_id: DeviceId,

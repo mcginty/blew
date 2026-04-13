@@ -45,7 +45,7 @@ objc2-foundation = { version = "0.3", features = [
     "NSValue",
     "NSStream",
 ] }
-objc2-core-bluetooth = "0.3"
+objc2-core-bluetooth = { version = "0.3", features = ["CBError", "CBCentralManagerConstants"] }
 dispatch2 = { version = "0.3", features = ["alloc", "objc2"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
