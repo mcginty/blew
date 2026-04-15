@@ -372,9 +372,14 @@ impl PeripheralBackend for LinuxPeripheral {
 
     fn notify_characteristic(
         &self,
+        _device_id: &crate::types::DeviceId,
         char_uuid: Uuid,
         value: Vec<u8>,
     ) -> impl Future<Output = BlewResult<()>> + Send {
+        // NOTE: BlueZ's `CharacteristicNotifier` callback does not expose the
+        // remote device identity, so we cannot route a notification to a
+        // specific subscriber here. Every live notifier for the characteristic
+        // receives the value. See the trait doc for details.
         let handle = Arc::clone(&self.0);
         async move {
             trace!(%char_uuid, len = value.len(), "notifying characteristic");

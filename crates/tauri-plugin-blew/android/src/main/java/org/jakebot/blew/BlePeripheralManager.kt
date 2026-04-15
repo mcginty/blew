@@ -430,47 +430,32 @@ object BlePeripheralManager {
     }
 
     /**
-     * Send a notification on a characteristic to all subscribed devices.
+     * Send a notification on a characteristic to a single subscribed device.
      *
      * Returns:
-     *   0 = success (sent to at least one device)
+     *   0 = success
      *   1 = busy (semaphore not available — caller should retry after a short delay)
-     *   2 = no subscribers
+     *   2 = device not connected or not subscribed to this characteristic
      *   3 = characteristic not found
      */
     @JvmStatic
     fun notifyCharacteristic(
+        deviceAddr: String,
         charUuid: String,
         value: ByteArray,
     ): Int {
         val uuid = UUID.fromString(charUuid)
         val char = characteristics[uuid] ?: return 3
-
-        var sentAny = false
-        var busyAny = false
-        for ((addr, subs) in subscriptions) {
-            if (uuid in subs) {
-                val device = connectedDevices[addr] ?: continue
-                if (!acquireNotify(addr, timeoutMs = 50)) {
-                    busyAny = true
-                    continue
-                }
-                val sent = sendNotification(device, char, value)
-                if (!sent) {
-                    // notifyCharacteristicChanged failed — onNotificationSent
-                    // won't fire, so release immediately.
-                    releaseNotify(addr)
-                    busyAny = true
-                } else {
-                    sentAny = true
-                }
-            }
+        val device = connectedDevices[deviceAddr] ?: return 2
+        val subs = subscriptions[deviceAddr] ?: return 2
+        if (uuid !in subs) return 2
+        if (!acquireNotify(deviceAddr, timeoutMs = 50)) return 1
+        val sent = sendNotification(device, char, value)
+        if (!sent) {
+            releaseNotify(deviceAddr)
+            return 1
         }
-        return when {
-            sentAny -> 0
-            busyAny -> 1
-            else -> 2
-        }
+        return 0
     }
 
     /**

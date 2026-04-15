@@ -15,6 +15,7 @@ use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, types::Psm};
 use crate::peripheral::backend::{self, PeripheralBackend};
 use crate::peripheral::types::{AdvertisingConfig, PeripheralEvent};
+use crate::types::DeviceId;
 
 use super::jni_globals::{jvm, peripheral_class};
 
@@ -185,9 +186,11 @@ impl PeripheralBackend for AndroidPeripheral {
 
     fn notify_characteristic(
         &self,
+        device_id: &DeviceId,
         char_uuid: Uuid,
         value: Vec<u8>,
     ) -> impl Future<Output = BlewResult<()>> + Send {
+        let device_addr = device_id.as_str().to_owned();
         async move {
             // Retry loop: Kotlin returns 1 ("busy") when the previous
             // notification hasn't completed yet (onNotificationSent pending).
@@ -195,14 +198,15 @@ impl PeripheralBackend for AndroidPeripheral {
             for attempt in 0..50u32 {
                 let status: i32 = jvm()
                     .attach_current_thread(|env| {
+                        let addr_str = env.new_string(&device_addr)?;
                         let uuid_str = env.new_string(char_uuid.to_string())?;
                         let j_value = env.byte_array_from_slice(&value)?;
 
                         let ret = env.call_static_method(
                             peripheral_class(),
                             jni_str!("notifyCharacteristic"),
-                            jni_sig!("(Ljava/lang/String;[B)I"),
-                            &[(&uuid_str).into(), (&j_value).into()],
+                            jni_sig!("(Ljava/lang/String;Ljava/lang/String;[B)I"),
+                            &[(&addr_str).into(), (&uuid_str).into(), (&j_value).into()],
                         )?;
                         ret.i()
                     })

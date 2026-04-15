@@ -45,6 +45,7 @@ use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, types::Psm};
 use crate::peripheral::backend::{self, PeripheralBackend};
 use crate::peripheral::types::{AdvertisingConfig, PeripheralEvent, ReadResponder, WriteResponder};
+use crate::types::DeviceId;
 use crate::platform::apple::helpers::{
     ObjcSend, cbuuid_to_uuid, central_device_id, retain_send, uuid_to_cbuuid,
 };
@@ -93,6 +94,11 @@ fn our_perms_to_cb(perms: AttributePermissions) -> CBAttributePermissions {
 struct PeripheralInner {
     /// `CBMutableCharacteristic` objects keyed by UUID, for notification sending.
     chars: Mutex<HashMap<Uuid, ObjcSend<CBMutableCharacteristic>>>,
+    /// Retained `CBCentral` handles, keyed by (characteristic UUID, device id),
+    /// populated by `didSubscribeToCharacteristic` and cleared by
+    /// `didUnsubscribeFromCharacteristic`. Used by `notify_characteristic` to
+    /// target a single central rather than broadcasting.
+    subscribers: Mutex<HashMap<Uuid, HashMap<DeviceId, ObjcSend<CBCentral>>>>,
     /// Pending `start_advertising()` result.
     adv_tx: Mutex<Option<oneshot::Sender<BlewResult<()>>>>,
     /// Pending `add_service()` results.
@@ -117,6 +123,7 @@ impl PeripheralInner {
         let (powered_tx, powered_rx) = watch::channel(false);
         let inner = Arc::new(Self {
             chars: Default::default(),
+            subscribers: Default::default(),
             adv_tx: Default::default(),
             add_svc_tx: Default::default(),
             event_tx: Mutex::new(None),
@@ -217,6 +224,11 @@ define_class!(
             };
             let client_id = central_device_id(central);
             trace!(client_id = %client_id, %char_uuid, "client subscribed to characteristic");
+            {
+                let mut subs = inner.subscribers.lock().unwrap();
+                let entry = subs.entry(char_uuid).or_default();
+                entry.insert(client_id.clone(), unsafe { retain_send(central) });
+            }
             inner.emit(PeripheralEvent::SubscriptionChanged {
                 client_id,
                 char_uuid,
@@ -238,6 +250,15 @@ define_class!(
             };
             let client_id = central_device_id(central);
             trace!(client_id = %client_id, %char_uuid, "client unsubscribed from characteristic");
+            {
+                let mut subs = inner.subscribers.lock().unwrap();
+                if let Some(entry) = subs.get_mut(&char_uuid) {
+                    entry.remove(&client_id);
+                    if entry.is_empty() {
+                        subs.remove(&char_uuid);
+                    }
+                }
+            }
             inner.emit(PeripheralEvent::SubscriptionChanged {
                 client_id,
                 char_uuid,
@@ -630,12 +651,14 @@ impl PeripheralBackend for ApplePeripheral {
 
     fn notify_characteristic(
         &self,
+        device_id: &DeviceId,
         char_uuid: Uuid,
         value: Vec<u8>,
     ) -> impl Future<Output = BlewResult<()>> + Send {
         let handle = Arc::clone(&self.0);
+        let device_id = device_id.clone();
         async move {
-            trace!(%char_uuid, len = value.len(), "notifying characteristic");
+            trace!(device = %device_id, %char_uuid, len = value.len(), "notifying characteristic");
             let cb_char = {
                 let lock = handle.inner.chars.lock().unwrap();
                 lock.get(&char_uuid).map(|c| unsafe { retain_send(&**c) })
@@ -645,11 +668,29 @@ impl PeripheralBackend for ApplePeripheral {
                 return Err(BlewError::LocalCharacteristicNotFound { char_uuid });
             };
 
+            let cb_central = {
+                let lock = handle.inner.subscribers.lock().unwrap();
+                lock.get(&char_uuid)
+                    .and_then(|m| m.get(&device_id))
+                    .map(|c| unsafe { retain_send(&**c) })
+            };
+
+            let Some(cb_central) = cb_central else {
+                // Subscriber disappeared between our caller's decision and
+                // now — treat as no-op rather than an error.
+                return Ok(());
+            };
+
             let data = NSData::from_vec(value);
+            let centrals = NSArray::from_slice(&[cb_central.0.as_ref()]);
             unsafe {
                 handle
                     .manager
-                    .updateValue_forCharacteristic_onSubscribedCentrals(&data, &cb_char.0, None);
+                    .updateValue_forCharacteristic_onSubscribedCentrals(
+                        &data,
+                        &cb_char.0,
+                        Some(&centrals),
+                    );
             }
             Ok(())
         }

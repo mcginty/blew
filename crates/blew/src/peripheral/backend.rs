@@ -2,6 +2,7 @@ use super::types::{AdvertisingConfig, PeripheralEvent};
 use crate::error::BlewResult;
 use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, types::Psm};
+use crate::types::DeviceId;
 use futures_core::Stream;
 use std::future::Future;
 use uuid::Uuid;
@@ -39,9 +40,16 @@ pub trait PeripheralBackend: private::Sealed + Send + Sync + 'static {
     /// Stop advertising.
     fn stop_advertising(&self) -> impl Future<Output = BlewResult<()>> + Send;
 
-    /// Push a characteristic value update to all subscribed centrals.
+    /// Push a characteristic value update to a single subscribed central.
+    ///
+    /// The notification is unicast to the central identified by `device_id`
+    /// when the platform's GATT server API supports per-subscriber targeting
+    /// (Apple, Android). On Linux/BlueZ, BlueZ's `CharacteristicNotifier`
+    /// callback does not expose the remote device identity, so this degrades
+    /// to a broadcast to every subscribed notifier for that characteristic.
     fn notify_characteristic(
         &self,
+        device_id: &DeviceId,
         char_uuid: Uuid,
         value: Vec<u8>,
     ) -> impl Future<Output = BlewResult<()>> + Send;

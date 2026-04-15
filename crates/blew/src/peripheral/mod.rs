@@ -7,6 +7,7 @@ use crate::error::{BlewError, BlewResult};
 use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, types::Psm};
 use crate::platform::PlatformPeripheral;
+use crate::types::DeviceId;
 use crate::util::event_stream::EventStream;
 use backend::PeripheralBackend;
 use uuid::Uuid;
@@ -60,9 +61,19 @@ impl<B: PeripheralBackend> Peripheral<B> {
         self.backend.stop_advertising().await
     }
 
-    /// Push a characteristic value update to all subscribed centrals.
-    pub async fn notify_characteristic(&self, char_uuid: Uuid, value: Vec<u8>) -> BlewResult<()> {
-        self.backend.notify_characteristic(char_uuid, value).await
+    /// Push a characteristic value update to a single subscribed central.
+    ///
+    /// See [`PeripheralBackend::notify_characteristic`] for the per-device
+    /// semantics and the Linux-only broadcast fallback.
+    pub async fn notify_characteristic(
+        &self,
+        device_id: &DeviceId,
+        char_uuid: Uuid,
+        value: Vec<u8>,
+    ) -> BlewResult<()> {
+        self.backend
+            .notify_characteristic(device_id, char_uuid, value)
+            .await
     }
 
     /// Publish an L2CAP CoC channel.  Returns the OS-assigned PSM and a stream
