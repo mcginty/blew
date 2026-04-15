@@ -35,7 +35,6 @@ class BlewPlugin(
         val needed = mutableListOf<String>()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            // Android 12+: BLE permissions + location for scan results
             if (!hasPermission(Manifest.permission.BLUETOOTH_SCAN)) {
                 needed.add(Manifest.permission.BLUETOOTH_SCAN)
             }
@@ -45,11 +44,10 @@ class BlewPlugin(
             if (!hasPermission(Manifest.permission.BLUETOOTH_ADVERTISE)) {
                 needed.add(Manifest.permission.BLUETOOTH_ADVERTISE)
             }
-        }
-        // Location is required on all Android versions for BLE scan
-        // results to be delivered.
-        if (!hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)) {
-            needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        } else {
+            if (!hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)) {
+                needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
+            }
         }
 
         if (needed.isNotEmpty()) {

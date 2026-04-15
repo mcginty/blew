@@ -521,26 +521,17 @@ object BlePeripheralManager {
     @JvmStatic
     fun areBlePermissionsGranted(): Boolean {
         val ctx = context ?: return false
-        // Location is required on all Android versions for scan results.
-        if (androidx.core.content.ContextCompat.checkSelfPermission(
-                ctx,
-                android.Manifest.permission.ACCESS_FINE_LOCATION,
-            ) != android.content.pm.PackageManager.PERMISSION_GRANTED
-        ) {
-            return false
-        }
+        fun granted(p: String) =
+            androidx.core.content.ContextCompat.checkSelfPermission(ctx, p) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
         return if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
             arrayOf(
                 android.Manifest.permission.BLUETOOTH_SCAN,
                 android.Manifest.permission.BLUETOOTH_CONNECT,
                 android.Manifest.permission.BLUETOOTH_ADVERTISE,
-            ).all {
-                androidx.core.content.ContextCompat
-                    .checkSelfPermission(ctx, it) ==
-                    android.content.pm.PackageManager.PERMISSION_GRANTED
-            }
+            ).all(::granted)
         } else {
-            true // location already checked above
+            granted(android.Manifest.permission.ACCESS_FINE_LOCATION)
         }
     }
 
