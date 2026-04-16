@@ -2,12 +2,9 @@ use crate::types::DeviceId;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-/// Events emitted by the peripheral (advertiser/GATT server) role.
-///
-/// `PeripheralEvent` is intentionally **not** `Clone`: [`ReadRequest`] and [`WriteRequest`]
-/// carry owned responder handles that must be consumed exactly once.
-#[derive(Debug)]
-pub enum PeripheralEvent {
+/// Non-request events from the peripheral role. Clone-able; multiple subscribers welcome.
+#[derive(Debug, Clone)]
+pub enum PeripheralStateEvent {
     /// The local Bluetooth adapter was powered on or off.
     AdapterStateChanged { powered: bool },
 
@@ -17,11 +14,17 @@ pub enum PeripheralEvent {
         char_uuid: Uuid,
         subscribed: bool,
     },
+}
 
+/// Inbound GATT requests from remote centrals.
+///
+/// Each variant carries an owned responder that must be consumed exactly once,
+/// or dropped (which sends an ATT Application Error automatically). Single-consumer:
+/// the request stream is handed out via [`Peripheral::take_requests`].
+#[derive(Debug)]
+pub enum PeripheralRequest {
     /// A remote central sent an ATT Read Request.
-    /// Consume `responder` to send the value; dropping it without responding sends an
-    /// ATT Application Error automatically.
-    ReadRequest {
+    Read {
         client_id: DeviceId,
         service_uuid: Uuid,
         char_uuid: Uuid,
@@ -32,7 +35,7 @@ pub enum PeripheralEvent {
     /// A remote central sent an ATT Write Request or Write Command.
     /// `responder` is `Some` for Write Request (needs an ATT response) and
     /// `None` for Write Without Response.
-    WriteRequest {
+    Write {
         client_id: DeviceId,
         service_uuid: Uuid,
         char_uuid: Uuid,
