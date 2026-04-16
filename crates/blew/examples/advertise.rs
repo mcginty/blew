@@ -10,7 +10,7 @@
 use blew::Peripheral;
 use blew::gatt::props::{AttributePermissions, CharacteristicProperties};
 use blew::gatt::service::{GattCharacteristic, GattService};
-use blew::peripheral::{AdvertisingConfig, PeripheralEvent};
+use blew::peripheral::{AdvertisingConfig, PeripheralRequest, PeripheralStateEvent};
 use tokio_stream::StreamExt as _;
 use uuid::Uuid;
 
@@ -41,7 +41,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
 
-    let mut events = peripheral.events();
+    let mut requests = peripheral.take_requests().expect("requests already taken");
+    let mut state = peripheral.state_events();
 
     peripheral
         .start_advertising(&AdvertisingConfig {
@@ -51,15 +52,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     println!("Advertising as \"blew-example\" for 30 s ... (Ctrl-C to stop early)");
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-
-    loop {
-        match tokio::time::timeout_at(deadline, events.next()).await {
-            Ok(Some(event)) => match event {
-                PeripheralEvent::AdapterStateChanged { powered } => {
+    let state_task = tokio::spawn(async move {
+        while let Some(event) = state.next().await {
+            match event {
+                PeripheralStateEvent::AdapterStateChanged { powered } => {
                     println!("  adapter state: powered={powered}");
                 }
-                PeripheralEvent::SubscriptionChanged {
+                PeripheralStateEvent::SubscriptionChanged {
                     client_id,
                     char_uuid,
                     subscribed,
@@ -69,7 +68,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                          subscribed={subscribed}"
                     );
                 }
-                PeripheralEvent::ReadRequest {
+            }
+        }
+    });
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+
+    loop {
+        match tokio::time::timeout_at(deadline, requests.next()).await {
+            Ok(Some(request)) => match request {
+                PeripheralRequest::Read {
                     client_id,
                     char_uuid,
                     offset,
@@ -80,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let reply = b"hello from blew".to_vec();
                     responder.respond(reply);
                 }
-                PeripheralEvent::WriteRequest {
+                PeripheralRequest::Write {
                     client_id,
                     char_uuid,
                     value,
@@ -97,11 +105,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             },
-            Ok(None) => break, // event stream closed
+            Ok(None) => break, // request stream closed
             Err(_) => break,   // 30 s elapsed
         }
     }
 
+    state_task.abort();
     peripheral.stop_advertising().await?;
     println!("Done.");
     Ok(())

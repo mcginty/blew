@@ -15,7 +15,9 @@ use uuid::Uuid;
 
 use crate::central::types::{CentralEvent, DisconnectCause};
 use crate::l2cap::types::Psm;
-use crate::peripheral::types::{PeripheralEvent, ReadResponder, WriteResponder};
+use crate::peripheral::types::{
+    PeripheralRequest, PeripheralStateEvent, ReadResponder, WriteResponder,
+};
 use crate::types::{BleDevice, DeviceId};
 
 use super::jni_globals::{jvm, peripheral_class};
@@ -73,7 +75,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnRead
             let (tx, rx) = oneshot::channel();
             let responder = ReadResponder::new(tx);
 
-            let event = PeripheralEvent::ReadRequest {
+            let event = PeripheralRequest::Read {
                 client_id: DeviceId::from(addr.as_str()),
                 service_uuid: svc_uuid,
                 char_uuid: chr_uuid,
@@ -81,7 +83,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnRead
                 responder,
             };
 
-            super::peripheral::send_event(event);
+            super::peripheral::send_request(event);
 
             let req_id = request_id;
             let addr_clone = addr.clone();
@@ -171,7 +173,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnWrit
                 None
             };
 
-            let event = PeripheralEvent::WriteRequest {
+            let event = PeripheralRequest::Write {
                 client_id: DeviceId::from(addr.as_str()),
                 service_uuid: svc_uuid,
                 char_uuid: chr_uuid,
@@ -179,7 +181,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnWrit
                 responder,
             };
 
-            super::peripheral::send_event(event);
+            super::peripheral::send_request(event);
 
             Ok(())
         })
@@ -228,7 +230,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnSubs
 
             trace!(addr, %chr_uuid, subscribed = subscribed == JNI_TRUE, "subscription changed");
 
-            super::peripheral::send_event(PeripheralEvent::SubscriptionChanged {
+            super::peripheral::send_state_event(PeripheralStateEvent::SubscriptionChanged {
                 client_id: DeviceId::from(addr.as_str()),
                 char_uuid: chr_uuid,
                 subscribed: subscribed == JNI_TRUE,
@@ -273,7 +275,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnAdap
 ) {
     guard("nativeOnAdapterStateChanged", || {
         trace!(powered = powered == JNI_TRUE, "adapter state changed");
-        super::peripheral::send_event(PeripheralEvent::AdapterStateChanged {
+        super::peripheral::send_state_event(PeripheralStateEvent::AdapterStateChanged {
             powered: powered == JNI_TRUE,
         });
     });

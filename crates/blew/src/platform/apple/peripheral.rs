@@ -35,7 +35,7 @@ use objc2_core_bluetooth::{
 };
 use objc2_foundation::{NSArray, NSData, NSDictionary, NSError, NSObjectProtocol, NSString};
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use uuid::Uuid;
 
@@ -46,12 +46,15 @@ use crate::gatt::props::{AttributePermissions, CharacteristicProperties};
 use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, types::Psm};
 use crate::peripheral::backend::{self, PeripheralBackend};
-use crate::peripheral::types::{AdvertisingConfig, PeripheralEvent, ReadResponder, WriteResponder};
+use crate::peripheral::types::{
+    AdvertisingConfig, PeripheralRequest, PeripheralStateEvent, ReadResponder, WriteResponder,
+};
 use crate::platform::apple::helpers::{
     ObjcSend, cbuuid_to_uuid, central_device_id, retain_send, uuid_to_cbuuid,
 };
 use crate::platform::apple::l2cap::bridge_l2cap_channel;
 use crate::types::DeviceId;
+use crate::util::BroadcastEventStream;
 
 fn our_props_to_cb(props: CharacteristicProperties) -> CBCharacteristicProperties {
     let mut out = CBCharacteristicProperties(0);
@@ -105,10 +108,12 @@ struct PeripheralInner {
     adv_tx: Mutex<Option<oneshot::Sender<BlewResult<()>>>>,
     /// Pending `add_service()` results.
     add_svc_tx: Mutex<HashMap<Uuid, oneshot::Sender<BlewResult<()>>>>,
-    /// Single event subscriber (most recent call to `events()` wins).
-    ///
-    /// `PeripheralEvent` is `!Clone`, so we cannot fan out to multiple subscribers.
-    event_tx: Mutex<Option<mpsc::UnboundedSender<PeripheralEvent>>>,
+    /// Inbound GATT requests. The receiver is handed out at most once via
+    /// [`PeripheralBackend::take_requests`].
+    request_tx: mpsc::UnboundedSender<PeripheralRequest>,
+    request_rx: Mutex<Option<mpsc::UnboundedReceiver<PeripheralRequest>>>,
+    /// Broadcast sender for clone-able state events (adapter power, subscription changes).
+    state_tx: broadcast::Sender<PeripheralStateEvent>,
     /// Powered state watch.
     powered_tx: watch::Sender<bool>,
     /// Result of `publishL2CAPChannelWithEncryption` -- carries the assigned PSM.
@@ -124,12 +129,16 @@ struct PeripheralInner {
 impl PeripheralInner {
     fn new() -> (Arc<Self>, watch::Receiver<bool>) {
         let (powered_tx, powered_rx) = watch::channel(false);
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (state_tx, _) = broadcast::channel(64);
         let inner = Arc::new(Self {
             chars: Default::default(),
             subscribers: Default::default(),
             adv_tx: Default::default(),
             add_svc_tx: Default::default(),
-            event_tx: Mutex::new(None),
+            request_tx,
+            request_rx: Mutex::new(Some(request_rx)),
+            state_tx,
             powered_tx,
             l2cap_publish_tx: Mutex::new(None),
             l2cap_channel_tx: Mutex::new(None),
@@ -138,10 +147,12 @@ impl PeripheralInner {
         (inner, powered_rx)
     }
 
-    fn emit(&self, event: PeripheralEvent) {
-        if let Some(tx) = self.event_tx.lock().as_ref() {
-            let _ = tx.send(event);
-        }
+    fn emit_state(&self, event: PeripheralStateEvent) {
+        let _ = self.state_tx.send(event);
+    }
+
+    fn emit_request(&self, request: PeripheralRequest) {
+        let _ = self.request_tx.send(request);
     }
 }
 
@@ -161,7 +172,7 @@ define_class!(
             debug!(powered, "peripheral adapter state changed");
             let inner = self.ivars();
             let _ = inner.powered_tx.send(powered);
-            inner.emit(PeripheralEvent::AdapterStateChanged { powered });
+            inner.emit_state(PeripheralStateEvent::AdapterStateChanged { powered });
         }
 
         #[unsafe(method(peripheralManagerDidStartAdvertising:error:))]
@@ -232,7 +243,7 @@ define_class!(
                 let entry = subs.entry(char_uuid).or_default();
                 entry.insert(client_id.clone(), unsafe { retain_send(central) });
             }
-            inner.emit(PeripheralEvent::SubscriptionChanged {
+            inner.emit_state(PeripheralStateEvent::SubscriptionChanged {
                 client_id,
                 char_uuid,
                 subscribed: true,
@@ -262,7 +273,7 @@ define_class!(
                     }
                 }
             }
-            inner.emit(PeripheralEvent::SubscriptionChanged {
+            inner.emit_state(PeripheralStateEvent::SubscriptionChanged {
                 client_id,
                 char_uuid,
                 subscribed: false,
@@ -297,7 +308,7 @@ define_class!(
             let (tx, rx) = oneshot::channel::<Result<Vec<u8>, ()>>();
             let responder = ReadResponder::new(tx);
 
-            inner.emit(PeripheralEvent::ReadRequest {
+            inner.emit_request(PeripheralRequest::Read {
                 client_id,
                 service_uuid,
                 char_uuid,
@@ -364,7 +375,7 @@ define_class!(
             let (tx, rx) = oneshot::channel::<bool>();
             let responder = WriteResponder::new(tx);
 
-            inner.emit(PeripheralEvent::WriteRequest {
+            inner.emit_request(PeripheralRequest::Write {
                 client_id,
                 service_uuid,
                 char_uuid,
@@ -472,7 +483,8 @@ pub struct ApplePeripheral(Arc<PeripheralHandle>);
 impl backend::private::Sealed for ApplePeripheral {}
 
 impl PeripheralBackend for ApplePeripheral {
-    type EventStream = UnboundedReceiverStream<PeripheralEvent>;
+    type StateEvents = BroadcastEventStream<PeripheralStateEvent>;
+    type Requests = UnboundedReceiverStream<PeripheralRequest>;
 
     async fn new() -> BlewResult<Self>
     where
@@ -728,9 +740,16 @@ impl PeripheralBackend for ApplePeripheral {
         }
     }
 
-    fn events(&self) -> Self::EventStream {
-        let (tx, rx) = mpsc::unbounded_channel();
-        *self.0.inner.event_tx.lock() = Some(tx);
-        UnboundedReceiverStream::new(rx)
+    fn state_events(&self) -> Self::StateEvents {
+        BroadcastEventStream::new(self.0.inner.state_tx.subscribe())
+    }
+
+    fn take_requests(&self) -> Option<Self::Requests> {
+        self.0
+            .inner
+            .request_rx
+            .lock()
+            .take()
+            .map(UnboundedReceiverStream::new)
     }
 }

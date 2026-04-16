@@ -19,7 +19,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::central::backend::{self, CentralBackend};
@@ -28,8 +28,11 @@ use crate::error::{BlewError, BlewResult};
 use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, types::Psm};
 use crate::peripheral::backend::{self as periph_backend, PeripheralBackend};
-use crate::peripheral::types::{AdvertisingConfig, PeripheralEvent, ReadResponder, WriteResponder};
+use crate::peripheral::types::{
+    AdvertisingConfig, PeripheralRequest, PeripheralStateEvent, ReadResponder, WriteResponder,
+};
 use crate::types::{BleDevice, DeviceId};
+use crate::util::BroadcastEventStream;
 /// Policy for injecting L2CAP failures in mock tests.
 #[derive(Debug, Clone, Default)]
 pub struct MockL2capPolicy {
@@ -98,23 +101,25 @@ impl MockLink {
         }));
 
         let (central_event_tx, central_event_rx) = mpsc::unbounded_channel();
-        let (periph_event_tx, periph_event_rx) = mpsc::unbounded_channel();
+        let (periph_request_tx, periph_request_rx) = mpsc::unbounded_channel();
+        let (periph_state_tx, _) = broadcast::channel(64);
 
         let _ = central_event_tx.send(CentralEvent::AdapterStateChanged { powered: true });
 
         let central = MockCentral {
             link: Arc::clone(&link),
             event_tx: central_event_tx.clone(),
-            periph_sender_keepalive: Arc::new(Mutex::new(Some(periph_event_tx.clone()))),
             central_rx: Arc::new(Mutex::new(Some(central_event_rx))),
-            periph_event_tx,
+            periph_request_tx: periph_request_tx.clone(),
+            periph_state_tx: periph_state_tx.clone(),
             powered: Arc::new(Mutex::new(true)),
         };
 
         let peripheral = MockPeripheral {
             link: Arc::clone(&link),
-            event_tx: Arc::new(Mutex::new(Some(periph_event_rx))),
-            emit_tx: None,
+            request_rx: Arc::new(Mutex::new(Some(periph_request_rx))),
+            request_tx: periph_request_tx,
+            state_tx: periph_state_tx,
             central_sender_keepalive: central_event_tx.clone(),
             powered: Arc::new(Mutex::new(true)),
         };
@@ -137,9 +142,9 @@ impl MockLink {
 pub struct MockCentral {
     link: SharedLink,
     event_tx: mpsc::UnboundedSender<CentralEvent>,
-    periph_sender_keepalive: Arc<Mutex<Option<mpsc::UnboundedSender<PeripheralEvent>>>>,
     central_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<CentralEvent>>>>,
-    periph_event_tx: mpsc::UnboundedSender<PeripheralEvent>,
+    periph_request_tx: mpsc::UnboundedSender<PeripheralRequest>,
+    periph_state_tx: broadcast::Sender<PeripheralStateEvent>,
     powered: Arc<Mutex<bool>>,
 }
 
@@ -148,9 +153,9 @@ impl Clone for MockCentral {
         Self {
             link: Arc::clone(&self.link),
             event_tx: self.event_tx.clone(),
-            periph_sender_keepalive: Arc::clone(&self.periph_sender_keepalive),
             central_rx: Arc::clone(&self.central_rx),
-            periph_event_tx: self.periph_event_tx.clone(),
+            periph_request_tx: self.periph_request_tx.clone(),
+            periph_state_tx: self.periph_state_tx.clone(),
             powered: Arc::clone(&self.powered),
         }
     }
@@ -161,34 +166,19 @@ impl MockCentral {
     /// Construct a standalone powered mock central (not linked to any peripheral).
     #[must_use]
     pub fn new_powered() -> crate::central::Central<Self> {
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (periph_event_tx, _periph_event_rx) = mpsc::unbounded_channel();
-        let link = Arc::new(Mutex::new(LinkState {
-            services: Vec::new(),
-            char_values: std::collections::HashMap::new(),
-            subscriptions: std::collections::HashMap::new(),
-            advertising: false,
-            adv_config: None,
-            connected: false,
-            l2cap_policy: MockL2capPolicy::default(),
-            l2cap_psm: None,
-            l2cap_accept_tx: None,
-        }));
-        crate::central::Central::from_backend(Self {
-            link,
-            event_tx,
-            periph_sender_keepalive: Arc::new(Mutex::new(None)),
-            central_rx: Arc::new(Mutex::new(Some(event_rx))),
-            periph_event_tx,
-            powered: Arc::new(Mutex::new(true)),
-        })
+        Self::new_standalone(true)
     }
 
     /// Construct a standalone unpowered mock central (not linked to any peripheral).
     #[must_use]
     pub fn new_unpowered() -> crate::central::Central<Self> {
+        Self::new_standalone(false)
+    }
+
+    fn new_standalone(powered: bool) -> crate::central::Central<Self> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (periph_event_tx, _periph_event_rx) = mpsc::unbounded_channel();
+        let (periph_request_tx, _periph_request_rx) = mpsc::unbounded_channel();
+        let (periph_state_tx, _) = broadcast::channel(64);
         let link = Arc::new(Mutex::new(LinkState {
             services: Vec::new(),
             char_values: std::collections::HashMap::new(),
@@ -203,10 +193,10 @@ impl MockCentral {
         crate::central::Central::from_backend(Self {
             link,
             event_tx,
-            periph_sender_keepalive: Arc::new(Mutex::new(None)),
             central_rx: Arc::new(Mutex::new(Some(event_rx))),
-            periph_event_tx,
-            powered: Arc::new(Mutex::new(false)),
+            periph_request_tx,
+            periph_state_tx,
+            powered: Arc::new(Mutex::new(powered)),
         })
     }
 
@@ -310,7 +300,7 @@ impl CentralBackend for MockCentral {
             .iter()
             .any(|s| s.characteristics.iter().any(|c| c.uuid == char_uuid));
         let device_id = device_id.clone();
-        let periph_tx = self.periph_event_tx.clone();
+        let periph_tx = self.periph_request_tx.clone();
 
         async move {
             if let Some(value) = static_value
@@ -328,7 +318,7 @@ impl CentralBackend for MockCentral {
 
             let (tx, rx) = oneshot::channel();
             let responder = ReadResponder::new(tx);
-            let _ = periph_tx.send(PeripheralEvent::ReadRequest {
+            let _ = periph_tx.send(PeripheralRequest::Read {
                 client_id: DeviceId::from("mock-central"),
                 service_uuid: Uuid::nil(),
                 char_uuid,
@@ -352,7 +342,7 @@ impl CentralBackend for MockCentral {
         value: Vec<u8>,
         write_type: WriteType,
     ) -> impl Future<Output = BlewResult<()>> + Send {
-        let periph_tx = self.periph_event_tx.clone();
+        let periph_tx = self.periph_request_tx.clone();
         async move {
             let (responder, rx) = match write_type {
                 WriteType::WithResponse => {
@@ -362,7 +352,7 @@ impl CentralBackend for MockCentral {
                 WriteType::WithoutResponse => (None, None),
             };
 
-            let _ = periph_tx.send(PeripheralEvent::WriteRequest {
+            let _ = periph_tx.send(PeripheralRequest::Write {
                 client_id: DeviceId::from("mock-central"),
                 service_uuid: Uuid::nil(),
                 char_uuid,
@@ -392,7 +382,7 @@ impl CentralBackend for MockCentral {
         let device_id = device_id.clone();
         let link = Arc::clone(&self.link);
         let event_tx = self.event_tx.clone();
-        let periph_event_tx = self.periph_event_tx.clone();
+        let periph_state_tx = self.periph_state_tx.clone();
         async move {
             let rx = {
                 let mut link = link.lock();
@@ -419,7 +409,7 @@ impl CentralBackend for MockCentral {
                 }
             });
 
-            let _ = periph_event_tx.send(PeripheralEvent::SubscriptionChanged {
+            let _ = periph_state_tx.send(PeripheralStateEvent::SubscriptionChanged {
                 client_id: DeviceId::from("mock-central"),
                 char_uuid,
                 subscribed: true,
@@ -485,9 +475,9 @@ impl CentralBackend for MockCentral {
 /// In-memory mock [`PeripheralBackend`].
 pub struct MockPeripheral {
     link: SharedLink,
-    event_tx: Arc<Mutex<Option<mpsc::UnboundedReceiver<PeripheralEvent>>>>,
-    /// Sender for standalone (non-paired) mock peripherals; `None` in pair mode.
-    emit_tx: Option<mpsc::UnboundedSender<PeripheralEvent>>,
+    request_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<PeripheralRequest>>>>,
+    request_tx: mpsc::UnboundedSender<PeripheralRequest>,
+    state_tx: broadcast::Sender<PeripheralStateEvent>,
     central_sender_keepalive: mpsc::UnboundedSender<CentralEvent>,
     powered: Arc<Mutex<bool>>,
 }
@@ -496,8 +486,9 @@ impl Clone for MockPeripheral {
     fn clone(&self) -> Self {
         Self {
             link: Arc::clone(&self.link),
-            event_tx: Arc::clone(&self.event_tx),
-            emit_tx: self.emit_tx.clone(),
+            request_rx: Arc::clone(&self.request_rx),
+            request_tx: self.request_tx.clone(),
+            state_tx: self.state_tx.clone(),
             central_sender_keepalive: self.central_sender_keepalive.clone(),
             powered: Arc::clone(&self.powered),
         }
@@ -523,44 +514,43 @@ impl MockPeripheral {
     /// Construct a standalone powered mock peripheral (not linked to any central).
     #[must_use]
     pub fn new_powered() -> crate::peripheral::Peripheral<Self> {
-        let (central_event_tx, _central_event_rx) = mpsc::unbounded_channel::<CentralEvent>();
-        let (periph_event_tx, periph_event_rx) = mpsc::unbounded_channel();
-        crate::peripheral::Peripheral::from_backend(Self {
-            link: Self::make_link(),
-            event_tx: Arc::new(Mutex::new(Some(periph_event_rx))),
-            emit_tx: Some(periph_event_tx),
-            central_sender_keepalive: central_event_tx,
-            powered: Arc::new(Mutex::new(true)),
-        })
+        Self::new_standalone(true)
     }
 
     /// Construct a standalone unpowered mock peripheral (not linked to any central).
     #[must_use]
     pub fn new_unpowered() -> crate::peripheral::Peripheral<Self> {
+        Self::new_standalone(false)
+    }
+
+    fn new_standalone(powered: bool) -> crate::peripheral::Peripheral<Self> {
         let (central_event_tx, _central_event_rx) = mpsc::unbounded_channel::<CentralEvent>();
-        let (periph_event_tx, periph_event_rx) = mpsc::unbounded_channel();
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (state_tx, _) = broadcast::channel(64);
         crate::peripheral::Peripheral::from_backend(Self {
             link: Self::make_link(),
-            event_tx: Arc::new(Mutex::new(Some(periph_event_rx))),
-            emit_tx: Some(periph_event_tx),
+            request_rx: Arc::new(Mutex::new(Some(request_rx))),
+            request_tx,
+            state_tx,
             central_sender_keepalive: central_event_tx,
-            powered: Arc::new(Mutex::new(false)),
+            powered: Arc::new(Mutex::new(powered)),
         })
     }
 
     /// Emit an `AdapterStateChanged` event and update the powered flag.
     pub fn mock_emit_adapter_state(&self, powered: bool) {
         *self.powered.lock() = powered;
-        if let Some(tx) = &self.emit_tx {
-            let _ = tx.send(PeripheralEvent::AdapterStateChanged { powered });
-        }
+        let _ = self
+            .state_tx
+            .send(PeripheralStateEvent::AdapterStateChanged { powered });
     }
 }
 
 impl periph_backend::private::Sealed for MockPeripheral {}
 
 impl PeripheralBackend for MockPeripheral {
-    type EventStream = tokio_stream::wrappers::UnboundedReceiverStream<PeripheralEvent>;
+    type StateEvents = BroadcastEventStream<PeripheralStateEvent>;
+    type Requests = tokio_stream::wrappers::UnboundedReceiverStream<PeripheralRequest>;
 
     async fn new() -> BlewResult<Self>
     where
@@ -644,13 +634,15 @@ impl PeripheralBackend for MockPeripheral {
         }
     }
 
-    fn events(&self) -> Self::EventStream {
-        let rx = self
-            .event_tx
+    fn state_events(&self) -> Self::StateEvents {
+        BroadcastEventStream::new(self.state_tx.subscribe())
+    }
+
+    fn take_requests(&self) -> Option<Self::Requests> {
+        self.request_rx
             .lock()
             .take()
-            .expect("events() called more than once on MockPeripheral");
-        tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
+            .map(tokio_stream::wrappers::UnboundedReceiverStream::new)
     }
 }
 impl<B: CentralBackend> crate::central::Central<B> {
@@ -678,11 +670,7 @@ impl crate::central::Central<MockCentral> {
 impl<B: PeripheralBackend> crate::peripheral::Peripheral<B> {
     /// Create a `Peripheral` from a pre-constructed backend (for testing).
     pub fn from_backend(backend: B) -> Self {
-        Self {
-            backend,
-            #[cfg(debug_assertions)]
-            events_taken: std::sync::atomic::AtomicBool::new(false),
-        }
+        Self { backend }
     }
 }
 
@@ -690,10 +678,6 @@ impl<B: PeripheralBackend + Clone> Clone for crate::peripheral::Peripheral<B> {
     fn clone(&self) -> Self {
         Self {
             backend: self.backend.clone(),
-            #[cfg(debug_assertions)]
-            events_taken: std::sync::atomic::AtomicBool::new(
-                self.events_taken.load(std::sync::atomic::Ordering::SeqCst),
-            ),
         }
     }
 }
@@ -830,10 +814,12 @@ mod tests {
             .await
             .unwrap();
 
-        let mut events = peripheral.events();
+        let mut requests = peripheral
+            .take_requests()
+            .expect("requests stream available");
         tokio::spawn(async move {
-            while let Some(event) = events.next().await {
-                if let PeripheralEvent::ReadRequest { responder, .. } = event {
+            while let Some(request) = requests.next().await {
+                if let PeripheralRequest::Read { responder, .. } = request {
                     responder.respond(b"dynamic-response".to_vec());
                 }
             }
@@ -871,12 +857,14 @@ mod tests {
 
         let received = Arc::new(Mutex::new(Vec::new()));
         let received2 = received.clone();
-        let mut events = peripheral.events();
+        let mut requests = peripheral
+            .take_requests()
+            .expect("requests stream available");
         tokio::spawn(async move {
-            while let Some(event) = events.next().await {
-                if let PeripheralEvent::WriteRequest {
+            while let Some(request) = requests.next().await {
+                if let PeripheralRequest::Write {
                     value, responder, ..
-                } = event
+                } = request
                 {
                     received2.lock().push(value);
                     if let Some(r) = responder {
@@ -912,12 +900,14 @@ mod tests {
         let char_uuid = Uuid::from_u128(0xDDDD);
         let received = Arc::new(Mutex::new(Vec::new()));
         let received2 = received.clone();
-        let mut events = peripheral.events();
+        let mut requests = peripheral
+            .take_requests()
+            .expect("requests stream available");
         tokio::spawn(async move {
-            while let Some(event) = events.next().await {
-                if let PeripheralEvent::WriteRequest {
+            while let Some(request) = requests.next().await {
+                if let PeripheralRequest::Write {
                     value, responder, ..
-                } = event
+                } = request
                 {
                     received2.lock().push(value);
                     assert!(responder.is_none());
@@ -1082,17 +1072,19 @@ mod tests {
             "write-with-response should block until ACK"
         );
 
-        let mut events = peripheral.events();
-        let ev = tokio::time::timeout(std::time::Duration::from_millis(50), events.next())
+        let mut requests = peripheral
+            .take_requests()
+            .expect("requests stream available");
+        let req = tokio::time::timeout(std::time::Duration::from_millis(50), requests.next())
             .await
-            .expect("should have event")
+            .expect("should have request")
             .expect("stream should not end");
 
-        match ev {
-            PeripheralEvent::WriteRequest { responder, .. } => {
+        match req {
+            PeripheralRequest::Write { responder, .. } => {
                 responder.unwrap().success();
             }
-            other => panic!("expected WriteRequest, got {other:?}"),
+            other => panic!("expected Write request, got {other:?}"),
         }
     }
     #[tokio::test]
@@ -1117,15 +1109,17 @@ mod tests {
             .await
             .unwrap();
 
-        let mut events = peripheral.events();
+        let mut requests = peripheral
+            .take_requests()
+            .expect("requests stream available");
         let expected_char = char_uuid;
         tokio::spawn(async move {
-            while let Some(event) = events.next().await {
-                if let PeripheralEvent::ReadRequest {
+            while let Some(request) = requests.next().await {
+                if let PeripheralRequest::Read {
                     char_uuid,
                     responder,
                     ..
-                } = event
+                } = request
                 {
                     if char_uuid == expected_char {
                         responder.respond(b"correct-char".to_vec());
@@ -1181,20 +1175,20 @@ mod tests {
         let char_uuid = Uuid::from_u128(0x7777);
         let device_id = DeviceId::from("mock-peripheral");
 
-        let mut events = peripheral.events();
+        let mut state = peripheral.state_events();
 
         central
             .subscribe_characteristic(&device_id, char_uuid)
             .await
             .unwrap();
 
-        let ev = tokio::time::timeout(std::time::Duration::from_millis(100), events.next())
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(100), state.next())
             .await
             .expect("should receive subscription event")
             .expect("stream should not end");
 
         match ev {
-            PeripheralEvent::SubscriptionChanged {
+            PeripheralStateEvent::SubscriptionChanged {
                 char_uuid: uuid,
                 subscribed,
                 ..
@@ -1359,10 +1353,12 @@ mod tests {
             .await
             .unwrap();
 
-        let mut events = peripheral.events();
+        let mut requests = peripheral
+            .take_requests()
+            .expect("requests stream available");
         tokio::spawn(async move {
-            while let Some(event) = events.next().await {
-                if let PeripheralEvent::ReadRequest { responder, .. } = event {
+            while let Some(request) = requests.next().await {
+                if let PeripheralRequest::Read { responder, .. } = request {
                     drop(responder); // RAII: auto-sends error
                 }
             }

@@ -13,7 +13,7 @@
 use blew::Peripheral;
 use blew::gatt::props::{AttributePermissions, CharacteristicProperties};
 use blew::gatt::service::{GattCharacteristic, GattService};
-use blew::peripheral::{AdvertisingConfig, PeripheralEvent};
+use blew::peripheral::{AdvertisingConfig, PeripheralRequest};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_stream::StreamExt as _;
@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
 
-    let mut events = peripheral.events();
+    let mut requests = peripheral.take_requests().expect("requests already taken");
 
     // On Apple the OS assigns a dynamic PSM.
     let (psm, mut l2cap_channels) = peripheral.l2cap_listener().await?;
@@ -63,10 +63,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         tokio::select! {
-            event = events.next() => {
-                let Some(event) = event else { break };
-                match event {
-                    PeripheralEvent::ReadRequest { char_uuid, responder, .. }
+            request = requests.next() => {
+                let Some(request) = request else { break };
+                match request {
+                    PeripheralRequest::Read { char_uuid, responder, .. }
                         if char_uuid == PSM_CHAR_UUID =>
                     {
                         responder.respond(psm_bytes.clone());
