@@ -4,4 +4,4 @@ pub mod request_map;
 
 pub use event_fanout::{EventFanout, EventFanoutTx};
 pub use event_stream::EventStream;
-pub use request_map::RequestMap;
+pub use request_map::{KeyedRequestMap, RequestMap};
