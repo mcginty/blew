@@ -180,7 +180,7 @@ Uses `bluer 0.17` (official BlueZ Rust bindings over D-Bus).
 Uses `jni 0.22` and `ndk-context 0.1`. The Android BLE API is Java/Kotlin-only, so the backend bridges Rust ↔ Kotlin via JNI.
 
 **Architecture:**
-- **Kotlin singletons** (`BleCentralManager`, `BlePeripheralManager`) live in `crates/tauri-plugin-blew/android/`. They wrap `BluetoothLeScanner`, `BluetoothGatt`, `BluetoothGattServer`, and `BluetoothLeAdvertiser`.
+- **Kotlin singletons** (`BleCentralManager`, `BlePeripheralManager`) live in `crates/blew/android/` (co-located with the Rust JNI hooks so they link-time version together). They wrap `BluetoothLeScanner`, `BluetoothGatt`, `BluetoothGattServer`, and `BluetoothLeAdvertiser`.
 - **Rust → Kotlin**: `jvm().attach_current_thread()` then `call_static_method` on Kotlin object singletons.
 - **Kotlin → Rust**: `@JvmStatic external fun` declarations in Kotlin, implemented as `#[unsafe(no_mangle)] extern "C"` in `jni_hooks.rs`.
 
@@ -210,11 +210,11 @@ rx.await?; // safe to await now
 
 ## `crates/tauri-plugin-blew` — Tauri plugin for Android BLE setup
 
-A lightweight Tauri 2 plugin that ships Kotlin BLE classes and initializes the JNI bridge.
+A thin Tauri 2 integration wrapper. The Kotlin BLE classes now live in `crates/blew/android/`; this crate just points Tauri's Gradle build at that path and initializes the JNI bridge.
 
-**Rust side** (`src/lib.rs`): On Android, stores the JVM reference in blew's `OnceLock` via `blew::platform::android::init_jvm()`, then registers the Android plugin.
+**Rust side** (`src/lib.rs`): On Android, stores the JVM reference in blew's `OnceLock` via `blew::platform::android::init_jvm()`, then registers the Android plugin. `build.rs` computes the path to `../blew/android` and passes it to `tauri_plugin::Builder::android_path()`.
 
-**Kotlin side** (`android/src/main/java/org/jakebot/blew/`):
+**Kotlin side** (lives at `crates/blew/android/src/main/java/org/jakebot/blew/`):
 - `BlewPlugin.kt` — `@TauriPlugin`, initializes BLE managers, requests runtime permissions (BLUETOOTH_SCAN/CONNECT/ADVERTISE on Android 12+; ACCESS_FINE_LOCATION on pre-12 only). `BLUETOOTH_SCAN` is declared with `neverForLocation` so scan results are delivered regardless of the OS-level Location Services toggle.
 - `BleCentralManager.kt` — Singleton wrapping scanner + GATT client. `ScanCallback` → `nativeOnDeviceDiscovered`. `BluetoothGattCallback` → `nativeOnConnectionStateChanged`, `nativeOnServicesDiscovered`, `nativeOnCharacteristicRead/Write/Changed`, `nativeOnMtuChanged`.
 - `BlePeripheralManager.kt` — Singleton wrapping GATT server + advertiser. `BluetoothGattServerCallback` → `nativeOnReadRequest`, `nativeOnWriteRequest`, `nativeOnSubscriptionChanged`, `nativeOnConnectionStateChanged`, `nativeOnAdapterStateChanged`.
