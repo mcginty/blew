@@ -1,7 +1,9 @@
 pub mod backend;
 pub mod types;
 
-pub use types::{AdvertisingConfig, PeripheralEvent, ReadResponder, WriteResponder};
+pub use types::{
+    AdvertisingConfig, PeripheralRequest, PeripheralStateEvent, ReadResponder, WriteResponder,
+};
 
 use crate::error::{BlewError, BlewResult};
 use crate::gatt::service::GattService;
@@ -27,8 +29,6 @@ use uuid::Uuid;
 /// ```
 pub struct Peripheral<B: PeripheralBackend = PlatformPeripheral> {
     pub(crate) backend: B,
-    #[cfg(debug_assertions)]
-    pub(crate) events_taken: std::sync::atomic::AtomicBool,
 }
 
 impl<B: PeripheralBackend> Peripheral<B> {
@@ -36,8 +36,6 @@ impl<B: PeripheralBackend> Peripheral<B> {
     pub async fn new() -> BlewResult<Self> {
         Ok(Self {
             backend: B::new().await?,
-            #[cfg(debug_assertions)]
-            events_taken: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -87,34 +85,18 @@ impl<B: PeripheralBackend> Peripheral<B> {
         self.backend.l2cap_listener().await
     }
 
-    /// Returns the peripheral event stream.
-    ///
-    /// # Single-consumer contract
-    ///
-    /// [`PeripheralEvent`] is `!Clone` because it carries RAII
-    /// [`ReadResponder`]/[`WriteResponder`] handles. Because of that, this
-    /// method is **single-consumer**: calling it a second time replaces the
-    /// internal sender and silently steals the stream from the previous
-    /// caller. Debug builds will panic on the second call to catch this
-    /// early; release builds will not.
-    pub fn events(&self) -> EventStream<PeripheralEvent, B::EventStream> {
-        #[cfg(debug_assertions)]
-        {
-            let was_taken = self
-                .events_taken
-                .swap(true, std::sync::atomic::Ordering::SeqCst);
-            assert!(
-                !was_taken,
-                "Peripheral::events() called more than once — this is not \
-                 supported (single-consumer contract); PeripheralEvent is !Clone \
-                 and a second call would silently steal the stream"
-            );
-        }
-        self.events_inner()
+    /// Subscribe to clone-able peripheral state events (adapter power, subscription changes).
+    /// Each call returns an independent stream; fan-out is safe.
+    pub fn state_events(&self) -> EventStream<PeripheralStateEvent, B::StateEvents> {
+        EventStream::new(self.backend.state_events())
     }
 
-    fn events_inner(&self) -> EventStream<PeripheralEvent, B::EventStream> {
-        EventStream::new(self.backend.events())
+    /// Take ownership of the inbound GATT request stream. Returns `None` on the second call.
+    ///
+    /// [`PeripheralRequest`] carries RAII [`ReadResponder`]/[`WriteResponder`] handles and
+    /// must be consumed by exactly one reader; this method enforces that at the type level.
+    pub fn take_requests(&self) -> Option<EventStream<PeripheralRequest, B::Requests>> {
+        self.backend.take_requests().map(EventStream::new)
     }
 
     /// Wait until the adapter is powered on, or return `BlewError::Timeout`.
@@ -122,10 +104,7 @@ impl<B: PeripheralBackend> Peripheral<B> {
         if self.backend.is_powered().await.unwrap_or(false) {
             return Ok(());
         }
-        // Uses events_inner() to bypass the single-consumer check since
-        // wait_ready is an internal operation; calling it should not "use up"
-        // the caller's one allowed events() call.
-        let mut events = self.events_inner();
+        let mut events = self.state_events();
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -136,20 +115,21 @@ impl<B: PeripheralBackend> Peripheral<B> {
             {
                 Err(_) => return Err(BlewError::Timeout),
                 Ok(None) => return Err(BlewError::StreamClosed),
-                Ok(Some(PeripheralEvent::AdapterStateChanged { powered: true })) => return Ok(()),
+                Ok(Some(PeripheralStateEvent::AdapterStateChanged { powered: true })) => {
+                    return Ok(());
+                }
                 Ok(Some(_)) => {}
             }
         }
     }
 }
 
-#[cfg(all(test, feature = "testing", debug_assertions))]
-mod single_consumer_test {
-    #[test]
-    #[should_panic(expected = "single-consumer contract")]
-    fn events_twice_panics_in_debug() {
+#[cfg(all(test, feature = "testing"))]
+mod take_requests_tests {
+    #[tokio::test]
+    async fn second_take_returns_none() {
         let p = crate::testing::MockPeripheral::new_powered();
-        let _ev1 = p.events();
-        let _ev2 = p.events();
+        assert!(p.take_requests().is_some());
+        assert!(p.take_requests().is_none());
     }
 }
