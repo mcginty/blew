@@ -70,6 +70,14 @@ pub enum ScanMode {
 }
 
 /// Filter applied during scanning.
+///
+/// # Platform caveats
+///
+/// **Linux/BlueZ:** BlueZ's device cache may emit `DeviceAdded` events for devices that do
+/// not match [`services`](Self::services) on the first tick after a fresh scan start. If you
+/// need strict filtering, re-check against
+/// [`CentralEvent::DeviceDiscovered`](super::CentralEvent::DeviceDiscovered) on the client
+/// side rather than relying on the filter alone.
 #[derive(Debug, Clone, Default)]
 pub struct ScanFilter {
     /// Only report peripherals advertising at least one of these service UUIDs.
