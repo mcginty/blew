@@ -308,6 +308,7 @@ impl CentralBackend for AndroidCentral {
 
     fn connect(&self, device_id: &DeviceId) -> impl Future<Output = BlewResult<()>> + Send {
         let addr = device_id.as_str().to_owned();
+        let id_for_err = device_id.clone();
         async move {
             let (tx, rx) = oneshot::channel();
 
@@ -329,7 +330,7 @@ impl CentralBackend for AndroidCentral {
                 .map_err(jni_err)?;
 
             rx.await
-                .map_err(|_| BlewError::Internal("connect cancelled".into()))?
+                .map_err(|_| BlewError::DisconnectedDuringOperation(id_for_err))?
         }
     }
 
@@ -386,7 +387,7 @@ impl CentralBackend for AndroidCentral {
             }
 
             rx.await
-                .map_err(|_| BlewError::Internal("discover_services cancelled".into()))?
+                .map_err(|_| BlewError::DisconnectedDuringOperation(did))?
         }
     }
 
@@ -427,7 +428,7 @@ impl CentralBackend for AndroidCentral {
             }
 
             rx.await
-                .map_err(|_| BlewError::Internal("read cancelled".into()))?
+                .map_err(|_| BlewError::DisconnectedDuringOperation(did))?
         }
     }
 
@@ -491,7 +492,7 @@ impl CentralBackend for AndroidCentral {
 
             if let Some(rx) = rx {
                 rx.await
-                    .map_err(|_| BlewError::Internal("write cancelled".into()))??;
+                    .map_err(|_| BlewError::DisconnectedDuringOperation(did))??;
             }
 
             Ok(())
@@ -578,6 +579,7 @@ impl CentralBackend for AndroidCentral {
         psm: Psm,
     ) -> impl Future<Output = BlewResult<L2capChannel>> + Send {
         let addr = device_id.as_str().to_owned();
+        let id_for_err = device_id.clone();
         async move {
             let (tx, rx) = oneshot::channel();
             super::l2cap_state::set_pending_open(addr.clone(), tx);
@@ -596,7 +598,7 @@ impl CentralBackend for AndroidCentral {
                 .map_err(jni_err)?;
 
             rx.await
-                .map_err(|_| BlewError::Internal("L2CAP open cancelled".into()))?
+                .map_err(|_| BlewError::DisconnectedDuringOperation(id_for_err))?
         }
     }
 

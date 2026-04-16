@@ -335,7 +335,10 @@ define_class!(
             let inner = self.ivars();
 
             if let Some(e) = error {
-                let err = BlewError::Internal(e.localizedDescription().to_string());
+                let err = BlewError::DiscoveryFailed {
+                    device_id: id.clone(),
+                    reason: e.localizedDescription().to_string(),
+                };
                 if let Some(ds) = inner.discoveries.lock().remove(&id) {
                     let _ = ds.tx.send(Err(err));
                 }
@@ -618,6 +621,7 @@ impl CentralBackend for AppleCentral {
         async move {
             debug!(device_id = %device_id, "connecting to device");
             // All ObjC ops in a synchronous block to avoid holding !Send types across .await.
+            let id_for_err = device_id.clone();
             let rx = {
                 let peripheral = handle
                     .inner
@@ -639,7 +643,7 @@ impl CentralBackend for AppleCentral {
                 rx
             };
             rx.await
-                .unwrap_or(Err(BlewError::Internal("connect dropped".into())))
+                .unwrap_or(Err(BlewError::DisconnectedDuringOperation(id_for_err)))
         }
     }
 
@@ -670,6 +674,7 @@ impl CentralBackend for AppleCentral {
         let device_id = device_id.clone();
         async move {
             debug!(device_id = %device_id, "discovering GATT services");
+            let id_for_err = device_id.clone();
             let rx = {
                 let peripheral = handle
                     .inner
@@ -693,7 +698,7 @@ impl CentralBackend for AppleCentral {
                 rx
             };
             rx.await
-                .unwrap_or(Err(BlewError::Internal("discover_services dropped".into())))
+                .unwrap_or(Err(BlewError::DisconnectedDuringOperation(id_for_err)))
         }
     }
 
@@ -706,6 +711,7 @@ impl CentralBackend for AppleCentral {
         let device_id = device_id.clone();
         async move {
             debug!(device_id = %device_id, %char_uuid, "reading characteristic");
+            let id_for_err = device_id.clone();
             let rx = {
                 let peripheral = handle
                     .inner
@@ -729,7 +735,7 @@ impl CentralBackend for AppleCentral {
                 // peripheral and characteristic drop here, before .await
             };
             rx.await
-                .unwrap_or(Err(BlewError::Internal("read dropped".into())))
+                .unwrap_or(Err(BlewError::DisconnectedDuringOperation(id_for_err)))
         }
     }
 
@@ -744,6 +750,7 @@ impl CentralBackend for AppleCentral {
         let device_id = device_id.clone();
         async move {
             trace!(device_id = %device_id, %char_uuid, len = value.len(), ?write_type, "writing characteristic");
+            let id_for_err = device_id.clone();
             let rx = {
                 let peripheral = handle
                     .inner
@@ -799,7 +806,7 @@ impl CentralBackend for AppleCentral {
                 // all ObjC objects drop here, before .await
             };
             rx.await
-                .unwrap_or(Err(BlewError::Internal("write dropped".into())))
+                .unwrap_or(Err(BlewError::DisconnectedDuringOperation(id_for_err)))
         }
     }
 
@@ -853,6 +860,7 @@ impl CentralBackend for AppleCentral {
         let device_id = device_id.clone();
         async move {
             debug!(device_id = %device_id, psm = psm.0, "opening L2CAP channel");
+            let id_for_err = device_id.clone();
             let rx = {
                 let peripheral = handle
                     .inner
@@ -869,7 +877,7 @@ impl CentralBackend for AppleCentral {
                 rx
             };
             rx.await
-                .unwrap_or(Err(BlewError::Internal("l2cap channel dropped".into())))
+                .unwrap_or(Err(BlewError::DisconnectedDuringOperation(id_for_err)))
         }
     }
 
@@ -956,6 +964,7 @@ impl AppleCentral {
         char_uuid: Uuid,
         enabled: bool,
     ) -> BlewResult<()> {
+        let id_for_err = device_id.clone();
         let rx = {
             let peripheral = handle
                 .inner
@@ -981,7 +990,7 @@ impl AppleCentral {
             rx
         };
         rx.await
-            .unwrap_or(Err(BlewError::Internal("set_notify dropped".into())))
+            .unwrap_or(Err(BlewError::DisconnectedDuringOperation(id_for_err)))
     }
 }
 

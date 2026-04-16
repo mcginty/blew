@@ -52,6 +52,15 @@ pub enum BlewError {
         char_uuid: Uuid,
     },
 
+    #[error("event stream closed unexpectedly")]
+    StreamClosed,
+
+    #[error("device {0} disconnected during operation")]
+    DisconnectedDuringOperation(DeviceId),
+
+    #[error("GATT discovery failed on {device_id}: {reason}")]
+    DiscoveryFailed { device_id: DeviceId, reason: String },
+
     #[error("GATT error on device {device_id}: {source}")]
     Gatt {
         device_id: DeviceId,

@@ -135,7 +135,7 @@ impl<B: PeripheralBackend> Peripheral<B> {
             match tokio::time::timeout(remaining, tokio_stream::StreamExt::next(&mut events)).await
             {
                 Err(_) => return Err(BlewError::Timeout),
-                Ok(None) => return Err(BlewError::Internal("adapter event stream closed".into())),
+                Ok(None) => return Err(BlewError::StreamClosed),
                 Ok(Some(PeripheralEvent::AdapterStateChanged { powered: true })) => return Ok(()),
                 Ok(Some(_)) => {}
             }
