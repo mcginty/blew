@@ -31,6 +31,20 @@ necessary Kotlin/JNI glue to enable Android functionality.
 | Linux | BlueZ (via `bluer`) | Yes | Yes | Yes |
 | Android | JNI + Kotlin (via `jni` and `ndk-context`) | Yes | Yes | Yes |
 
+## Platform notes
+
+- **macOS/iOS:** writable characteristics must be constructed with `value: vec![]` — otherwise
+  CoreBluetooth raises `NSInvalidArgumentException` → `SIGABRT`. See `GattCharacteristic` docs.
+- **Linux/BlueZ:** negotiated ATT MTU is not plumbed through the API yet; `Central::mtu` returns
+  a conservative default of 247. Writes larger than 244 bytes may be rejected by peers with
+  smaller negotiated MTUs.
+- **Android:** BLE permissions (`BLUETOOTH_SCAN`/`CONNECT`/`ADVERTISE` on API 31+, plus
+  `ACCESS_FINE_LOCATION` on older versions) must be granted at runtime — `Central::new` /
+  `Peripheral::new` return `BlewError::PermissionDenied` if not.
+- **Testing:** the `testing` feature exposes in-memory mock backends that enforce the
+  connection/service/MTU invariants the real backends do. Real hardware behavior is not
+  covered by CI; plan to smoke-test on device before shipping.
+
 ## Examples
 
 ```sh
