@@ -1,4 +1,4 @@
-use super::types::{AdvertisingConfig, PeripheralEvent};
+use super::types::{AdvertisingConfig, PeripheralRequest, PeripheralStateEvent};
 use crate::error::BlewResult;
 use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, types::Psm};
@@ -16,8 +16,11 @@ pub(crate) mod private {
 /// This trait is **sealed**: external crates cannot implement it. See [`CentralBackend`](crate::central::backend::CentralBackend)
 /// for the sealing rationale.
 pub trait PeripheralBackend: private::Sealed + Send + Sync + 'static {
-    /// The concrete `Stream` type yielded by [`events`](Self::events).
-    type EventStream: Stream<Item = PeripheralEvent> + Send + Unpin + 'static;
+    /// The concrete `Stream` type yielded by [`state_events`](Self::state_events).
+    type StateEvents: Stream<Item = PeripheralStateEvent> + Send + Unpin + 'static;
+
+    /// The concrete `Stream` type yielded by [`take_requests`](Self::take_requests).
+    type Requests: Stream<Item = PeripheralRequest> + Send + Unpin + 'static;
 
     /// Construct and initialise the backend.
     fn new() -> impl Future<Output = BlewResult<Self>> + Send
@@ -71,6 +74,11 @@ pub trait PeripheralBackend: private::Sealed + Send + Sync + 'static {
         )>,
     > + Send;
 
-    /// Subscribe to peripheral-role events. Each call returns an independent stream.
-    fn events(&self) -> Self::EventStream;
+    /// Subscribe to clone-able peripheral state events (adapter/power, subscription changes).
+    /// Each call returns an independent stream — fan-out is safe.
+    fn state_events(&self) -> Self::StateEvents;
+
+    /// Take ownership of the GATT request stream. Single-consumer by construction:
+    /// the first call returns `Some`, subsequent calls return `None`.
+    fn take_requests(&self) -> Option<Self::Requests>;
 }
