@@ -77,8 +77,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             incoming = l2cap_channels.next() => {
                 let Some(result) = incoming else { break };
                 match result {
-                    Ok(mut ch) => {
-                        println!("  L2CAP connection accepted -- echoing ...");
+                    Ok((device_id, mut ch)) => {
+                        println!("  L2CAP connection accepted from {device_id} -- echoing ...");
                         tokio::spawn(async move {
                             let mut buf = vec![0u8; 4096];
                             let mut total_bytes: usize = 0;

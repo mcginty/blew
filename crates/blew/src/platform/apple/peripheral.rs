@@ -112,7 +112,7 @@ struct PeripheralInner {
     /// Result of `publishL2CAPChannelWithEncryption` -- carries the assigned PSM.
     l2cap_publish_tx: Mutex<Option<oneshot::Sender<BlewResult<Psm>>>>,
     /// Sender for incoming L2CAP channels (set by `l2cap_listener`).
-    l2cap_channel_tx: Mutex<Option<mpsc::Sender<BlewResult<L2capChannel>>>>,
+    l2cap_channel_tx: Mutex<Option<mpsc::Sender<BlewResult<(DeviceId, L2capChannel)>>>>,
     /// Tokio runtime handle, captured at construction time so GCD callbacks
     /// (which run off the Tokio thread) can spawn tasks onto the runtime.
     runtime: Handle,
@@ -430,16 +430,19 @@ define_class!(
 
             // Request low-latency connection parameters for higher throughput.
             // On the peripheral side the channel peer is always CBCentral.
-            if let Some(peer) = ch.peer() {
+            let device_id = if let Some(peer) = ch.peer() {
                 let central: Retained<CBCentral> = Retained::cast_unchecked(peer);
                 manager.setDesiredConnectionLatency_forCentral(
                     CBPeripheralManagerConnectionLatency::Low,
                     &central,
                 );
-            }
+                central_device_id(&central)
+            } else {
+                DeviceId::from("unknown")
+            };
 
             let l2cap = bridge_l2cap_channel(ch, &inner.runtime);
-            let _ = tx.blocking_send(Ok(l2cap));
+            let _ = tx.blocking_send(Ok((device_id, l2cap)));
         }
     }
 );
@@ -701,13 +704,13 @@ impl PeripheralBackend for ApplePeripheral {
     ) -> impl Future<
         Output = BlewResult<(
             Psm,
-            impl Stream<Item = BlewResult<L2capChannel>> + Send + 'static,
+            impl Stream<Item = BlewResult<(DeviceId, L2capChannel)>> + Send + 'static,
         )>,
     > + Send {
         let handle = Arc::clone(&self.0);
         async move {
             debug!("publishing L2CAP CoC channel");
-            let (ch_tx, ch_rx) = mpsc::channel::<BlewResult<L2capChannel>>(16);
+            let (ch_tx, ch_rx) = mpsc::channel::<BlewResult<(DeviceId, L2capChannel)>>(16);
             let (pub_tx, pub_rx) = oneshot::channel::<BlewResult<Psm>>();
             {
                 *handle.inner.l2cap_channel_tx.lock().unwrap() = Some(ch_tx);

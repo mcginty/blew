@@ -61,7 +61,7 @@ struct LinkState {
     connected: bool,
     l2cap_policy: MockL2capPolicy,
     l2cap_psm: Option<crate::l2cap::types::Psm>,
-    l2cap_accept_tx: Option<tokio::sync::mpsc::UnboundedSender<BlewResult<L2capChannel>>>,
+    l2cap_accept_tx: Option<tokio::sync::mpsc::UnboundedSender<BlewResult<(DeviceId, L2capChannel)>>>,
 }
 
 type SharedLink = Arc<Mutex<LinkState>>;
@@ -431,10 +431,11 @@ impl CentralBackend for MockCentral {
 
     fn open_l2cap_channel(
         &self,
-        _device_id: &DeviceId,
+        device_id: &DeviceId,
         psm: Psm,
     ) -> impl Future<Output = BlewResult<L2capChannel>> + Send {
         let link = Arc::clone(&self.link);
+        let device_id = device_id.clone();
         async move {
             let accept_tx = {
                 let guard = link.lock().unwrap();
@@ -453,7 +454,7 @@ impl CentralBackend for MockCentral {
             };
             let (central_side, peripheral_side) = L2capChannel::pair(64 * 1024);
             accept_tx
-                .send(Ok(peripheral_side))
+                .send(Ok((device_id, peripheral_side)))
                 .map_err(|_| BlewError::Internal("listener stream closed".into()))?;
             Ok(central_side)
         }
@@ -610,7 +611,7 @@ impl PeripheralBackend for MockPeripheral {
     ) -> impl Future<
         Output = BlewResult<(
             crate::l2cap::types::Psm,
-            impl futures_core::Stream<Item = BlewResult<L2capChannel>> + Send + 'static,
+            impl futures_core::Stream<Item = BlewResult<(DeviceId, L2capChannel)>> + Send + 'static,
         )>,
     > + Send {
         let link = Arc::clone(&self.link);
@@ -1404,7 +1405,8 @@ mod tests {
 
         let (central_side, accepted) = tokio::join!(open_fut, accept_fut);
         let mut central_side = central_side.unwrap();
-        let mut periph_side = accepted.unwrap().unwrap();
+        let (accepted_device_id, mut periph_side) = accepted.unwrap().unwrap();
+        assert_eq!(accepted_device_id, DeviceId::from("mock-peripheral"));
 
         central_side.write_all(b"ping").await.unwrap();
         let mut buf = [0_u8; 4];

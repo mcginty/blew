@@ -421,7 +421,7 @@ impl PeripheralBackend for LinuxPeripheral {
         &self,
     ) -> BlewResult<(
         Psm,
-        impl futures_core::Stream<Item = BlewResult<L2capChannel>> + Send + 'static,
+        impl futures_core::Stream<Item = BlewResult<(DeviceId, L2capChannel)>> + Send + 'static,
     )> {
         debug!("starting L2CAP CoC listener");
         // Use low-level Socket API to explicitly set security to Low,
@@ -458,13 +458,14 @@ impl PeripheralBackend for LinuxPeripheral {
         let psm = Psm(local_addr.psm);
         debug!(psm = psm.0, "L2CAP listener ready");
 
-        let (tx, rx) = mpsc::channel::<BlewResult<L2capChannel>>(16);
+        let (tx, rx) = mpsc::channel::<BlewResult<(DeviceId, L2capChannel)>>(16);
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, addr)) => {
                         debug!(peer = ?addr, "incoming L2CAP connection accepted");
-                        if tx.send(Ok(bridge_l2cap(stream))).await.is_err() {
+                        let device_id = DeviceId(addr.addr.to_string());
+                        if tx.send(Ok((device_id, bridge_l2cap(stream)))).await.is_err() {
                             break;
                         }
                     }

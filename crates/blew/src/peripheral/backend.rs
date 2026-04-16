@@ -67,7 +67,7 @@ pub trait PeripheralBackend: private::Sealed + Send + Sync + 'static {
     ) -> impl Future<
         Output = BlewResult<(
             Psm,
-            impl Stream<Item = BlewResult<L2capChannel>> + Send + 'static,
+            impl Stream<Item = BlewResult<(DeviceId, L2capChannel)>> + Send + 'static,
         )>,
     > + Send;
 

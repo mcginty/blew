@@ -244,7 +244,7 @@ impl PeripheralBackend for AndroidPeripheral {
     ) -> impl Future<
         Output = BlewResult<(
             Psm,
-            impl futures_core::Stream<Item = BlewResult<L2capChannel>> + Send + 'static,
+            impl futures_core::Stream<Item = BlewResult<(DeviceId, L2capChannel)>> + Send + 'static,
         )>,
     > + Send {
         async {

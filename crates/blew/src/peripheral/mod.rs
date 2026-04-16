@@ -82,7 +82,7 @@ impl<B: PeripheralBackend> Peripheral<B> {
         &self,
     ) -> BlewResult<(
         Psm,
-        impl futures_core::Stream<Item = BlewResult<L2capChannel>> + Send + 'static,
+        impl futures_core::Stream<Item = BlewResult<(DeviceId, L2capChannel)>> + Send + 'static,
     )> {
         self.backend.l2cap_listener().await
     }
