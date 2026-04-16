@@ -51,6 +51,10 @@ ktlint 'crates/blew/android/**/*.kt'
 description = "Check dependencies for license and vulnerability issues"
 run = "cargo deny check"
 
+[tasks.verify]
+description = "Pre-commit gate: fmt + lint + test + deny"
+depends = ["fmt", "lint", "test", "deny"]
+
 # --- CI ---------------------------------------------------------------
 
 [tasks.ci]
