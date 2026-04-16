@@ -56,9 +56,9 @@ crates/blew/src/
 │   └── backend.rs                # CentralBackend sealed trait (RPITIT, no async_trait)
 ├── peripheral/
 │   ├── mod.rs                    # Peripheral<B> (default B = PlatformPeripheral)
-│   │                             #   + PeripheralEvents<S> wrapper type
-│   ├── types.rs                  # PeripheralEvent (!Clone), ReadResponder, WriteResponder,
-│   │                             #   AdvertisingConfig
+│   │                             #   + state_events() / take_requests() accessors
+│   ├── types.rs                  # PeripheralStateEvent (Clone), PeripheralRequest (!Clone),
+│   │                             #   ReadResponder, WriteResponder, AdvertisingConfig
 │   └── backend.rs                # PeripheralBackend sealed trait
 ├── l2cap/
 │   ├── mod.rs                    # L2capChannel stub (AsyncRead + AsyncWrite)
@@ -77,6 +77,11 @@ crates/blew/src/
 │       ├── central.rs            # AndroidCentral — JNI bridge to BleCentralManager.kt
 │       ├── peripheral.rs         # AndroidPeripheral — JNI bridge to BlePeripheralManager.kt
 │       └── jni_hooks.rs          # #[unsafe(no_mangle)] extern "C" JNI callbacks
+crates/blew/android/                  # Co-located Kotlin/Gradle module for the Android backend
+├── src/main/java/org/jakebot/blew/   # BleCentralManager.kt, BlePeripheralManager.kt,
+│                                     #   GattOperationQueue.kt, L2capSocketManager.kt,
+│                                     #   BlewPlugin.kt (Tauri entry point)
+└── AndroidManifest.xml               # Runtime permission declarations (merged into host app)
 ├── testing.rs                    # In-memory mock backends (feature = "testing")
 └── util/
     ├── event_fanout.rs           # EventFanout<E: Clone> — mpsc fan-out for CentralEvent
@@ -90,9 +95,14 @@ crates/blew/src/
 let central: Central = Central::new().await?;   // explicit type required — see below
 let peripheral: Peripheral = Peripheral::new().await?;
 
-let mut events = central.events();   // returns CentralEvents<_> (impl Stream)
+let mut events = central.events();   // returns an impl Stream of CentralEvent
 use tokio_stream::StreamExt as _;
-while let Some(ev) = events.next().await { ... }
+while let Some(ev) = events.next().await { /* ... */ }
+
+// Peripheral events are split by kind:
+let mut state = peripheral.state_events();                  // Clone, broadcast fan-out
+let mut requests = peripheral.take_requests()                // single-consumer; None on 2nd call
+    .expect("requests already taken");
 ```
 
 **`let central: Central` is required.** Rust's default type-parameter inference does not kick in for method calls; without the explicit annotation the compiler fails with E0283. Same for `Peripheral`.
@@ -134,14 +144,14 @@ rx.await...
 - `use objc2::DefinedClass` — provides `ivars()` inside `define_class!` method bodies.
 - Both imports are required; missing either gives "no method found" errors.
 
-**`PeripheralEvent` is `!Clone`** (it carries RAII `ReadResponder`/`WriteResponder` handles). Therefore `EventFanout<PeripheralEvent>` cannot be used. Instead, `PeripheralInner` holds `Mutex<Option<mpsc::UnboundedSender<PeripheralEvent>>>`. Each call to `Peripheral::events()` replaces the sender, so only the most-recent subscriber receives events.
+**Split peripheral events.** State updates (adapter power, subscription changes) are `Clone` and fan out through a `tokio::sync::broadcast` channel via `state_events()`. GATT requests (reads/writes) carry RAII `ReadResponder`/`WriteResponder` handles and must be owned by a single consumer; `take_requests()` hands out the `mpsc::UnboundedReceiver` and returns `None` on the second call. The broadcast side runs behind `parking_lot::Mutex` for fast, poison-free synchronization.
 
-**RAII responders:** `peripheralManager:didReceiveReadRequest:` and `didReceiveWriteRequests:` build a `ReadResponder`/`WriteResponder` (backed by an `oneshot::Sender`), emit a `PeripheralEvent`, then spawn a task (via `inner.runtime.spawn()`) that awaits the oneshot and calls `respondToRequest:withResult:`. The spawn uses the captured `Handle` because GCD callbacks run outside the Tokio runtime context — bare `tokio::spawn` would panic.
+**RAII responders:** `peripheralManager:didReceiveReadRequest:` and `didReceiveWriteRequests:` build a `ReadResponder`/`WriteResponder` (backed by an `oneshot::Sender`), emit a `PeripheralRequest`, then spawn a task (via `inner.runtime.spawn()`) that awaits the oneshot and calls `respondToRequest:withResult:`. The spawn uses the captured `Handle` because GCD callbacks run outside the Tokio runtime context — bare `tokio::spawn` would panic.
 
 ## CoreBluetooth rules that cause crashes
 
 **Static value + Write property = `NSInvalidArgumentException` → SIGABRT.**
-If `GattCharacteristic.value` is non-empty, CoreBluetooth treats the characteristic as static and throws if the characteristic also has the `Write` property. Use `value: vec![]` for any characteristic that needs to be writable; the app handles reads via `PeripheralEvent::ReadRequest`.
+If `GattCharacteristic.value` is non-empty, CoreBluetooth treats the characteristic as static and throws if the characteristic also has the `Write` property. Use `value: vec![]` for any characteristic that needs to be writable; the app handles reads via `PeripheralRequest::Read`.
 
 ```rust
 GattCharacteristic {
@@ -199,8 +209,8 @@ rx.await?; // safe to await now
 
 **Global state:** Module-level `OnceLock` statics store event channels and pending operation maps. Only one Bluetooth adapter exists on Android so singletons are correct.
 
-- `AndroidCentral`: uses `EventFanout<CentralEvent>` (central events are `Clone`) + `RequestMap<oneshot::Sender>` for async request/response coupling.
-- `AndroidPeripheral`: uses `Mutex<mpsc::UnboundedSender<PeripheralEvent>>` (peripheral events are `!Clone` due to RAII responders). For read/write requests, a tokio task is spawned per request that awaits the responder's oneshot then calls Kotlin `respondToRead`/`respondToWrite` via JNI.
+- `AndroidCentral`: uses `EventFanout<CentralEvent>` (central events are `Clone`) + `KeyedRequestMap<oneshot::Sender>` for async request/response coupling. A per-device Kotlin coroutine queue serializes GATT ops (replacing the old adapter-wide semaphore) so a slow peer can't block others.
+- `AndroidPeripheral`: state events fan out through `tokio::sync::broadcast` (`PeripheralStateEvent` is `Clone`). GATT reads/writes are delivered as `PeripheralRequest` over an `mpsc::UnboundedSender`, handed out once via `take_requests()`. For each request, a tokio task awaits the responder's oneshot then calls Kotlin `respondToRead`/`respondToWrite` via JNI. All Rust-side synchronization uses `parking_lot::Mutex`.
 
 **JNI data marshalling:** Complex data (GATT services, UUID lists) passed as flat arrays or JSON strings to avoid complex JNI type construction. Service characteristics use parallel arrays (uuids, properties, permissions, values).
 
