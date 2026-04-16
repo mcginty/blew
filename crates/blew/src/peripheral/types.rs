@@ -85,7 +85,6 @@ impl<T: Send + Clone + 'static> Drop for ResponderInner<T> {
 pub struct ReadResponder(ResponderInner<Result<Vec<u8>, ()>>);
 
 impl ReadResponder {
-    #[allow(dead_code)]
     pub(crate) fn new(tx: ReadResponseTx) -> Self {
         Self(ResponderInner::new(tx, Err(())))
     }
@@ -109,7 +108,6 @@ impl ReadResponder {
 pub struct WriteResponder(ResponderInner<bool>);
 
 impl WriteResponder {
-    #[allow(dead_code)]
     pub(crate) fn new(tx: WriteResponseTx) -> Self {
         Self(ResponderInner::new(tx, false))
     }

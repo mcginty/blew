@@ -28,7 +28,6 @@ impl L2capChannel {
         (Self { inner: a }, Self { inner: b })
     }
 
-    #[allow(dead_code)]
     pub(crate) fn from_duplex(inner: DuplexStream) -> Self {
         Self { inner }
     }
