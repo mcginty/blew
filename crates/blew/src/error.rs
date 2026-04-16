@@ -43,6 +43,9 @@ pub enum BlewError {
     #[error("GATT busy on device {0} (another operation in flight)")]
     GattBusy(DeviceId),
 
+    #[error("value too large for current MTU: got {got} bytes, max {max}")]
+    ValueTooLarge { got: usize, max: usize },
+
     #[error("GATT error on device {device_id}: {source}")]
     Gatt {
         device_id: DeviceId,
