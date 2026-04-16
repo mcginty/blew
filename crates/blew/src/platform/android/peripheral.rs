@@ -47,6 +47,9 @@ impl PeripheralBackend for AndroidPeripheral {
         Self: Sized,
     {
         async {
+            if !super::are_ble_permissions_granted() {
+                return Err(BlewError::PermissionDenied);
+            }
             let (tx, _rx) = mpsc::unbounded_channel();
             let _ = STATE.set(PeripheralState {
                 event_tx: Mutex::new(tx),

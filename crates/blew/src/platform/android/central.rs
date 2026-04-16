@@ -223,6 +223,9 @@ impl CentralBackend for AndroidCentral {
         Self: Sized,
     {
         async {
+            if !super::are_ble_permissions_granted() {
+                return Err(BlewError::PermissionDenied);
+            }
             init_statics();
             debug!("AndroidCentral initialized");
             Ok(AndroidCentral)

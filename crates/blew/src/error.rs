@@ -16,6 +16,9 @@ pub enum BlewError {
     #[error("Bluetooth adapter is not powered on")]
     NotPowered,
 
+    #[error("required Android BLE permissions are not granted")]
+    PermissionDenied,
+
     #[error("device not found: {0}")]
     DeviceNotFound(DeviceId),
 
