@@ -1,8 +1,8 @@
 package org.jakebot.blew
 
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -22,7 +22,9 @@ import kotlinx.coroutines.withTimeoutOrNull
  *
  * Each device gets its own instance; a single worker coroutine drains the queue serially.
  */
-class GattOperationQueue(tag: String) {
+class GattOperationQueue(
+    tag: String,
+) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val channel = Channel<Task<*>>(capacity = Channel.UNLIMITED)
     private val worker: Job
@@ -30,11 +32,12 @@ class GattOperationQueue(tag: String) {
     @Volatile private var current: Task<*>? = null
 
     init {
-        worker = scope.launch {
-            for (task in channel) {
-                task.run()
+        worker =
+            scope.launch {
+                for (task in channel) {
+                    task.run()
+                }
             }
-        }
     }
 
     suspend fun <T> enqueue(
@@ -91,8 +94,14 @@ class GattOperationQueue(tag: String) {
             }
         }
 
-        fun complete(value: T) { deferred.complete(Result.success(value)) }
-        fun fail(t: Throwable) { deferred.complete(Result.failure(t)) }
+        fun complete(value: T) {
+            deferred.complete(Result.success(value))
+        }
+
+        fun fail(t: Throwable) {
+            deferred.complete(Result.failure(t))
+        }
+
         suspend fun await(): Result<T> = deferred.await()
     }
 }

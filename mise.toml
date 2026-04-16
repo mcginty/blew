@@ -37,14 +37,14 @@ run = "cargo nextest run --workspace"
 description = "Format all Rust and Kotlin code"
 run = """
 cargo fmt --all
-ktlint --format 'crates/tauri-plugin-blew/android/**/*.kt'
+ktlint --format 'crates/blew/android/**/*.kt'
 """
 
 [tasks."fmt:check"]
 description = "Check formatting without modifying files"
 run = """
 cargo fmt --all -- --check
-ktlint 'crates/tauri-plugin-blew/android/**/*.kt'
+ktlint 'crates/blew/android/**/*.kt'
 """
 
 [tasks.deny]
