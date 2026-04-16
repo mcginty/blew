@@ -758,11 +758,24 @@ impl CentralBackend for AppleCentral {
                         char_uuid,
                     })?;
 
-                let data = NSData::from_vec(value);
                 let cb_type = match write_type {
                     WriteType::WithResponse => CBCharacteristicWriteType::WithResponse,
                     WriteType::WithoutResponse => CBCharacteristicWriteType::WithoutResponse,
                 };
+
+                // CoreBluetooth raises NSInvalidArgumentException (→ SIGABRT) when
+                // writeValue:forCharacteristic:type: receives a payload that
+                // exceeds the negotiated capacity for the given write type.
+                // Clamp both .withResponse and .withoutResponse paths — the
+                // framework's long-write support for .withResponse has its own
+                // bugs (FB13596337), so staying under the reported max is safer.
+                let got = value.len();
+                let max = unsafe { peripheral.maximumWriteValueLengthForType(cb_type) };
+                if got > max {
+                    return Err(BlewError::ValueTooLarge { got, max });
+                }
+
+                let data = NSData::from_vec(value);
 
                 if write_type == WriteType::WithoutResponse {
                     unsafe {
