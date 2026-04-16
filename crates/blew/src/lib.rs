@@ -15,6 +15,21 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Getting started
+//!
+//! Construct [`Central`] or [`Peripheral`] with an explicit type annotation:
+//!
+//! ```no_run
+//! # async fn example() -> blew::error::BlewResult<()> {
+//! use blew::central::Central;
+//! let central: Central = Central::new().await?;
+//! # Ok(()) }
+//! ```
+//!
+//! The annotation is required because Rust's default type-parameter inference does not fire on
+//! method calls. If you see compiler error E0283 ("type annotations needed"), you forgot the
+//! `: Central`.
 
 pub mod central;
 pub mod error;
