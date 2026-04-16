@@ -521,7 +521,13 @@ impl CentralBackend for LinuxCentral {
     }
 
     async fn mtu(&self, _device_id: &DeviceId) -> u16 {
-        23_u16
+        // bluer does not expose negotiated ATT MTU on `Device`. Real value is available per
+        // CharacteristicWriter/Reader after opening a socket. Until we plumb that through,
+        // return a conservative LE DLE-era default that matches what BlueZ negotiates on
+        // almost all modern hardware. See also `iroh-ble-transport` discussion on
+        // MTU-at-rest defaults.
+        // TODO(mtu-plumb): thread the real negotiated MTU through from the open socket.
+        247_u16
     }
 
     fn open_l2cap_channel(
