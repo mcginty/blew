@@ -8,6 +8,13 @@ description = "Cross-platform async BLE library for Rust (Apple, Linux, Android)
 repository = "https://github.com/mcginty/blew"
 keywords = ["bluetooth", "ble", "gatt", "l2cap"]
 categories = ["hardware-support", "network-programming"]
+include = [
+    "src/**/*.rs",
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+    "android/**/*",
+]
 
 [features]
 testing = []
