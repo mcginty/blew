@@ -16,7 +16,9 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use bytes::Bytes;
 use dispatch2::{DispatchQueue, DispatchQueueAttr};
@@ -191,8 +193,8 @@ define_class!(
             };
             debug!(device_id = %id, name = ?device.name, rssi = rssi_val, "device discovered");
             let inner = self.ivars();
-            inner.peripherals.lock().unwrap().insert(id.clone(), retain_send(peripheral));
-            inner.discovered.lock().unwrap().insert(id.clone(), device.clone());
+            inner.peripherals.lock().insert(id.clone(), retain_send(peripheral));
+            inner.discovered.lock().insert(id.clone(), device.clone());
             inner.emit(CentralEvent::DeviceDiscovered(device));
         }
 
@@ -205,7 +207,7 @@ define_class!(
             let id = peripheral_device_id(peripheral);
             debug!(device_id = %id, "device connected");
             let inner = self.ivars();
-            if let Some(tx) = inner.connects.lock().unwrap().remove(&id) {
+            if let Some(tx) = inner.connects.lock().remove(&id) {
                 let _ = tx.send(Ok(()));
             }
             inner.emit(CentralEvent::DeviceConnected { device_id: id });
@@ -235,7 +237,7 @@ define_class!(
                 || BlewError::Internal("connection failed".into()),
                 BlewError::Internal,
             );
-            if let Some(tx) = inner.connects.lock().unwrap().remove(&id) {
+            if let Some(tx) = inner.connects.lock().remove(&id) {
                 let _ = tx.send(Err(err));
             }
         }
@@ -250,7 +252,7 @@ define_class!(
             let id = peripheral_device_id(peripheral);
             debug!(device_id = %id, "device disconnected");
             let inner = self.ivars();
-            inner.peripherals.lock().unwrap().remove(&id);
+            inner.peripherals.lock().remove(&id);
             let cause = if central.state() == CBManagerState::PoweredOn {
                 match error {
                     Some(err) => {
@@ -302,13 +304,13 @@ define_class!(
                 };
                 inner
                     .peripherals
-                    .lock()
-                    .unwrap()
+
+.lock()
                     .insert(id.clone(), unsafe { retain_send(&*peripheral) });
                 inner
                     .discovered
-                    .lock()
-                    .unwrap()
+
+.lock()
                     .insert(id.clone(), device.clone());
                 recovered.push(device);
             }
@@ -332,7 +334,7 @@ define_class!(
 
             if let Some(e) = error {
                 let err = BlewError::Internal(e.localizedDescription().to_string());
-                if let Some(ds) = inner.discoveries.lock().unwrap().remove(&id) {
+                if let Some(ds) = inner.discoveries.lock().remove(&id) {
                     let _ = ds.tx.send(Err(err));
                 }
                 return;
@@ -341,7 +343,7 @@ define_class!(
             let services = match peripheral.services() {
                 Some(s) if s.count() > 0 => s,
                 _ => {
-                    if let Some(ds) = inner.discoveries.lock().unwrap().remove(&id) {
+                    if let Some(ds) = inner.discoveries.lock().remove(&id) {
                         let _ = ds.tx.send(Ok(vec![]));
                     }
                     return;
@@ -350,7 +352,7 @@ define_class!(
 
             let svc_vec = services.to_vec();
             debug!(device_id = %id, count = svc_vec.len(), "services discovered, fetching characteristics");
-            let mut lock = inner.discoveries.lock().unwrap();
+            let mut lock = inner.discoveries.lock();
             let Some(ds) = lock.get_mut(&id) else {
                 return;
             };
@@ -391,7 +393,7 @@ define_class!(
                 return;
             };
             let inner = self.ivars();
-            let mut lock = inner.discoveries.lock().unwrap();
+            let mut lock = inner.discoveries.lock();
             let Some(ds) = lock.get_mut(&id) else {
                 return;
             };
@@ -439,7 +441,7 @@ define_class!(
             let inner = self.ivars();
 
             // Read response?
-            if let Some(tx) = inner.reads.lock().unwrap().remove(&(id.clone(), char_uuid)) {
+            if let Some(tx) = inner.reads.lock().remove(&(id.clone(), char_uuid)) {
                 let result = if let Some(e) = error {
                     Err(BlewError::Internal(e.localizedDescription().to_string()))
                 } else {
@@ -475,7 +477,7 @@ define_class!(
                 return;
             };
             let inner = self.ivars();
-            if let Some(tx) = inner.writes.lock().unwrap().remove(&(id, char_uuid)) {
+            if let Some(tx) = inner.writes.lock().remove(&(id, char_uuid)) {
                 let result = error.map_or(Ok(()), |e| {
                     Err(BlewError::Internal(e.localizedDescription().to_string()))
                 });
@@ -495,7 +497,7 @@ define_class!(
                 return;
             };
             let inner = self.ivars();
-            if let Some(tx) = inner.notify_states.lock().unwrap().remove(&(id, char_uuid)) {
+            if let Some(tx) = inner.notify_states.lock().remove(&(id, char_uuid)) {
                 let result = error.map_or(Ok(()), |e| {
                     Err(BlewError::Internal(e.localizedDescription().to_string()))
                 });
@@ -513,7 +515,7 @@ define_class!(
         ) {
             let id = peripheral_device_id(peripheral);
             let inner = self.ivars();
-            let Some(tx) = inner.l2cap_pendings.lock().unwrap().remove(&id) else { return };
+            let Some(tx) = inner.l2cap_pendings.lock().remove(&id) else { return };
 
             if let Some(e) = error {
                 warn!(device_id = %id, error = %e.localizedDescription(), "L2CAP channel open failed");
@@ -605,16 +607,7 @@ impl CentralBackend for AppleCentral {
 
     fn discovered_devices(&self) -> impl Future<Output = BlewResult<Vec<BleDevice>>> + Send {
         let handle = Arc::clone(&self.0);
-        async move {
-            Ok(handle
-                .inner
-                .discovered
-                .lock()
-                .unwrap()
-                .values()
-                .cloned()
-                .collect())
-        }
+        async move { Ok(handle.inner.discovered.lock().values().cloned().collect()) }
     }
 
     fn connect(&self, device_id: &DeviceId) -> impl Future<Output = BlewResult<()>> + Send {
@@ -628,7 +621,6 @@ impl CentralBackend for AppleCentral {
                     .inner
                     .peripherals
                     .lock()
-                    .unwrap()
                     .get(&device_id)
                     .map(|p| unsafe { retain_send(&**p) });
                 let Some(peripheral) = peripheral else {
@@ -636,7 +628,7 @@ impl CentralBackend for AppleCentral {
                 };
 
                 let (tx, rx) = oneshot::channel();
-                handle.inner.connects.lock().unwrap().insert(device_id, tx);
+                handle.inner.connects.lock().insert(device_id, tx);
 
                 unsafe {
                     peripheral.setDelegate(Some(ProtocolObject::from_ref(&*handle.delegate)));
@@ -658,7 +650,6 @@ impl CentralBackend for AppleCentral {
                 .inner
                 .peripherals
                 .lock()
-                .unwrap()
                 .get(&device_id)
                 .map(|p| unsafe { retain_send(&**p) });
             let Some(peripheral) = peripheral else {
@@ -682,14 +673,13 @@ impl CentralBackend for AppleCentral {
                     .inner
                     .peripherals
                     .lock()
-                    .unwrap()
                     .get(&device_id)
                     .map(|p| unsafe { retain_send(&**p) });
                 let Some(peripheral) = peripheral else {
                     return Err(BlewError::NotConnected(device_id.clone()));
                 };
                 let (tx, rx) = oneshot::channel();
-                handle.inner.discoveries.lock().unwrap().insert(
+                handle.inner.discoveries.lock().insert(
                     device_id,
                     DiscoveryState {
                         services: HashMap::new(),
@@ -719,7 +709,6 @@ impl CentralBackend for AppleCentral {
                     .inner
                     .peripherals
                     .lock()
-                    .unwrap()
                     .get(&device_id)
                     .map(|p| unsafe { retain_send(&**p) });
                 let Some(peripheral) = peripheral else {
@@ -732,12 +721,7 @@ impl CentralBackend for AppleCentral {
                     })?;
 
                 let (tx, rx) = oneshot::channel();
-                handle
-                    .inner
-                    .reads
-                    .lock()
-                    .unwrap()
-                    .insert((device_id, char_uuid), tx);
+                handle.inner.reads.lock().insert((device_id, char_uuid), tx);
                 unsafe { peripheral.readValueForCharacteristic(&characteristic) };
                 rx
                 // peripheral and characteristic drop here, before .await
@@ -763,7 +747,6 @@ impl CentralBackend for AppleCentral {
                     .inner
                     .peripherals
                     .lock()
-                    .unwrap()
                     .get(&device_id)
                     .map(|p| unsafe { retain_send(&**p) });
                 let Some(peripheral) = peripheral else {
@@ -797,7 +780,6 @@ impl CentralBackend for AppleCentral {
                     .inner
                     .writes
                     .lock()
-                    .unwrap()
                     .insert((device_id, char_uuid), tx);
                 unsafe {
                     peripheral.writeValue_forCharacteristic_type(&data, &characteristic, cb_type);
@@ -835,7 +817,6 @@ impl CentralBackend for AppleCentral {
                     .inner
                     .peripherals
                     .lock()
-                    .unwrap()
                     .get(&device_id)
                     .map(|p| unsafe { retain_send(&**p) });
                 let Some(peripheral) = peripheral else {
@@ -866,19 +847,13 @@ impl CentralBackend for AppleCentral {
                     .inner
                     .peripherals
                     .lock()
-                    .unwrap()
                     .get(&device_id)
                     .map(|p| unsafe { retain_send(&**p) });
                 let Some(peripheral) = peripheral else {
                     return Err(BlewError::DeviceNotFound(device_id));
                 };
                 let (tx, rx) = oneshot::channel();
-                handle
-                    .inner
-                    .l2cap_pendings
-                    .lock()
-                    .unwrap()
-                    .insert(device_id, tx);
+                handle.inner.l2cap_pendings.lock().insert(device_id, tx);
                 unsafe { peripheral.openL2CAPChannel(psm.0) };
                 rx
             };
@@ -975,7 +950,6 @@ impl AppleCentral {
                 .inner
                 .peripherals
                 .lock()
-                .unwrap()
                 .get(&device_id)
                 .map(|p| unsafe { retain_send(&**p) });
             let Some(peripheral) = peripheral else {
@@ -992,7 +966,6 @@ impl AppleCentral {
                 .inner
                 .notify_states
                 .lock()
-                .unwrap()
                 .insert((device_id, char_uuid), tx);
             unsafe { peripheral.setNotifyValue_forCharacteristic(enabled, &characteristic) };
             rx

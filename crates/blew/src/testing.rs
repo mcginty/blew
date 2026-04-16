@@ -14,7 +14,9 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
@@ -127,7 +129,7 @@ impl MockLink {
     #[must_use]
     pub fn pair_with_policy(policy: MockL2capPolicy) -> (MockLinkEndpoint, MockPeripheralEndpoint) {
         let (central_ep, periph_ep) = Self::pair();
-        central_ep.central.link.lock().unwrap().l2cap_policy = policy;
+        central_ep.central.link.lock().l2cap_policy = policy;
         (central_ep, periph_ep)
     }
 }
@@ -210,7 +212,7 @@ impl MockCentral {
 
     /// Emit an `AdapterStateChanged` event and update the powered flag.
     pub fn mock_emit_adapter_state(&self, powered: bool) {
-        *self.powered.lock().unwrap() = powered;
+        *self.powered.lock() = powered;
         let _ = self
             .event_tx
             .send(CentralEvent::AdapterStateChanged { powered });
@@ -230,12 +232,12 @@ impl CentralBackend for MockCentral {
     }
 
     fn is_powered(&self) -> impl Future<Output = BlewResult<bool>> + Send {
-        let powered = *self.powered.lock().unwrap();
+        let powered = *self.powered.lock();
         async move { Ok(powered) }
     }
 
     fn start_scan(&self, _filter: ScanFilter) -> impl Future<Output = BlewResult<()>> + Send {
-        let link = self.link.lock().unwrap();
+        let link = self.link.lock();
         let advertising = link.advertising;
         let adv_config = link.adv_config.clone();
         let services = link.services.iter().map(|s| s.uuid).collect::<Vec<_>>();
@@ -263,7 +265,7 @@ impl CentralBackend for MockCentral {
     }
 
     fn connect(&self, device_id: &DeviceId) -> impl Future<Output = BlewResult<()>> + Send {
-        let mut link = self.link.lock().unwrap();
+        let mut link = self.link.lock();
         link.connected = true;
         let id = device_id.clone();
         let tx = self.event_tx.clone();
@@ -274,7 +276,7 @@ impl CentralBackend for MockCentral {
     }
 
     fn disconnect(&self, device_id: &DeviceId) -> impl Future<Output = BlewResult<()>> + Send {
-        let mut link = self.link.lock().unwrap();
+        let mut link = self.link.lock();
         link.connected = false;
         link.subscriptions.clear();
         let id = device_id.clone();
@@ -292,7 +294,7 @@ impl CentralBackend for MockCentral {
         &self,
         _device_id: &DeviceId,
     ) -> impl Future<Output = BlewResult<Vec<GattService>>> + Send {
-        let services = self.link.lock().unwrap().services.clone();
+        let services = self.link.lock().services.clone();
         async move { Ok(services) }
     }
 
@@ -301,7 +303,7 @@ impl CentralBackend for MockCentral {
         device_id: &DeviceId,
         char_uuid: Uuid,
     ) -> impl Future<Output = BlewResult<Vec<u8>>> + Send {
-        let link = self.link.lock().unwrap();
+        let link = self.link.lock();
         let static_value = link.char_values.get(&char_uuid).cloned();
         let has_service_char = link
             .services
@@ -388,11 +390,7 @@ impl CentralBackend for MockCentral {
         char_uuid: Uuid,
     ) -> impl Future<Output = BlewResult<()>> + Send {
         let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
-        self.link
-            .lock()
-            .unwrap()
-            .subscriptions
-            .insert(char_uuid, tx);
+        self.link.lock().subscriptions.insert(char_uuid, tx);
 
         let event_tx = self.event_tx.clone();
         let device_id = DeviceId::from("mock-peripheral");
@@ -422,7 +420,7 @@ impl CentralBackend for MockCentral {
         _device_id: &DeviceId,
         char_uuid: Uuid,
     ) -> impl Future<Output = BlewResult<()>> + Send {
-        self.link.lock().unwrap().subscriptions.remove(&char_uuid);
+        self.link.lock().subscriptions.remove(&char_uuid);
         async { Ok(()) }
     }
 
@@ -439,7 +437,7 @@ impl CentralBackend for MockCentral {
         let device_id = device_id.clone();
         async move {
             let accept_tx = {
-                let guard = link.lock().unwrap();
+                let guard = link.lock();
                 if let Some(kind) = guard.l2cap_policy.open_error {
                     return Err(kind.to_error());
                 }
@@ -465,7 +463,6 @@ impl CentralBackend for MockCentral {
         let rx = self
             .central_rx
             .lock()
-            .unwrap()
             .take()
             .expect("events() called more than once on MockCentral");
         tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
@@ -539,7 +536,7 @@ impl MockPeripheral {
 
     /// Emit an `AdapterStateChanged` event and update the powered flag.
     pub fn mock_emit_adapter_state(&self, powered: bool) {
-        *self.powered.lock().unwrap() = powered;
+        *self.powered.lock() = powered;
         if let Some(tx) = &self.emit_tx {
             let _ = tx.send(PeripheralEvent::AdapterStateChanged { powered });
         }
@@ -559,12 +556,12 @@ impl PeripheralBackend for MockPeripheral {
     }
 
     fn is_powered(&self) -> impl Future<Output = BlewResult<bool>> + Send {
-        let powered = *self.powered.lock().unwrap();
+        let powered = *self.powered.lock();
         async move { Ok(powered) }
     }
 
     fn add_service(&self, service: &GattService) -> impl Future<Output = BlewResult<()>> + Send {
-        let mut link = self.link.lock().unwrap();
+        let mut link = self.link.lock();
         for ch in &service.characteristics {
             if !ch.value.is_empty() {
                 link.char_values.insert(ch.uuid, ch.value.clone());
@@ -578,7 +575,7 @@ impl PeripheralBackend for MockPeripheral {
         &self,
         config: &AdvertisingConfig,
     ) -> impl Future<Output = BlewResult<()>> + Send {
-        let mut link = self.link.lock().unwrap();
+        let mut link = self.link.lock();
         if link.advertising {
             return std::future::ready(Err(BlewError::AlreadyAdvertising));
         }
@@ -588,7 +585,7 @@ impl PeripheralBackend for MockPeripheral {
     }
 
     fn stop_advertising(&self) -> impl Future<Output = BlewResult<()>> + Send {
-        let mut link = self.link.lock().unwrap();
+        let mut link = self.link.lock();
         link.advertising = false;
         link.adv_config = None;
         async { Ok(()) }
@@ -600,7 +597,7 @@ impl PeripheralBackend for MockPeripheral {
         char_uuid: Uuid,
         value: Vec<u8>,
     ) -> impl Future<Output = BlewResult<()>> + Send {
-        let link = self.link.lock().unwrap();
+        let link = self.link.lock();
         if let Some(tx) = link.subscriptions.get(&char_uuid) {
             let _ = tx.send(Bytes::from(value));
         }
@@ -617,7 +614,7 @@ impl PeripheralBackend for MockPeripheral {
     > + Send {
         let link = Arc::clone(&self.link);
         async move {
-            let mut guard = link.lock().unwrap();
+            let mut guard = link.lock();
             if let Some(kind) = guard.l2cap_policy.listener_error {
                 return Err(kind.to_error());
             }
@@ -637,7 +634,6 @@ impl PeripheralBackend for MockPeripheral {
         let rx = self
             .event_tx
             .lock()
-            .unwrap()
             .take()
             .expect("events() called more than once on MockPeripheral");
         tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
@@ -868,7 +864,7 @@ mod tests {
                     value, responder, ..
                 } = event
                 {
-                    received2.lock().unwrap().push(value);
+                    received2.lock().push(value);
                     if let Some(r) = responder {
                         r.success();
                     }
@@ -888,7 +884,7 @@ mod tests {
             .unwrap();
 
         tokio::task::yield_now().await;
-        let values = received.lock().unwrap();
+        let values = received.lock();
         assert_eq!(values.len(), 1);
         assert_eq!(values[0], b"hello");
     }
@@ -909,7 +905,7 @@ mod tests {
                     value, responder, ..
                 } = event
                 {
-                    received2.lock().unwrap().push(value);
+                    received2.lock().push(value);
                     assert!(responder.is_none());
                 }
             }
@@ -927,7 +923,7 @@ mod tests {
             .unwrap();
 
         tokio::task::yield_now().await;
-        let values = received.lock().unwrap();
+        let values = received.lock();
         assert_eq!(values.len(), 1);
         assert_eq!(values[0], b"fire-and-forget");
     }

@@ -12,7 +12,9 @@ use bluer::{Adapter, AdapterEvent, Session};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, trace, warn};
@@ -164,7 +166,7 @@ impl CentralBackend for LinuxCentral {
                 }
             }
         });
-        *inner.adapter_task.lock().unwrap() = Some(adapter_task);
+        *inner.adapter_task.lock() = Some(adapter_task);
         Ok(LinuxCentral(inner))
     }
 
@@ -224,7 +226,7 @@ impl CentralBackend for LinuxCentral {
             let mut stream = Box::pin(stream);
 
             // Dropping a JoinHandle only detaches; we must abort explicitly.
-            if let Some(old) = handle.scan_task.lock().unwrap().take() {
+            if let Some(old) = handle.scan_task.lock().take() {
                 old.abort();
             }
 
@@ -257,7 +259,6 @@ impl CentralBackend for LinuxCentral {
                             handle
                                 .discovered
                                 .lock()
-                                .unwrap()
                                 .insert(device_id, ble_device.clone());
                             handle
                                 .event_tx
@@ -266,7 +267,7 @@ impl CentralBackend for LinuxCentral {
                         AdapterEvent::DeviceRemoved(addr) => {
                             let device_id = DeviceId(addr.to_string());
                             debug!(device_id = %device_id, "device removed");
-                            handle.discovered.lock().unwrap().remove(&device_id);
+                            handle.discovered.lock().remove(&device_id);
                             let cause = if handle.adapter.is_powered().await.unwrap_or(true) {
                                 DisconnectCause::LinkLoss
                             } else {
@@ -281,7 +282,7 @@ impl CentralBackend for LinuxCentral {
                 }
             });
 
-            *handle.scan_task.lock().unwrap() = Some(task);
+            *handle.scan_task.lock() = Some(task);
             Ok(())
         }
     }
@@ -290,7 +291,7 @@ impl CentralBackend for LinuxCentral {
         let handle = Arc::clone(&self.0);
         async move {
             debug!("stopping BLE scan");
-            if let Some(task) = handle.scan_task.lock().unwrap().take() {
+            if let Some(task) = handle.scan_task.lock().take() {
                 task.abort();
             }
             Ok(())
@@ -299,15 +300,7 @@ impl CentralBackend for LinuxCentral {
 
     fn discovered_devices(&self) -> impl Future<Output = BlewResult<Vec<BleDevice>>> + Send {
         let handle = Arc::clone(&self.0);
-        async move {
-            Ok(handle
-                .discovered
-                .lock()
-                .unwrap()
-                .values()
-                .cloned()
-                .collect())
-        }
+        async move { Ok(handle.discovered.lock().values().cloned().collect()) }
     }
 
     fn connect(&self, device_id: &DeviceId) -> impl Future<Output = BlewResult<()>> + Send {
@@ -507,7 +500,6 @@ impl CentralBackend for LinuxCentral {
             handle
                 .notify_tasks
                 .lock()
-                .unwrap()
                 .insert((device_id, char_uuid), task);
             Ok(())
         }
@@ -521,12 +513,7 @@ impl CentralBackend for LinuxCentral {
         let handle = Arc::clone(&self.0);
         let device_id = device_id.clone();
         async move {
-            if let Some(task) = handle
-                .notify_tasks
-                .lock()
-                .unwrap()
-                .remove(&(device_id, char_uuid))
-            {
+            if let Some(task) = handle.notify_tasks.lock().remove(&(device_id, char_uuid)) {
                 task.abort();
             }
             Ok(())

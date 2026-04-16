@@ -16,7 +16,9 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use dispatch2::{DispatchQueue, DispatchQueueAttr};
 use futures_core::Stream;
@@ -137,7 +139,7 @@ impl PeripheralInner {
     }
 
     fn emit(&self, event: PeripheralEvent) {
-        if let Some(tx) = self.event_tx.lock().unwrap().as_ref() {
+        if let Some(tx) = self.event_tx.lock().as_ref() {
             let _ = tx.send(event);
         }
     }
@@ -169,7 +171,7 @@ define_class!(
             error: Option<&NSError>,
         ) {
             let inner = self.ivars();
-            if let Some(tx) = inner.adv_tx.lock().unwrap().take() {
+            if let Some(tx) = inner.adv_tx.lock().take() {
                 let result = error.map_or_else(
                     || {
                         debug!("advertising started");
@@ -196,7 +198,7 @@ define_class!(
             let Some(svc_uuid) = cbuuid_to_uuid(&svc_uuid_ret) else {
                 return;
             };
-            if let Some(tx) = inner.add_svc_tx.lock().unwrap().remove(&svc_uuid) {
+            if let Some(tx) = inner.add_svc_tx.lock().remove(&svc_uuid) {
                 let result = error.map_or_else(
                     || {
                         debug!(service_uuid = %svc_uuid, "GATT service added");
@@ -226,7 +228,7 @@ define_class!(
             let client_id = central_device_id(central);
             trace!(client_id = %client_id, %char_uuid, "client subscribed to characteristic");
             {
-                let mut subs = inner.subscribers.lock().unwrap();
+                let mut subs = inner.subscribers.lock();
                 let entry = subs.entry(char_uuid).or_default();
                 entry.insert(client_id.clone(), unsafe { retain_send(central) });
             }
@@ -252,7 +254,7 @@ define_class!(
             let client_id = central_device_id(central);
             trace!(client_id = %client_id, %char_uuid, "client unsubscribed from characteristic");
             {
-                let mut subs = inner.subscribers.lock().unwrap();
+                let mut subs = inner.subscribers.lock();
                 if let Some(entry) = subs.get_mut(&char_uuid) {
                     entry.remove(&client_id);
                     if entry.is_empty() {
@@ -395,7 +397,7 @@ define_class!(
             error: Option<&NSError>,
         ) {
             let inner = self.ivars();
-            if let Some(tx) = inner.l2cap_publish_tx.lock().unwrap().take() {
+            if let Some(tx) = inner.l2cap_publish_tx.lock().take() {
                 let result = if let Some(e) = error {
                     warn!(error = %e.localizedDescription(), "L2CAP channel publish failed");
                     Err(BlewError::Internal(e.localizedDescription().to_string()))
@@ -416,7 +418,7 @@ define_class!(
             error: Option<&NSError>,
         ) {
             let inner = self.ivars();
-            let tx = inner.l2cap_channel_tx.lock().unwrap().clone();
+            let tx = inner.l2cap_channel_tx.lock().clone();
             let Some(tx) = tx else { return };
 
             if let Some(e) = error {
@@ -582,12 +584,12 @@ impl PeripheralBackend for ApplePeripheral {
                 unsafe { cb_service.setCharacteristics(Some(&char_array)) };
 
                 {
-                    let mut lock = handle.inner.chars.lock().unwrap();
+                    let mut lock = handle.inner.chars.lock();
                     lock.extend(char_map);
                 }
                 let (tx, rx) = oneshot::channel();
                 {
-                    let mut lock = handle.inner.add_svc_tx.lock().unwrap();
+                    let mut lock = handle.inner.add_svc_tx.lock();
                     lock.insert(service.uuid, tx);
                 }
 
@@ -633,7 +635,7 @@ impl PeripheralBackend for ApplePeripheral {
                 let adv_data = NSDictionary::from_slices(&[key_name, key_uuids], &[ln_any, ua_any]);
 
                 let (tx, rx) = oneshot::channel();
-                *handle.inner.adv_tx.lock().unwrap() = Some(tx);
+                *handle.inner.adv_tx.lock() = Some(tx);
                 unsafe { handle.manager.startAdvertising(Some(&adv_data)) };
                 rx
             };
@@ -664,7 +666,7 @@ impl PeripheralBackend for ApplePeripheral {
         async move {
             trace!(device = %device_id, %char_uuid, len = value.len(), "notifying characteristic");
             let cb_char = {
-                let lock = handle.inner.chars.lock().unwrap();
+                let lock = handle.inner.chars.lock();
                 lock.get(&char_uuid).map(|c| unsafe { retain_send(&**c) })
             };
 
@@ -673,7 +675,7 @@ impl PeripheralBackend for ApplePeripheral {
             };
 
             let cb_central = {
-                let lock = handle.inner.subscribers.lock().unwrap();
+                let lock = handle.inner.subscribers.lock();
                 lock.get(&char_uuid)
                     .and_then(|m| m.get(&device_id))
                     .map(|c| unsafe { retain_send(&**c) })
@@ -714,8 +716,8 @@ impl PeripheralBackend for ApplePeripheral {
             let (ch_tx, ch_rx) = mpsc::channel::<BlewResult<(DeviceId, L2capChannel)>>(16);
             let (pub_tx, pub_rx) = oneshot::channel::<BlewResult<Psm>>();
             {
-                *handle.inner.l2cap_channel_tx.lock().unwrap() = Some(ch_tx);
-                *handle.inner.l2cap_publish_tx.lock().unwrap() = Some(pub_tx);
+                *handle.inner.l2cap_channel_tx.lock() = Some(ch_tx);
+                *handle.inner.l2cap_publish_tx.lock() = Some(pub_tx);
                 unsafe { handle.manager.publishL2CAPChannelWithEncryption(false) };
             }
             let psm = pub_rx.await.unwrap_or(Err(BlewError::Internal(
@@ -728,7 +730,7 @@ impl PeripheralBackend for ApplePeripheral {
 
     fn events(&self) -> Self::EventStream {
         let (tx, rx) = mpsc::unbounded_channel();
-        *self.0.inner.event_tx.lock().unwrap() = Some(tx);
+        *self.0.inner.event_tx.lock() = Some(tx);
         UnboundedReceiverStream::new(rx)
     }
 }
