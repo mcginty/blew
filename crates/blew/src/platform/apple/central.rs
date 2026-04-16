@@ -57,6 +57,7 @@ use crate::platform::apple::helpers::{
 use crate::platform::apple::l2cap::bridge_l2cap_channel;
 use crate::types::{BleDevice, DeviceId};
 use crate::util::event_fanout::{EventFanout, EventFanoutTx};
+use crate::util::request_map::KeyedRequestMap;
 
 fn cb_props_to_ours(props: CBCharacteristicProperties) -> CharacteristicProperties {
     use crate::gatt::props::CharacteristicProperties as P;
@@ -88,18 +89,19 @@ struct DiscoveryState {
     tx: oneshot::Sender<BlewResult<Vec<GattService>>>,
 }
 
-type PendingMap<K, V> = Mutex<HashMap<K, oneshot::Sender<BlewResult<V>>>>;
-
 struct CentralInner {
     peripherals: Mutex<HashMap<DeviceId, ObjcSend<CBPeripheral>>>,
     discovered: Mutex<HashMap<DeviceId, BleDevice>>,
-    connects: PendingMap<DeviceId, ()>,
+    connects: KeyedRequestMap<DeviceId, oneshot::Sender<BlewResult<()>>>,
+    // `discoveries` keeps a mutable `DiscoveryState` per device (services
+    // accumulate across multiple didDiscoverCharacteristicsForService
+    // callbacks), so it needs `get_mut` and can't use KeyedRequestMap.
     discoveries: Mutex<HashMap<DeviceId, DiscoveryState>>,
-    reads: PendingMap<(DeviceId, Uuid), Vec<u8>>,
-    writes: PendingMap<(DeviceId, Uuid), ()>,
-    notify_states: PendingMap<(DeviceId, Uuid), ()>,
+    reads: KeyedRequestMap<(DeviceId, Uuid), oneshot::Sender<BlewResult<Vec<u8>>>>,
+    writes: KeyedRequestMap<(DeviceId, Uuid), oneshot::Sender<BlewResult<()>>>,
+    notify_states: KeyedRequestMap<(DeviceId, Uuid), oneshot::Sender<BlewResult<()>>>,
     /// Pending `open_l2cap_channel` results, keyed by device ID.
-    l2cap_pendings: PendingMap<DeviceId, L2capChannel>,
+    l2cap_pendings: KeyedRequestMap<DeviceId, oneshot::Sender<BlewResult<L2capChannel>>>,
     event_tx: EventFanoutTx<CentralEvent>,
     event_fanout: EventFanout<CentralEvent>,
     powered_tx: watch::Sender<bool>,
@@ -207,7 +209,7 @@ define_class!(
             let id = peripheral_device_id(peripheral);
             debug!(device_id = %id, "device connected");
             let inner = self.ivars();
-            if let Some(tx) = inner.connects.lock().remove(&id) {
+            if let Some(tx) = inner.connects.take(&id) {
                 let _ = tx.send(Ok(()));
             }
             inner.emit(CentralEvent::DeviceConnected { device_id: id });
@@ -237,7 +239,7 @@ define_class!(
                 || BlewError::Internal("connection failed".into()),
                 BlewError::Internal,
             );
-            if let Some(tx) = inner.connects.lock().remove(&id) {
+            if let Some(tx) = inner.connects.take(&id) {
                 let _ = tx.send(Err(err));
             }
         }
@@ -441,7 +443,7 @@ define_class!(
             let inner = self.ivars();
 
             // Read response?
-            if let Some(tx) = inner.reads.lock().remove(&(id.clone(), char_uuid)) {
+            if let Some(tx) = inner.reads.take(&(id.clone(), char_uuid)) {
                 let result = if let Some(e) = error {
                     Err(BlewError::Internal(e.localizedDescription().to_string()))
                 } else {
@@ -477,7 +479,7 @@ define_class!(
                 return;
             };
             let inner = self.ivars();
-            if let Some(tx) = inner.writes.lock().remove(&(id, char_uuid)) {
+            if let Some(tx) = inner.writes.take(&(id, char_uuid)) {
                 let result = error.map_or(Ok(()), |e| {
                     Err(BlewError::Internal(e.localizedDescription().to_string()))
                 });
@@ -497,7 +499,7 @@ define_class!(
                 return;
             };
             let inner = self.ivars();
-            if let Some(tx) = inner.notify_states.lock().remove(&(id, char_uuid)) {
+            if let Some(tx) = inner.notify_states.take(&(id, char_uuid)) {
                 let result = error.map_or(Ok(()), |e| {
                     Err(BlewError::Internal(e.localizedDescription().to_string()))
                 });
@@ -515,7 +517,7 @@ define_class!(
         ) {
             let id = peripheral_device_id(peripheral);
             let inner = self.ivars();
-            let Some(tx) = inner.l2cap_pendings.lock().remove(&id) else { return };
+            let Some(tx) = inner.l2cap_pendings.take(&id) else { return };
 
             if let Some(e) = error {
                 warn!(device_id = %id, error = %e.localizedDescription(), "L2CAP channel open failed");
@@ -628,7 +630,7 @@ impl CentralBackend for AppleCentral {
                 };
 
                 let (tx, rx) = oneshot::channel();
-                handle.inner.connects.lock().insert(device_id, tx);
+                handle.inner.connects.insert(device_id, tx);
 
                 unsafe {
                     peripheral.setDelegate(Some(ProtocolObject::from_ref(&*handle.delegate)));
@@ -721,7 +723,7 @@ impl CentralBackend for AppleCentral {
                     })?;
 
                 let (tx, rx) = oneshot::channel();
-                handle.inner.reads.lock().insert((device_id, char_uuid), tx);
+                handle.inner.reads.insert((device_id, char_uuid), tx);
                 unsafe { peripheral.readValueForCharacteristic(&characteristic) };
                 rx
                 // peripheral and characteristic drop here, before .await
@@ -789,11 +791,7 @@ impl CentralBackend for AppleCentral {
                 }
 
                 let (tx, rx) = oneshot::channel();
-                handle
-                    .inner
-                    .writes
-                    .lock()
-                    .insert((device_id, char_uuid), tx);
+                handle.inner.writes.insert((device_id, char_uuid), tx);
                 unsafe {
                     peripheral.writeValue_forCharacteristic_type(&data, &characteristic, cb_type);
                 };
@@ -866,7 +864,7 @@ impl CentralBackend for AppleCentral {
                     return Err(BlewError::DeviceNotFound(device_id));
                 };
                 let (tx, rx) = oneshot::channel();
-                handle.inner.l2cap_pendings.lock().insert(device_id, tx);
+                handle.inner.l2cap_pendings.insert(device_id, tx);
                 unsafe { peripheral.openL2CAPChannel(psm.0) };
                 rx
             };
@@ -978,7 +976,6 @@ impl AppleCentral {
             handle
                 .inner
                 .notify_states
-                .lock()
                 .insert((device_id, char_uuid), tx);
             unsafe { peripheral.setNotifyValue_forCharacteristic(enabled, &characteristic) };
             rx
