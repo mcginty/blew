@@ -7,6 +7,15 @@ pub struct GattDescriptor {
     pub value: Vec<u8>,
 }
 
+/// A GATT characteristic.
+///
+/// # Platform caveats
+///
+/// **Apple:** If [`value`](Self::value) is non-empty **and** [`properties`](Self::properties)
+/// includes [`CharacteristicProperties::WRITE`], CoreBluetooth treats the characteristic as
+/// static and raises `NSInvalidArgumentException` → `SIGABRT` when a central writes to it.
+/// For any writable characteristic set `value: vec![]` and handle reads via
+/// [`PeripheralRequest::Read`](crate::peripheral::PeripheralRequest::Read).
 #[derive(Debug, Clone)]
 pub struct GattCharacteristic {
     pub uuid: Uuid,
