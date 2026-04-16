@@ -112,6 +112,7 @@ struct PeripheralInner {
     /// Result of `publishL2CAPChannelWithEncryption` -- carries the assigned PSM.
     l2cap_publish_tx: Mutex<Option<oneshot::Sender<BlewResult<Psm>>>>,
     /// Sender for incoming L2CAP channels (set by `l2cap_listener`).
+    #[allow(clippy::type_complexity)]
     l2cap_channel_tx: Mutex<Option<mpsc::Sender<BlewResult<(DeviceId, L2capChannel)>>>>,
     /// Tokio runtime handle, captured at construction time so GCD callbacks
     /// (which run off the Tokio thread) can spawn tasks onto the runtime.
