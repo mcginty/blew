@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Fan-out from a single event source to multiple per-subscriber bounded channels.
@@ -24,7 +25,7 @@ impl<E: Clone + Send + 'static> EventFanout<E> {
     #[must_use]
     pub fn subscribe(&self, capacity: usize) -> mpsc::Receiver<E> {
         let (tx, rx) = mpsc::channel(capacity);
-        self.subscribers.lock().unwrap().push(tx);
+        self.subscribers.lock().push(tx);
         rx
     }
 }
@@ -38,7 +39,7 @@ impl<E: Clone + Send + 'static> EventFanoutTx<E> {
     /// Broadcast `event` to all subscribers. Full or closed subscribers are removed.
     #[allow(clippy::needless_pass_by_value)]
     pub fn send(&self, event: E) {
-        let mut subs = self.subscribers.lock().unwrap();
+        let mut subs = self.subscribers.lock();
         subs.retain(|tx| tx.try_send(event.clone()).is_ok());
     }
 }
