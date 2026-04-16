@@ -33,6 +33,8 @@ use crate::peripheral::types::{
 };
 use crate::types::{BleDevice, DeviceId};
 use crate::util::BroadcastEventStream;
+
+const MOCK_MTU: u16 = 512;
 /// Policy for injecting L2CAP failures in mock tests.
 #[derive(Debug, Clone, Default)]
 pub struct MockL2capPolicy {
@@ -293,57 +295,90 @@ impl CentralBackend for MockCentral {
         device_id: &DeviceId,
         char_uuid: Uuid,
     ) -> impl Future<Output = BlewResult<Vec<u8>>> + Send {
-        let link = self.link.lock();
-        let static_value = link.char_values.get(&char_uuid).cloned();
-        let has_service_char = link
-            .services
-            .iter()
-            .any(|s| s.characteristics.iter().any(|c| c.uuid == char_uuid));
         let device_id = device_id.clone();
         let periph_tx = self.periph_request_tx.clone();
-
-        async move {
-            if let Some(value) = static_value
+        let precheck = {
+            let link = self.link.lock();
+            if !link.connected {
+                Err(BlewError::NotConnected(device_id.clone()))
+            } else if let Some(value) = link.char_values.get(&char_uuid).cloned()
                 && !value.is_empty()
             {
-                return Ok(value);
-            }
-
-            if !has_service_char {
-                return Err(BlewError::CharacteristicNotFound {
-                    device_id,
+                Ok(Some(value))
+            } else if link
+                .services
+                .iter()
+                .any(|s| s.characteristics.iter().any(|c| c.uuid == char_uuid))
+            {
+                Ok(None)
+            } else {
+                Err(BlewError::CharacteristicNotFound {
+                    device_id: device_id.clone(),
                     char_uuid,
-                });
+                })
             }
+        };
 
-            let (tx, rx) = oneshot::channel();
-            let responder = ReadResponder::new(tx);
-            let _ = periph_tx.send(PeripheralRequest::Read {
-                client_id: DeviceId::from("mock-central"),
-                service_uuid: Uuid::nil(),
-                char_uuid,
-                offset: 0,
-                responder,
-            });
-            match rx.await {
-                Ok(Ok(data)) => Ok(data),
-                _ => Err(BlewError::Gatt {
-                    device_id,
-                    source: "read failed".into(),
-                }),
+        async move {
+            match precheck? {
+                Some(value) => Ok(value),
+                None => {
+                    let (tx, rx) = oneshot::channel();
+                    let responder = ReadResponder::new(tx);
+                    let _ = periph_tx.send(PeripheralRequest::Read {
+                        client_id: DeviceId::from("mock-central"),
+                        service_uuid: Uuid::nil(),
+                        char_uuid,
+                        offset: 0,
+                        responder,
+                    });
+                    match rx.await {
+                        Ok(Ok(data)) => Ok(data),
+                        _ => Err(BlewError::Gatt {
+                            device_id,
+                            source: "read failed".into(),
+                        }),
+                    }
+                }
             }
         }
     }
 
     fn write_characteristic(
         &self,
-        _device_id: &DeviceId,
+        device_id: &DeviceId,
         char_uuid: Uuid,
         value: Vec<u8>,
         write_type: WriteType,
     ) -> impl Future<Output = BlewResult<()>> + Send {
+        let device_id = device_id.clone();
         let periph_tx = self.periph_request_tx.clone();
+        let max = MOCK_MTU as usize - 3;
+        let precheck: BlewResult<()> = {
+            let link = self.link.lock();
+            if !link.connected {
+                Err(BlewError::NotConnected(device_id.clone()))
+            } else if !link
+                .services
+                .iter()
+                .any(|s| s.characteristics.iter().any(|c| c.uuid == char_uuid))
+            {
+                Err(BlewError::CharacteristicNotFound {
+                    device_id: device_id.clone(),
+                    char_uuid,
+                })
+            } else if value.len() > max {
+                Err(BlewError::ValueTooLarge {
+                    got: value.len(),
+                    max,
+                })
+            } else {
+                Ok(())
+            }
+        };
+
         async move {
+            precheck?;
             let (responder, rx) = match write_type {
                 WriteType::WithResponse => {
                     let (tx, rx) = oneshot::channel::<bool>();
@@ -364,7 +399,7 @@ impl CentralBackend for MockCentral {
                 match rx.await {
                     Ok(true) => Ok(()),
                     _ => Err(BlewError::Gatt {
-                        device_id: DeviceId::from("mock-central"),
+                        device_id,
                         source: "write rejected".into(),
                     }),
                 }
@@ -386,6 +421,19 @@ impl CentralBackend for MockCentral {
         async move {
             let rx = {
                 let mut link = link.lock();
+                if !link.connected {
+                    return Err(BlewError::NotConnected(device_id));
+                }
+                if !link
+                    .services
+                    .iter()
+                    .any(|s| s.characteristics.iter().any(|c| c.uuid == char_uuid))
+                {
+                    return Err(BlewError::CharacteristicNotFound {
+                        device_id,
+                        char_uuid,
+                    });
+                }
                 if link.subscriptions.contains_key(&char_uuid) {
                     return Err(BlewError::AlreadySubscribed {
                         device_id,
@@ -429,7 +477,7 @@ impl CentralBackend for MockCentral {
     }
 
     async fn mtu(&self, _device_id: &DeviceId) -> u16 {
-        512
+        MOCK_MTU
     }
 
     fn open_l2cap_channel(
@@ -785,6 +833,7 @@ mod tests {
             .unwrap();
 
         let device_id = DeviceId::from("mock-peripheral");
+        central.connect(&device_id).await.unwrap();
         let data = central
             .read_characteristic(&device_id, char_uuid)
             .await
@@ -826,6 +875,7 @@ mod tests {
         });
 
         let device_id = DeviceId::from("mock-peripheral");
+        central.connect(&device_id).await.unwrap();
         let data = central
             .read_characteristic(&device_id, char_uuid)
             .await
@@ -875,6 +925,7 @@ mod tests {
         });
 
         let device_id = DeviceId::from("mock-peripheral");
+        central.connect(&device_id).await.unwrap();
         central
             .write_characteristic(
                 &device_id,
@@ -898,6 +949,20 @@ mod tests {
         let peripheral = Peripheral::from_backend(p.peripheral);
 
         let char_uuid = Uuid::from_u128(0xDDDD);
+        peripheral
+            .add_service(&GattService {
+                uuid: Uuid::from_u128(0x1234),
+                primary: true,
+                characteristics: vec![GattCharacteristic {
+                    uuid: char_uuid,
+                    properties: CharacteristicProperties::WRITE_WITHOUT_RESPONSE,
+                    permissions: AttributePermissions::WRITE,
+                    value: vec![],
+                    descriptors: vec![],
+                }],
+            })
+            .await
+            .unwrap();
         let received = Arc::new(Mutex::new(Vec::new()));
         let received2 = received.clone();
         let mut requests = peripheral
@@ -916,6 +981,7 @@ mod tests {
         });
 
         let device_id = DeviceId::from("mock-peripheral");
+        central.connect(&device_id).await.unwrap();
         central
             .write_characteristic(
                 &device_id,
@@ -939,13 +1005,32 @@ mod tests {
         let peripheral = Peripheral::from_backend(p.peripheral);
 
         let char_uuid = Uuid::from_u128(0xEEEE);
+        peripheral
+            .add_service(&GattService {
+                uuid: Uuid::from_u128(0x1234),
+                primary: true,
+                characteristics: vec![GattCharacteristic {
+                    uuid: char_uuid,
+                    properties: CharacteristicProperties::NOTIFY,
+                    permissions: AttributePermissions::READ,
+                    value: vec![],
+                    descriptors: vec![],
+                }],
+            })
+            .await
+            .unwrap();
         let device_id = DeviceId::from("mock-peripheral");
+        central.connect(&device_id).await.unwrap();
 
         let mut events = central.events();
-        // Drain the initial AdapterStateChanged event emitted on construction.
+        // Drain the initial AdapterStateChanged and DeviceConnected events.
         assert!(matches!(
             events.next().await.unwrap(),
             CentralEvent::AdapterStateChanged { powered: true }
+        ));
+        assert!(matches!(
+            events.next().await.unwrap(),
+            CentralEvent::DeviceConnected { .. }
         ));
         central
             .subscribe_characteristic(&device_id, char_uuid)
@@ -1032,15 +1117,32 @@ mod tests {
     async fn contract_write_without_response_returns_immediately() {
         let (c, p) = MockLink::pair();
         let central = Central::from_backend(c.central);
-        let _peripheral = Peripheral::from_backend(p.peripheral);
+        let peripheral = Peripheral::from_backend(p.peripheral);
+
+        let char_uuid = Uuid::from_u128(0x1234);
+        peripheral
+            .add_service(&GattService {
+                uuid: Uuid::from_u128(0xAA00),
+                primary: true,
+                characteristics: vec![GattCharacteristic {
+                    uuid: char_uuid,
+                    properties: CharacteristicProperties::WRITE_WITHOUT_RESPONSE,
+                    permissions: AttributePermissions::WRITE,
+                    value: vec![],
+                    descriptors: vec![],
+                }],
+            })
+            .await
+            .unwrap();
 
         // BLE spec: Write Command has no ATT response, so central must not block.
         let device_id = DeviceId::from("mock-peripheral");
+        central.connect(&device_id).await.unwrap();
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(100),
             central.write_characteristic(
                 &device_id,
-                Uuid::from_u128(0x1234),
+                char_uuid,
                 b"data".to_vec(),
                 WriteType::WithoutResponse,
             ),
@@ -1057,8 +1159,23 @@ mod tests {
         let peripheral = Peripheral::from_backend(p.peripheral);
 
         let char_uuid = Uuid::from_u128(0x5555);
+        peripheral
+            .add_service(&GattService {
+                uuid: Uuid::from_u128(0x1234),
+                primary: true,
+                characteristics: vec![GattCharacteristic {
+                    uuid: char_uuid,
+                    properties: CharacteristicProperties::WRITE,
+                    permissions: AttributePermissions::WRITE,
+                    value: vec![],
+                    descriptors: vec![],
+                }],
+            })
+            .await
+            .unwrap();
 
         let device_id = DeviceId::from("mock-peripheral");
+        central.connect(&device_id).await.unwrap();
         let write_fut = central.write_characteristic(
             &device_id,
             char_uuid,
@@ -1131,6 +1248,7 @@ mod tests {
         });
 
         let device_id = DeviceId::from("mock-peripheral");
+        central.connect(&device_id).await.unwrap();
         let data = central
             .read_characteristic(&device_id, char_uuid)
             .await
@@ -1139,11 +1257,27 @@ mod tests {
     }
     #[tokio::test]
     async fn contract_duplicate_subscribe_rejected() {
-        let (c, _p) = MockLink::pair();
+        let (c, p) = MockLink::pair();
         let central = Central::from_backend(c.central);
+        let peripheral = Peripheral::from_backend(p.peripheral);
 
         let char_uuid = Uuid::from_u128(0x5151);
+        peripheral
+            .add_service(&GattService {
+                uuid: Uuid::from_u128(0x1234),
+                primary: true,
+                characteristics: vec![GattCharacteristic {
+                    uuid: char_uuid,
+                    properties: CharacteristicProperties::NOTIFY,
+                    permissions: AttributePermissions::READ,
+                    value: vec![],
+                    descriptors: vec![],
+                }],
+            })
+            .await
+            .unwrap();
         let device_id = DeviceId::from("mock-peripheral");
+        central.connect(&device_id).await.unwrap();
 
         central
             .subscribe_characteristic(&device_id, char_uuid)
@@ -1173,7 +1307,22 @@ mod tests {
         let peripheral = Peripheral::from_backend(p.peripheral);
 
         let char_uuid = Uuid::from_u128(0x7777);
+        peripheral
+            .add_service(&GattService {
+                uuid: Uuid::from_u128(0x1234),
+                primary: true,
+                characteristics: vec![GattCharacteristic {
+                    uuid: char_uuid,
+                    properties: CharacteristicProperties::NOTIFY,
+                    permissions: AttributePermissions::READ,
+                    value: vec![],
+                    descriptors: vec![],
+                }],
+            })
+            .await
+            .unwrap();
         let device_id = DeviceId::from("mock-peripheral");
+        central.connect(&device_id).await.unwrap();
 
         let mut state = peripheral.state_events();
 
@@ -1206,11 +1355,32 @@ mod tests {
         let peripheral = Peripheral::from_backend(p.peripheral);
 
         let char_uuid = Uuid::from_u128(0x8888);
+        peripheral
+            .add_service(&GattService {
+                uuid: Uuid::from_u128(0x1234),
+                primary: true,
+                characteristics: vec![GattCharacteristic {
+                    uuid: char_uuid,
+                    properties: CharacteristicProperties::NOTIFY,
+                    permissions: AttributePermissions::READ,
+                    value: vec![],
+                    descriptors: vec![],
+                }],
+            })
+            .await
+            .unwrap();
+        let device_id = DeviceId::from("mock-peripheral");
+        central.connect(&device_id).await.unwrap();
+
         let mut events = central.events();
-        // Drain the initial AdapterStateChanged event emitted on construction.
+        // Drain the initial AdapterStateChanged and DeviceConnected events.
         assert!(matches!(
             events.next().await.unwrap(),
             CentralEvent::AdapterStateChanged { powered: true }
+        ));
+        assert!(matches!(
+            events.next().await.unwrap(),
+            CentralEvent::DeviceConnected { .. }
         ));
 
         peripheral
@@ -1229,7 +1399,6 @@ mod tests {
             "notification before subscribe should not arrive"
         );
 
-        let device_id = DeviceId::from("mock-peripheral");
         central
             .subscribe_characteristic(&device_id, char_uuid)
             .await
@@ -1277,7 +1446,22 @@ mod tests {
         let peripheral = Peripheral::from_backend(p.peripheral);
 
         let char_uuid = Uuid::from_u128(0x9999);
+        peripheral
+            .add_service(&GattService {
+                uuid: Uuid::from_u128(0x1234),
+                primary: true,
+                characteristics: vec![GattCharacteristic {
+                    uuid: char_uuid,
+                    properties: CharacteristicProperties::NOTIFY,
+                    permissions: AttributePermissions::READ,
+                    value: vec![],
+                    descriptors: vec![],
+                }],
+            })
+            .await
+            .unwrap();
         let device_id = DeviceId::from("mock-peripheral");
+        central.connect(&device_id).await.unwrap();
 
         central
             .subscribe_characteristic(&device_id, char_uuid)
@@ -1317,6 +1501,7 @@ mod tests {
 
         let device_id = DeviceId::from("mock-peripheral");
         let unknown_uuid = Uuid::from_u128(0xDEAD_BEEF);
+        central.connect(&device_id).await.unwrap();
 
         let result = central.read_characteristic(&device_id, unknown_uuid).await;
 
@@ -1405,13 +1590,32 @@ mod tests {
         let peripheral = Peripheral::from_backend(p.peripheral);
 
         let char_uuid = Uuid::from_u128(0xBBBB);
+        peripheral
+            .add_service(&GattService {
+                uuid: Uuid::from_u128(0x1234),
+                primary: true,
+                characteristics: vec![GattCharacteristic {
+                    uuid: char_uuid,
+                    properties: CharacteristicProperties::NOTIFY,
+                    permissions: AttributePermissions::READ,
+                    value: vec![],
+                    descriptors: vec![],
+                }],
+            })
+            .await
+            .unwrap();
         let device_id = DeviceId::from("mock-peripheral");
+        central.connect(&device_id).await.unwrap();
 
         let mut events = central.events();
-        // Drain the initial AdapterStateChanged event emitted on construction.
+        // Drain the initial AdapterStateChanged and DeviceConnected events.
         assert!(matches!(
             events.next().await.unwrap(),
             CentralEvent::AdapterStateChanged { powered: true }
+        ));
+        assert!(matches!(
+            events.next().await.unwrap(),
+            CentralEvent::DeviceConnected { .. }
         ));
         central
             .subscribe_characteristic(&device_id, char_uuid)
