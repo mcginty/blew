@@ -315,9 +315,16 @@ impl CentralBackend for LinuxCentral {
                 .map_err(|e| BlewError::Central {
                     source: Box::new(e),
                 })?;
-            device.connect().await.map_err(|e| BlewError::Central {
-                source: Box::new(e),
-            })?;
+            const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+            match tokio::time::timeout(CONNECT_TIMEOUT, device.connect()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    return Err(BlewError::Central {
+                        source: Box::new(e),
+                    });
+                }
+                Err(_) => return Err(BlewError::Timeout),
+            }
             debug!(device_id = %device_id, "device connected");
             handle
                 .event_tx
