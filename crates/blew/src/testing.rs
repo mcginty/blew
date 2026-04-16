@@ -61,7 +61,8 @@ struct LinkState {
     connected: bool,
     l2cap_policy: MockL2capPolicy,
     l2cap_psm: Option<crate::l2cap::types::Psm>,
-    l2cap_accept_tx: Option<tokio::sync::mpsc::UnboundedSender<BlewResult<(DeviceId, L2capChannel)>>>,
+    l2cap_accept_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<BlewResult<(DeviceId, L2capChannel)>>>,
 }
 
 type SharedLink = Arc<Mutex<LinkState>>;
@@ -952,7 +953,11 @@ mod tests {
             .unwrap();
 
         peripheral
-            .notify_characteristic(&crate::types::DeviceId::from("mock-central"), char_uuid, b"notify-data".to_vec())
+            .notify_characteristic(
+                &crate::types::DeviceId::from("mock-central"),
+                char_uuid,
+                b"notify-data".to_vec(),
+            )
             .await
             .unwrap();
 
@@ -1176,7 +1181,11 @@ mod tests {
         ));
 
         peripheral
-            .notify_characteristic(&crate::types::DeviceId::from("mock-central"), char_uuid, b"too-early".to_vec())
+            .notify_characteristic(
+                &crate::types::DeviceId::from("mock-central"),
+                char_uuid,
+                b"too-early".to_vec(),
+            )
             .await
             .unwrap();
 
@@ -1194,7 +1203,11 @@ mod tests {
             .unwrap();
 
         peripheral
-            .notify_characteristic(&crate::types::DeviceId::from("mock-central"), char_uuid, b"after-sub".to_vec())
+            .notify_characteristic(
+                &crate::types::DeviceId::from("mock-central"),
+                char_uuid,
+                b"after-sub".to_vec(),
+            )
             .await
             .unwrap();
 
@@ -1242,7 +1255,11 @@ mod tests {
 
         let mut events = central.events();
         peripheral
-            .notify_characteristic(&crate::types::DeviceId::from("mock-central"), char_uuid, b"after-disconnect".to_vec())
+            .notify_characteristic(
+                &crate::types::DeviceId::from("mock-central"),
+                char_uuid,
+                b"after-disconnect".to_vec(),
+            )
             .await
             .unwrap();
 
@@ -1368,7 +1385,11 @@ mod tests {
 
         for i in 0..10_u8 {
             peripheral
-                .notify_characteristic(&crate::types::DeviceId::from("mock-central"), char_uuid, vec![i])
+                .notify_characteristic(
+                    &crate::types::DeviceId::from("mock-central"),
+                    char_uuid,
+                    vec![i],
+                )
                 .await
                 .unwrap();
         }

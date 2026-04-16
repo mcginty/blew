@@ -465,7 +465,11 @@ impl PeripheralBackend for LinuxPeripheral {
                     Ok((stream, addr)) => {
                         debug!(peer = ?addr, "incoming L2CAP connection accepted");
                         let device_id = DeviceId(addr.addr.to_string());
-                        if tx.send(Ok((device_id, bridge_l2cap(stream)))).await.is_err() {
+                        if tx
+                            .send(Ok((device_id, bridge_l2cap(stream))))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }

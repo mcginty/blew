@@ -45,11 +45,11 @@ use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, types::Psm};
 use crate::peripheral::backend::{self, PeripheralBackend};
 use crate::peripheral::types::{AdvertisingConfig, PeripheralEvent, ReadResponder, WriteResponder};
-use crate::types::DeviceId;
 use crate::platform::apple::helpers::{
     ObjcSend, cbuuid_to_uuid, central_device_id, retain_send, uuid_to_cbuuid,
 };
 use crate::platform::apple::l2cap::bridge_l2cap_channel;
+use crate::types::DeviceId;
 
 fn our_props_to_cb(props: CharacteristicProperties) -> CBCharacteristicProperties {
     let mut out = CBCharacteristicProperties(0);

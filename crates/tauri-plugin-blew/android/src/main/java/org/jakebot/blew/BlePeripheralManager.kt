@@ -521,8 +521,10 @@ object BlePeripheralManager {
     @JvmStatic
     fun areBlePermissionsGranted(): Boolean {
         val ctx = context ?: return false
+
         fun granted(p: String) =
-            androidx.core.content.ContextCompat.checkSelfPermission(ctx, p) ==
+            androidx.core.content.ContextCompat
+                .checkSelfPermission(ctx, p) ==
                 android.content.pm.PackageManager.PERMISSION_GRANTED
         return if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
             arrayOf(
