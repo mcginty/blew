@@ -472,6 +472,18 @@ impl CentralBackend for LinuxCentral {
         let device_id = device_id.clone();
         async move {
             debug!(device_id = %device_id, %char_uuid, "subscribing to characteristic");
+            // Reject duplicates before acquiring a new notify_io socket -- otherwise
+            // each subscriber reads from its own stream and they each see partial data.
+            if handle
+                .notify_tasks
+                .lock()
+                .contains_key(&(device_id.clone(), char_uuid))
+            {
+                return Err(BlewError::AlreadySubscribed {
+                    device_id,
+                    char_uuid,
+                });
+            }
             let ch = handle.find_characteristic(&device_id, char_uuid).await?;
             let reader = ch.notify_io().await.map_err(|e| BlewError::Gatt {
                 device_id: device_id.clone(),
@@ -497,10 +509,18 @@ impl CentralBackend for LinuxCentral {
                     }
                 }
             });
-            handle
-                .notify_tasks
-                .lock()
-                .insert((device_id, char_uuid), task);
+            // Race check: another caller may have inserted between our contains_key
+            // check and now. Use entry/or_insert_with semantics via a second lock.
+            let mut tasks = handle.notify_tasks.lock();
+            if tasks.contains_key(&(device_id.clone(), char_uuid)) {
+                drop(tasks);
+                task.abort();
+                return Err(BlewError::AlreadySubscribed {
+                    device_id,
+                    char_uuid,
+                });
+            }
+            tasks.insert((device_id, char_uuid), task);
             Ok(())
         }
     }

@@ -386,33 +386,47 @@ impl CentralBackend for MockCentral {
 
     fn subscribe_characteristic(
         &self,
-        _device_id: &DeviceId,
+        device_id: &DeviceId,
         char_uuid: Uuid,
     ) -> impl Future<Output = BlewResult<()>> + Send {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
-        self.link.lock().subscriptions.insert(char_uuid, tx);
-
+        let device_id = device_id.clone();
+        let link = Arc::clone(&self.link);
         let event_tx = self.event_tx.clone();
-        let device_id = DeviceId::from("mock-peripheral");
-        tokio::spawn(async move {
-            while let Some(value) = rx.recv().await {
-                let _ = event_tx.send(CentralEvent::CharacteristicNotification {
-                    device_id: device_id.clone(),
-                    char_uuid,
-                    value,
-                });
-            }
-        });
+        let periph_event_tx = self.periph_event_tx.clone();
+        async move {
+            let rx = {
+                let mut link = link.lock();
+                if link.subscriptions.contains_key(&char_uuid) {
+                    return Err(BlewError::AlreadySubscribed {
+                        device_id,
+                        char_uuid,
+                    });
+                }
+                let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
+                link.subscriptions.insert(char_uuid, tx);
+                rx
+            };
 
-        let _ = self
-            .periph_event_tx
-            .send(PeripheralEvent::SubscriptionChanged {
+            let notif_device_id = DeviceId::from("mock-peripheral");
+            tokio::spawn(async move {
+                let mut rx = rx;
+                while let Some(value) = rx.recv().await {
+                    let _ = event_tx.send(CentralEvent::CharacteristicNotification {
+                        device_id: notif_device_id.clone(),
+                        char_uuid,
+                        value,
+                    });
+                }
+            });
+
+            let _ = periph_event_tx.send(PeripheralEvent::SubscriptionChanged {
                 client_id: DeviceId::from("mock-central"),
                 char_uuid,
                 subscribed: true,
             });
 
-        async { Ok(()) }
+            Ok(())
+        }
     }
 
     fn unsubscribe_characteristic(
@@ -1129,6 +1143,35 @@ mod tests {
             .unwrap();
         assert_eq!(data, b"correct-char");
     }
+    #[tokio::test]
+    async fn contract_duplicate_subscribe_rejected() {
+        let (c, _p) = MockLink::pair();
+        let central = Central::from_backend(c.central);
+
+        let char_uuid = Uuid::from_u128(0x5151);
+        let device_id = DeviceId::from("mock-peripheral");
+
+        central
+            .subscribe_characteristic(&device_id, char_uuid)
+            .await
+            .expect("first subscribe should succeed");
+
+        let err = central
+            .subscribe_characteristic(&device_id, char_uuid)
+            .await
+            .expect_err("second subscribe must fail");
+        match err {
+            BlewError::AlreadySubscribed {
+                char_uuid: u,
+                device_id: d,
+            } => {
+                assert_eq!(u, char_uuid);
+                assert_eq!(d, device_id);
+            }
+            other => panic!("expected AlreadySubscribed, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn contract_subscribe_emits_subscription_event() {
         let (c, p) = MockLink::pair();

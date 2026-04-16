@@ -46,6 +46,12 @@ pub enum BlewError {
     #[error("value too large for current MTU: got {got} bytes, max {max}")]
     ValueTooLarge { got: usize, max: usize },
 
+    #[error("already subscribed to characteristic {char_uuid} on {device_id}")]
+    AlreadySubscribed {
+        device_id: DeviceId,
+        char_uuid: Uuid,
+    },
+
     #[error("GATT error on device {device_id}: {source}")]
     Gatt {
         device_id: DeviceId,
