@@ -26,6 +26,9 @@ use objc2::define_class;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, ProtocolObject};
 use objc2::{AnyThread, DefinedClass};
+#[cfg(target_os = "ios")]
+use objc2_core_bluetooth::CBPeripheralManagerOptionRestoreIdentifierKey;
+use objc2_core_bluetooth::CBPeripheralManagerRestoredStateServicesKey;
 use objc2_core_bluetooth::{
     CBATTError, CBATTRequest, CBAdvertisementDataLocalNameKey, CBAdvertisementDataServiceUUIDsKey,
     CBAttributePermissions, CBCentral, CBCharacteristic, CBCharacteristicProperties,
@@ -47,7 +50,8 @@ use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, types::Psm};
 use crate::peripheral::backend::{self, PeripheralBackend};
 use crate::peripheral::types::{
-    AdvertisingConfig, PeripheralRequest, PeripheralStateEvent, ReadResponder, WriteResponder,
+    AdvertisingConfig, PeripheralConfig, PeripheralRequest, PeripheralStateEvent, ReadResponder,
+    WriteResponder,
 };
 use crate::platform::apple::helpers::{
     ObjcSend, cbuuid_to_uuid, central_device_id, retain_send, uuid_to_cbuuid,
@@ -173,6 +177,53 @@ define_class!(
             let inner = self.ivars();
             let _ = inner.powered_tx.send(powered);
             inner.emit_state(PeripheralStateEvent::AdapterStateChanged { powered });
+        }
+
+        #[unsafe(method(peripheralManager:willRestoreState:))]
+        unsafe fn peripheralManager_willRestoreState(
+            &self,
+            _peripheral: &CBPeripheralManager,
+            dict: &NSDictionary<NSString, AnyObject>,
+        ) {
+            let inner = self.ivars();
+            let key = unsafe { CBPeripheralManagerRestoredStateServicesKey };
+            let Some(obj) = dict.objectForKey(key) else {
+                inner.emit_state(PeripheralStateEvent::Restored { services: vec![] });
+                return;
+            };
+            // SAFETY: CoreBluetooth guarantees this key's value is NSArray<CBMutableService>.
+            let services: Retained<NSArray<CBMutableService>> = Retained::cast_unchecked(obj);
+            let mut restored_uuids = Vec::new();
+            {
+                let mut chars_lock = inner.chars.lock();
+                for service in services.to_vec() {
+                    let svc_uuid_ret = service.UUID();
+                    let Some(svc_uuid) = cbuuid_to_uuid(&svc_uuid_ret) else {
+                        continue;
+                    };
+                    if let Some(chars) = unsafe { service.characteristics() } {
+                        for ch in chars.to_vec() {
+                            let ch_uuid_ret = ch.UUID();
+                            let Some(ch_uuid) = cbuuid_to_uuid(&ch_uuid_ret) else {
+                                continue;
+                            };
+                            // SAFETY: services we publish are always built from CBMutableCharacteristic,
+                            // so the runtime class matches.
+                            let mutable: &CBMutableCharacteristic =
+                                unsafe { &*(&raw const *ch).cast() };
+                            chars_lock.insert(ch_uuid, unsafe { retain_send(mutable) });
+                        }
+                    }
+                    restored_uuids.push(svc_uuid);
+                }
+            }
+            debug!(
+                count = restored_uuids.len(),
+                "OS-level state restoration recovered peripheral services"
+            );
+            inner.emit_state(PeripheralStateEvent::Restored {
+                services: restored_uuids,
+            });
         }
 
         #[unsafe(method(peripheralManagerDidStartAdvertising:error:))]
@@ -480,21 +531,39 @@ unsafe impl Sync for PeripheralHandle {}
 
 pub struct ApplePeripheral(Arc<PeripheralHandle>);
 
-impl backend::private::Sealed for ApplePeripheral {}
-
-impl PeripheralBackend for ApplePeripheral {
-    type StateEvents = BroadcastEventStream<PeripheralStateEvent>;
-    type Requests = UnboundedReceiverStream<PeripheralRequest>;
-
-    async fn new() -> BlewResult<Self>
-    where
-        Self: Sized,
-    {
+impl ApplePeripheral {
+    pub async fn with_config(
+        #[cfg_attr(not(target_os = "ios"), allow(unused))] config: PeripheralConfig,
+    ) -> BlewResult<Self> {
         let (inner, mut powered_rx) = PeripheralInner::new();
         let delegate = PeripheralDelegate::new(Arc::clone(&inner));
 
         let queue = DispatchQueue::new("blew.peripheral", DispatchQueueAttr::SERIAL);
 
+        // State restoration (CBPeripheralManagerOptionRestoreIdentifierKey) is iOS-only;
+        // passing it on macOS causes CoreBluetooth to throw an NSException.
+        #[cfg(target_os = "ios")]
+        let manager = ObjcSend(unsafe {
+            if let Some(ref id) = config.restore_identifier {
+                let key: &NSString = CBPeripheralManagerOptionRestoreIdentifierKey;
+                let value = NSString::from_str(id);
+                let v_any: &AnyObject = &value;
+                let options = NSDictionary::from_slices(&[key], &[v_any]);
+                CBPeripheralManager::initWithDelegate_queue_options(
+                    CBPeripheralManager::alloc(),
+                    Some(ProtocolObject::from_ref(&*delegate)),
+                    Some(&queue),
+                    Some(&options),
+                )
+            } else {
+                CBPeripheralManager::initWithDelegate_queue(
+                    CBPeripheralManager::alloc(),
+                    Some(ProtocolObject::from_ref(&*delegate)),
+                    Some(&queue),
+                )
+            }
+        });
+        #[cfg(not(target_os = "ios"))]
         let manager = ObjcSend(unsafe {
             CBPeripheralManager::initWithDelegate_queue(
                 CBPeripheralManager::alloc(),
@@ -535,6 +604,20 @@ impl PeripheralBackend for ApplePeripheral {
             inner,
         });
         Ok(ApplePeripheral(handle))
+    }
+}
+
+impl backend::private::Sealed for ApplePeripheral {}
+
+impl PeripheralBackend for ApplePeripheral {
+    type StateEvents = BroadcastEventStream<PeripheralStateEvent>;
+    type Requests = UnboundedReceiverStream<PeripheralRequest>;
+
+    async fn new() -> BlewResult<Self>
+    where
+        Self: Sized,
+    {
+        Self::with_config(PeripheralConfig::default()).await
     }
 
     fn is_powered(&self) -> impl Future<Output = BlewResult<bool>> + Send {
