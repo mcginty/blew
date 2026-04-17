@@ -35,6 +35,133 @@ const STATUS_CHAR_UUID: Uuid = Uuid::from_u128(0x626c_6577_0000_0000_0000_0000_0
 const ECHO_CHAR_UUID: Uuid = Uuid::from_u128(0x626c_6577_0000_0000_0000_0000_0000_0003);
 const PSM_CHAR_UUID: Uuid = Uuid::from_u128(0x626c_6577_0000_0000_0000_0000_0000_0004);
 const STATUS_VALUE: &[u8] = b"BLEW-OK";
+const SPEEDTEST_BYTES: usize = 1024 * 1024;
+const SPEEDTEST_CHUNK_SIZE: usize = 4096;
+const CMD_ECHO: u8 = 0x01;
+const CMD_UPLOAD: u8 = 0x02;
+const CMD_DOWNLOAD: u8 = 0x03;
+const CMD_BIDIRECTIONAL: u8 = 0x04;
+const ACK_OK: u8 = 0xAA;
+const CENTRAL_PATTERN: u8 = 0xC1;
+const PERIPHERAL_PATTERN: u8 = 0xD2;
+
+type DynError = Box<dyn std::error::Error + Send + Sync>;
+
+async fn read_command_header(ch: &mut blew::L2capChannel) -> Result<Option<(u8, usize)>, DynError> {
+    let mut cmd = [0_u8; 1];
+    match ch.read(&mut cmd).await {
+        Ok(0) => return Ok(None),
+        Ok(1) => {}
+        Ok(_) => unreachable!("single-byte buffer read exceeded length"),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+
+    let mut len = [0_u8; 4];
+    ch.read_exact(&mut len).await?;
+    Ok(Some((cmd[0], u32::from_le_bytes(len) as usize)))
+}
+
+async fn send_pattern(
+    ch: &mut blew::L2capChannel,
+    total_len: usize,
+    pattern: u8,
+) -> Result<(), DynError> {
+    let chunk = [pattern; SPEEDTEST_CHUNK_SIZE];
+    let mut remaining = total_len;
+    while remaining > 0 {
+        let n = remaining.min(SPEEDTEST_CHUNK_SIZE);
+        ch.write_all(&chunk[..n]).await?;
+        remaining -= n;
+    }
+    Ok(())
+}
+
+async fn drain_exact_pattern(
+    ch: &mut blew::L2capChannel,
+    total_len: usize,
+    expected: u8,
+) -> Result<(), DynError> {
+    let mut remaining = total_len;
+    let mut buf = vec![0_u8; SPEEDTEST_CHUNK_SIZE];
+    while remaining > 0 {
+        let n = ch
+            .read(&mut buf[..remaining.min(SPEEDTEST_CHUNK_SIZE)])
+            .await?;
+        if n == 0 {
+            return Err("L2CAP speedtest hit EOF early".into());
+        }
+        if buf[..n].iter().any(|&b| b != expected) {
+            return Err("L2CAP speedtest received unexpected payload bytes".into());
+        }
+        remaining -= n;
+    }
+    Ok(())
+}
+
+async fn serve_l2cap_protocol(mut ch: blew::L2capChannel) -> Result<(), DynError> {
+    while let Some((cmd, len)) = read_command_header(&mut ch).await? {
+        match cmd {
+            CMD_ECHO => {
+                let mut buf = vec![0_u8; len];
+                ch.read_exact(&mut buf).await?;
+                ch.write_all(&buf).await?;
+            }
+            CMD_UPLOAD => {
+                drain_exact_pattern(&mut ch, len, CENTRAL_PATTERN).await?;
+                ch.write_all(&[ACK_OK]).await?;
+            }
+            CMD_DOWNLOAD => {
+                send_pattern(&mut ch, len, PERIPHERAL_PATTERN).await?;
+            }
+            CMD_BIDIRECTIONAL => {
+                if len != SPEEDTEST_BYTES {
+                    return Err(format!("unexpected bidirectional size: {len}").into());
+                }
+                let (mut reader, mut writer) = tokio::io::split(ch);
+                let sender = async move {
+                    let chunk = [PERIPHERAL_PATTERN; SPEEDTEST_CHUNK_SIZE];
+                    let mut remaining = len;
+                    while remaining > 0 {
+                        let n = remaining.min(SPEEDTEST_CHUNK_SIZE);
+                        writer.write_all(&chunk[..n]).await?;
+                        remaining -= n;
+                    }
+                    writer.shutdown().await?;
+                    Ok::<_, std::io::Error>(())
+                };
+                let receiver = async move {
+                    let mut remaining = len;
+                    let mut buf = vec![0_u8; SPEEDTEST_CHUNK_SIZE];
+                    while remaining > 0 {
+                        let n = reader
+                            .read(&mut buf[..remaining.min(SPEEDTEST_CHUNK_SIZE)])
+                            .await?;
+                        if n == 0 {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "bidirectional speedtest hit EOF early",
+                            ));
+                        }
+                        if buf[..n].iter().any(|&b| b != CENTRAL_PATTERN) {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "bidirectional speedtest received unexpected payload bytes",
+                            ));
+                        }
+                        remaining -= n;
+                    }
+                    Ok::<_, std::io::Error>(())
+                };
+                tokio::try_join!(sender, receiver)?;
+                return Ok(());
+            }
+            _ => return Err(format!("unknown L2CAP command: {cmd}").into()),
+        }
+    }
+
+    Ok(())
+}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -126,18 +253,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             incoming = l2cap_channels.next() => {
                 let Some(result) = incoming else { break };
                 match result {
-                    Ok((device_id, mut ch)) => {
+                    Ok((device_id, ch)) => {
                         println!("  L2CAP accept from {device_id}");
                         let l2cap_done_tx = l2cap_done_tx.clone();
                         tokio::spawn(async move {
-                            let mut buf = vec![0u8; 4096];
-                            loop {
-                                match ch.read(&mut buf).await {
-                                    Ok(0) | Err(_) => break,
-                                    Ok(n) => {
-                                        if ch.write_all(&buf[..n]).await.is_err() { break }
-                                    }
-                                }
+                            if let Err(e) = serve_l2cap_protocol(ch).await {
+                                eprintln!("  L2CAP session failed: {e}");
                             }
                             let _ = l2cap_done_tx.send(());
                         });
