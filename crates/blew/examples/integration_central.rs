@@ -23,6 +23,7 @@
 use blew::Central;
 use blew::central::{CentralEvent, ScanFilter, WriteType};
 use blew::l2cap::Psm;
+use std::io::Write as _;
 use std::process::ExitCode;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -49,11 +50,13 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => {
             println!("\nintegration-central: PASS");
-            ExitCode::SUCCESS
+            let _ = std::io::stdout().flush();
+            std::process::exit(0);
         }
         Err(e) => {
             eprintln!("\nintegration-central: FAIL -- {e}");
-            ExitCode::FAILURE
+            let _ = std::io::stderr().flush();
+            std::process::exit(1);
         }
     }
 }
@@ -193,6 +196,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("L2CAP echo mismatch".into());
     }
     println!("l2cap echo: ok ({L2CAP_PAYLOAD_LEN} bytes round-trip)");
+
+    drop(ch);
+
+    if let Err(e) = timeout(
+        OP_TIMEOUT,
+        central.unsubscribe_characteristic(&device_id, ECHO_CHAR_UUID),
+    )
+    .await
+    {
+        eprintln!("cleanup: unsubscribe timeout: {e}");
+    }
+
+    if let Err(e) = timeout(OP_TIMEOUT, central.disconnect(&device_id)).await {
+        eprintln!("cleanup: disconnect timeout: {e}");
+    }
+
+    drop(events);
+    drop(central);
 
     Ok(())
 }
