@@ -39,14 +39,15 @@ const STATUS_CHAR_UUID: Uuid = Uuid::from_u128(0x626c_6577_0000_0000_0000_0000_0
 const ECHO_CHAR_UUID: Uuid = Uuid::from_u128(0x626c_6577_0000_0000_0000_0000_0000_0003);
 const PSM_CHAR_UUID: Uuid = Uuid::from_u128(0x626c_6577_0000_0000_0000_0000_0000_0004);
 const STATUS_VALUE: &[u8] = b"BLEW-OK";
-const SCAN_TIMEOUT: Duration = Duration::from_secs(60);
+const SCAN_TIMEOUT: Duration = Duration::from_secs(120);
 const OP_TIMEOUT: Duration = Duration::from_secs(15);
-const SPEEDTEST_TIMEOUT: Duration = Duration::from_secs(60);
+const SPEEDTEST_TIMEOUT: Duration = Duration::from_secs(120);
 const BIDIRECTIONAL_SPEEDTEST_TIMEOUT: Duration = Duration::from_secs(180);
 const ECHO_PAYLOAD: &[u8] = b"the quick brown fox jumps over a lazy dog";
 const L2CAP_PAYLOAD_LEN: usize = 1024;
 const SPEEDTEST_BYTES: usize = 1024 * 1024;
 const SPEEDTEST_CHUNK_SIZE: usize = 4096;
+const PROGRESS_YIELD_INTERVAL: usize = 64 * 1024;
 const CMD_ECHO: u8 = 0x01;
 const CMD_UPLOAD: u8 = 0x02;
 const CMD_DOWNLOAD: u8 = 0x03;
@@ -81,6 +82,12 @@ fn print_speed(label: &str, bytes: usize, elapsed: Duration) {
     );
 }
 
+fn live_speed_label(label: &str, bytes: usize, start: Instant) -> String {
+    let elapsed = start.elapsed().as_secs_f64().max(0.001);
+    let mib_per_s = bytes as f64 / (1024.0 * 1024.0) / elapsed;
+    format!("{label} ({mib_per_s:.2} MiB/s)")
+}
+
 fn spinner(message: &str) -> ProgressBar {
     let pb = ProgressBar::new_spinner();
     pb.set_style(
@@ -97,7 +104,7 @@ fn bytes_bar(message: &str, total: usize) -> ProgressBar {
     let pb = ProgressBar::new(u64::try_from(total).expect("progress total fits in u64"));
     pb.set_style(
         ProgressStyle::with_template(
-            "{msg:<34} [{bar:40.cyan/blue}] {bytes:>8}/{total_bytes:8} {bytes_per_sec:>12} ETA {eta:>4}",
+            "{msg:<48} [{bar:30.cyan/blue}] {bytes:>8}/{total_bytes:8} ETA {eta:>4}",
         )
         .expect("valid bytes template")
         .progress_chars("=> "),
@@ -127,12 +134,21 @@ async fn run_upload_speedtest(
     write_command_header(ch, CMD_UPLOAD, SPEEDTEST_BYTES).await?;
     let chunk = [CENTRAL_PATTERN; SPEEDTEST_CHUNK_SIZE];
     let start = Instant::now();
+    let label = "speedtest central->peripheral";
     let mut remaining = SPEEDTEST_BYTES;
+    let mut bytes_since_yield = 0_usize;
     while remaining > 0 {
         let n = remaining.min(SPEEDTEST_CHUNK_SIZE);
         ch.write_all(&chunk[..n]).await?;
         progress.inc(u64::try_from(n).expect("chunk size fits in u64"));
         remaining -= n;
+        bytes_since_yield += n;
+        let sent = SPEEDTEST_BYTES - remaining;
+        progress.set_message(live_speed_label(label, sent, start));
+        if bytes_since_yield >= PROGRESS_YIELD_INTERVAL {
+            bytes_since_yield = 0;
+            tokio::task::yield_now().await;
+        }
     }
     let mut ack = [0_u8; 1];
     ch.read_exact(&mut ack).await?;
@@ -148,6 +164,7 @@ async fn run_download_speedtest(
 ) -> Result<Duration, Box<dyn std::error::Error>> {
     write_command_header(ch, CMD_DOWNLOAD, SPEEDTEST_BYTES).await?;
     let start = Instant::now();
+    let label = "speedtest peripheral->central";
     let mut remaining = SPEEDTEST_BYTES;
     let mut buf = vec![0_u8; SPEEDTEST_CHUNK_SIZE];
     while remaining > 0 {
@@ -162,6 +179,8 @@ async fn run_download_speedtest(
         }
         progress.inc(u64::try_from(n).expect("chunk size fits in u64"));
         remaining -= n;
+        let received = SPEEDTEST_BYTES - remaining;
+        progress.set_message(live_speed_label(label, received, start));
     }
     Ok(start.elapsed())
 }
@@ -172,23 +191,35 @@ async fn run_bidirectional_speedtest(
 ) -> Result<Duration, Box<dyn std::error::Error>> {
     let (mut reader, mut writer) = tokio::io::split(ch);
     let start = Instant::now();
+    let label = "speedtest concurrent";
     let progress = Arc::new(progress);
     let sender_progress = Arc::clone(&progress);
+    let sender_label = label;
 
     let sender = async move {
         let chunk = [CENTRAL_PATTERN; SPEEDTEST_CHUNK_SIZE];
         let mut remaining = SPEEDTEST_BYTES;
+        let mut bytes_since_yield = 0_usize;
         while remaining > 0 {
             let n = remaining.min(SPEEDTEST_CHUNK_SIZE);
             writer.write_all(&chunk[..n]).await?;
             sender_progress.inc(u64::try_from(n).expect("chunk size fits in u64"));
             remaining -= n;
+            bytes_since_yield += n;
+            let transferred = usize::try_from(sender_progress.position())
+                .expect("progress position fits in usize");
+            sender_progress.set_message(live_speed_label(sender_label, transferred, start));
+            if bytes_since_yield >= PROGRESS_YIELD_INTERVAL {
+                bytes_since_yield = 0;
+                tokio::task::yield_now().await;
+            }
         }
         writer.shutdown().await?;
         Ok::<_, std::io::Error>(())
     };
 
     let progress = Arc::clone(&progress);
+    let receiver_label = label;
     let receiver = async move {
         let mut remaining = SPEEDTEST_BYTES;
         let mut buf = vec![0_u8; SPEEDTEST_CHUNK_SIZE];
@@ -210,6 +241,9 @@ async fn run_bidirectional_speedtest(
             }
             progress.inc(u64::try_from(n).expect("chunk size fits in u64"));
             remaining -= n;
+            let transferred =
+                usize::try_from(progress.position()).expect("progress position fits in usize");
+            progress.set_message(live_speed_label(receiver_label, transferred, start));
         }
         Ok::<_, std::io::Error>(())
     };
