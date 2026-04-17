@@ -48,7 +48,7 @@ const SPEEDTEST_BYTES: usize = 1024 * 1024;
 const BIDIRECTIONAL_SPEEDTEST_BYTES: usize = 500 * 1024;
 const SPEEDTEST_CHUNK_SIZE: usize = 4096;
 const PROGRESS_YIELD_INTERVAL: usize = 64 * 1024;
-const PROGRESS_PRINT_INTERVAL: Duration = Duration::from_millis(250);
+const PROGRESS_PRINT_INTERVAL: Duration = Duration::from_secs(1);
 const CMD_ECHO: u8 = 0x01;
 const CMD_UPLOAD: u8 = 0x02;
 const CMD_DOWNLOAD: u8 = 0x03;
@@ -443,9 +443,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("l2cap echo: ok ({L2CAP_PAYLOAD_LEN} bytes round-trip)");
 
     let mut upload_send_progress =
-        ProgressPrinter::new("speedtest central->peripheral send", SPEEDTEST_BYTES);
+        ProgressPrinter::new("speedtest central->peripheral queued", SPEEDTEST_BYTES);
     let mut upload_recv_progress =
-        ProgressPrinter::new("speedtest central->peripheral recv", SPEEDTEST_BYTES);
+        ProgressPrinter::new("speedtest central->peripheral received", SPEEDTEST_BYTES);
     let upload_elapsed = timeout(
         SPEEDTEST_TIMEOUT,
         run_upload_speedtest(
