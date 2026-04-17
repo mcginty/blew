@@ -138,7 +138,6 @@ async fn serve_l2cap_protocol(mut ch: blew::L2capChannel) -> Result<(), DynError
                         writer.write_all(&chunk[..n]).await?;
                         remaining -= n;
                     }
-                    writer.shutdown().await?;
                     Ok::<_, std::io::Error>(())
                 };
                 let receiver = async move {

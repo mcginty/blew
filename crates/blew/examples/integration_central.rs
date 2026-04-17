@@ -145,20 +145,23 @@ async fn run_echo(
 
 async fn run_upload_speedtest(
     ch: &mut blew::L2capChannel,
-    progress: &mut ProgressPrinter,
+    send_progress: &mut ProgressPrinter,
+    recv_progress: &mut ProgressPrinter,
 ) -> Result<Duration, Box<dyn std::error::Error>> {
     write_command_header(ch, CMD_UPLOAD, SPEEDTEST_BYTES).await?;
-    let label = "speedtest central->peripheral";
     let (mut reader, mut writer) = tokio::io::split(ch);
 
     let sender = async {
         let chunk = [CENTRAL_PATTERN; SPEEDTEST_CHUNK_SIZE];
         let mut remaining = SPEEDTEST_BYTES;
+        let mut sent = 0_usize;
         let mut bytes_since_yield = 0_usize;
         while remaining > 0 {
             let n = remaining.min(SPEEDTEST_CHUNK_SIZE);
             writer.write_all(&chunk[..n]).await?;
             remaining -= n;
+            sent += n;
+            send_progress.update(sent);
             bytes_since_yield += n;
             if bytes_since_yield >= PROGRESS_YIELD_INTERVAL {
                 bytes_since_yield = 0;
@@ -181,16 +184,16 @@ async fn run_upload_speedtest(
                     "invalid upload progress report",
                 ));
             }
-            progress.update(received);
+            recv_progress.update(received);
             last_reported = received;
         }
         Ok::<(), std::io::Error>(())
     };
 
     tokio::try_join!(sender, receiver)?;
-    progress.finish();
-    let _ = label;
-    Ok(progress.start.elapsed())
+    send_progress.finish();
+    recv_progress.finish();
+    Ok(send_progress.start.elapsed())
 }
 
 async fn run_download_speedtest(
@@ -243,7 +246,6 @@ async fn run_bidirectional_speedtest(
                 tokio::task::yield_now().await;
             }
         }
-        writer.shutdown().await?;
         Ok::<_, std::io::Error>(())
     };
 
@@ -440,11 +442,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| "L2CAP echo timeout")??;
     println!("l2cap echo: ok ({L2CAP_PAYLOAD_LEN} bytes round-trip)");
 
-    let mut upload_progress =
-        ProgressPrinter::new("speedtest central->peripheral", SPEEDTEST_BYTES);
+    let mut upload_send_progress =
+        ProgressPrinter::new("speedtest central->peripheral send", SPEEDTEST_BYTES);
+    let mut upload_recv_progress =
+        ProgressPrinter::new("speedtest central->peripheral recv", SPEEDTEST_BYTES);
     let upload_elapsed = timeout(
         SPEEDTEST_TIMEOUT,
-        run_upload_speedtest(&mut ch, &mut upload_progress),
+        run_upload_speedtest(
+            &mut ch,
+            &mut upload_send_progress,
+            &mut upload_recv_progress,
+        ),
     )
     .await
     .map_err(|_| "central->peripheral speedtest timeout")??;
