@@ -43,7 +43,8 @@ pub enum PeripheralStateEvent {
 ///
 /// Each variant carries an owned responder that must be consumed exactly once,
 /// or dropped (which sends an ATT Application Error automatically). Single-consumer:
-/// the request stream is handed out via [`Peripheral::take_requests`].
+/// the request stream is handed out via
+/// [`Peripheral::take_requests`](crate::peripheral::Peripheral::take_requests).
 #[derive(Debug)]
 pub enum PeripheralRequest {
     /// A remote central sent an ATT Read Request.

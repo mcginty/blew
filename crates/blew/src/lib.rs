@@ -30,6 +30,88 @@
 //! The annotation is required because Rust's default type-parameter inference does not fire on
 //! method calls. If you see compiler error E0283 ("type annotations needed"), you forgot the
 //! `: Central`.
+//!
+//! # State restoration
+//!
+//! **iOS only.** On macOS, Linux, and Android the restoration configuration is inert —
+//! `Central::with_config` / `Peripheral::with_config` accept the same types but behave
+//! identically to `new()` there, so applications can call them unconditionally.
+//!
+//! State restoration lets iOS relaunch your app in the background when BLE events arrive
+//! after it has been suspended or jetsam-killed. When it works, the system hands back the
+//! previously-connected peripherals (central) or published services (peripheral), along
+//! with the subscriber list and any in-flight advertising state — no re-scan, no
+//! re-advertise, no re-discover-services. Used correctly it can keep a BLE session alive
+//! across hours or days of background time. Used incorrectly it silently does nothing, or
+//! worse, diverges from what the OS expects and causes connection drops. The rules below
+//! are non-negotiable.
+//!
+//! ## Prerequisites
+//!
+//! 1. **Info.plist `UIBackgroundModes`** must include `bluetooth-central` (for [`Central`])
+//!    and/or `bluetooth-peripheral` (for [`Peripheral`]). Without these the OS will not
+//!    preserve or restore state and `with_config` behaves like `new()`.
+//! 2. **The restore identifier must be stable across launches.** Hard-code it or load it
+//!    from a place that is available before the BLE stack comes up (e.g. a build-time
+//!    constant). If the identifier differs from the previous launch, the OS discards the
+//!    preserved state.
+//! 3. **Construct the role in `application:didFinishLaunchingWithOptions:`** — that is, at
+//!    the earliest possible point in app startup, *synchronously* from the launch
+//!    callback. If you construct it later, the delegate misses the `willRestoreState:`
+//!    callback and preserved state is dropped.
+//!
+//! ## Runtime contract
+//!
+//! After calling [`Central::with_config`] or [`Peripheral::with_config`] you **must** drain
+//! [`CentralEvent::Restored`](central::CentralEvent::Restored) /
+//! [`PeripheralStateEvent::Restored`](peripheral::PeripheralStateEvent::Restored) *before* issuing any new
+//! work (scanning, connecting, adding services, advertising). The OS fires the restore
+//! callback exactly once, synchronously during initialisation; if new work races ahead the
+//! two states can diverge in ways that look like random disconnects.
+//!
+//! Typical shape:
+//!
+//! ```no_run
+//! # async fn example() -> blew::error::BlewResult<()> {
+//! use blew::central::{Central, CentralConfig, CentralEvent};
+//! use tokio_stream::StreamExt as _;
+//!
+//! let central: Central = Central::with_config(CentralConfig {
+//!     restore_identifier: Some("com.example.app.central".into()),
+//!     ..Default::default()
+//! }).await?;
+//!
+//! let mut events = central.events();
+//! if let Some(CentralEvent::Restored { devices }) = events.next().await {
+//!     // Re-hydrate app-level state from `devices` before kicking off new scans.
+//!     for _dev in devices { /* ... */ }
+//! }
+//! # Ok(()) }
+//! ```
+//!
+//! ## What is *not* restored
+//!
+//! - **L2CAP CoC channels.** The OS does not persist L2CAP sockets across termination.
+//!   Any side that had a channel open must re-establish it — the central via
+//!   [`Central::open_l2cap_channel`], the peripheral via
+//!   [`Peripheral::l2cap_listener`]. The restored-state callbacks do not carry PSM info.
+//! - **Subscribers.** Peripheral subscribers are not carried across restoration; the
+//!   `SubscriptionChanged` events replay as clients re-subscribe.
+//! - **GATT service discovery cache** (central side) is preserved, but discovered
+//!   characteristics will be re-emitted by your own `discover_services` flow if you call
+//!   it again. Skip redundant discovery by using the restored peripherals directly.
+//!
+//! ## Background runtime caveats
+//!
+//! - Background scanning is degraded: you must pass a non-empty service-UUID filter, the
+//!   OS forces duplicate suppression on, and the scan duty cycle is coalesced with other
+//!   apps. Scans with no filter are silently ignored in the background.
+//! - Background advertising strips `local_name` from the advertisement and moves service
+//!   UUIDs into the overflow area. Peers that are not explicitly scanning for your
+//!   service UUID will not see you.
+//! - Repeated crashes during a background relaunch cause iOS to *disable* background BLE
+//!   for your app until the user relaunches it from the foreground. Treat
+//!   `willRestoreState:` as a stability-critical code path.
 
 pub mod central;
 pub mod error;

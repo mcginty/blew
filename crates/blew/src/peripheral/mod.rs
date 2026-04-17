@@ -21,15 +21,16 @@ impl Peripheral {
     /// On Apple platforms this wires `CBPeripheralManagerOptionRestoreIdentifierKey` when
     /// `config.restore_identifier` is `Some`. On all other platforms the config is ignored.
     ///
-    /// iOS requires that `CBPeripheralManager` be constructed with the restore identifier
-    /// during `application:didFinishLaunchingWithOptions:`, using the same identifier as the
-    /// previous launch — otherwise the OS discards the preserved state. When
-    /// `restore_identifier` is set, construct `Peripheral` as early as possible in app
-    /// startup. During the next launch, listen for
-    /// [`PeripheralStateEvent::Restored`] to observe the preserved services.
+    /// When `restore_identifier` is set, this must be called synchronously from
+    /// `application:didFinishLaunchingWithOptions:` with the same identifier as the
+    /// previous launch. Before issuing any new `add_service` / `start_advertising` calls,
+    /// drain [`PeripheralStateEvent::Restored`] — the OS re-registers the preserved
+    /// services on the manager for you, and racing `add_service` against that callback
+    /// can produce duplicate-service errors.
     ///
-    /// See the crate-level `State restoration` docs for the full iOS contract
-    /// (entitlements, event-drain rules, L2CAP re-open requirement).
+    /// See the crate-level [`State restoration`](crate#state-restoration) docs for the
+    /// full iOS contract (entitlements, L2CAP re-open requirement, background runtime
+    /// constraints).
     pub async fn with_config(config: PeripheralConfig) -> BlewResult<Self> {
         let backend = PlatformPeripheral::with_config(config).await?;
         Ok(Self { backend })

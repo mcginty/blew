@@ -35,12 +35,14 @@ impl Central {
     /// On Apple platforms this wires `CBCentralManagerOptionRestoreIdentifierKey` when
     /// `config.restore_identifier` is `Some`. On all other platforms the config is ignored.
     ///
-    /// iOS requires that `CBCentralManager` be constructed with the restore
-    /// identifier during `application:didFinishLaunchingWithOptions:`, using the
-    /// same identifier as the previous launch — otherwise the OS discards the
-    /// preserved state. When `restore_identifier` is set, construct `Central` as
-    /// early as possible in app startup. During the next launch, listen for
-    /// [`CentralEvent::Restored`] to recover the preserved peripherals.
+    /// When `restore_identifier` is set, this must be called synchronously from
+    /// `application:didFinishLaunchingWithOptions:` with the same identifier as the
+    /// previous launch. Before issuing any scans or connects, drain
+    /// [`CentralEvent::Restored`] to recover the preserved peripherals — issuing new work
+    /// ahead of that event will diverge from what the OS expects.
+    ///
+    /// See the crate-level [`State restoration`](crate#state-restoration) docs for the
+    /// full iOS contract (entitlements, L2CAP caveats, background runtime constraints).
     pub async fn with_config(config: CentralConfig) -> BlewResult<Self> {
         let backend = PlatformCentral::with_config(config).await?;
         Ok(Self { backend })

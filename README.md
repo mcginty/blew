@@ -41,6 +41,13 @@ necessary Kotlin/JNI glue to enable Android functionality.
 - **Android:** BLE permissions (`BLUETOOTH_SCAN`/`CONNECT`/`ADVERTISE` on API 31+, plus
   `ACCESS_FINE_LOCATION` on older versions) must be granted at runtime — `Central::new` /
   `Peripheral::new` return `BlewError::PermissionDenied` if not.
+- **iOS state restoration:** opt in via `Central::with_config` / `Peripheral::with_config`
+  with a stable `restore_identifier`. This *must* run synchronously from
+  `application:didFinishLaunchingWithOptions:`, the app must declare the matching
+  `UIBackgroundModes`, and the `Restored` event must be drained before issuing new scans,
+  connects, or `add_service` calls. L2CAP channels are never restored. See the crate-level
+  `State restoration` rustdoc for the full contract — misusing it causes silent connection
+  drops.
 - **Testing:** the `testing` feature exposes in-memory mock backends that enforce the
   connection/service/MTU invariants the real backends do. Real hardware behavior is not
   covered by CI; plan to smoke-test on device before shipping.
