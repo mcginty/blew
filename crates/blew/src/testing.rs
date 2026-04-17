@@ -1743,4 +1743,44 @@ mod tests {
             other => panic!("expected AdapterStateChanged(powered=true), got {other:?}"),
         }
     }
+
+    #[tokio::test]
+    async fn take_restored_returns_none_when_unset() {
+        let central = MockCentral::new_powered();
+        assert!(central.take_restored().is_none());
+
+        let peripheral = MockPeripheral::new_powered();
+        assert!(peripheral.take_restored().is_none());
+    }
+
+    #[tokio::test]
+    async fn take_restored_returns_seeded_value_once() {
+        let central = MockCentral::new_powered();
+        let device = BleDevice {
+            id: DeviceId::from("AA:BB:CC:DD:EE:FF"),
+            name: Some("restored".into()),
+            rssi: None,
+            services: vec![],
+        };
+        central.backend.mock_set_restored(vec![device.clone()]);
+
+        let taken = central.take_restored().expect("first call yields value");
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].id, device.id);
+        assert!(
+            central.take_restored().is_none(),
+            "second call must return None",
+        );
+    }
+
+    #[tokio::test]
+    async fn take_restored_peripheral_returns_seeded_services() {
+        let peripheral = MockPeripheral::new_powered();
+        let svc = Uuid::from_u128(0x1234);
+        peripheral.backend.mock_set_restored(vec![svc]);
+
+        let taken = peripheral.take_restored().expect("first call yields value");
+        assert_eq!(taken, vec![svc]);
+        assert!(peripheral.take_restored().is_none());
+    }
 }
