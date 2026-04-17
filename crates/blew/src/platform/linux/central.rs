@@ -612,6 +612,10 @@ impl CentralBackend for LinuxCentral {
     fn events(&self) -> Self::EventStream {
         ReceiverStream::new(self.0.event_fanout.subscribe(64))
     }
+
+    fn take_restored(&self) -> Option<Vec<BleDevice>> {
+        None
+    }
 }
 
 /// Warn if BlueZ is configured in a way that triggers Apple pairing popups.

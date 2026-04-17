@@ -37,9 +37,9 @@ impl Central {
     ///
     /// When `restore_identifier` is set, this must be called synchronously from
     /// `application:didFinishLaunchingWithOptions:` with the same identifier as the
-    /// previous launch. Before issuing any scans or connects, drain
-    /// [`CentralEvent::Restored`] to recover the preserved peripherals — issuing new work
-    /// ahead of that event will diverge from what the OS expects.
+    /// previous launch. Immediately after it returns, call [`Self::take_restored`] to
+    /// recover any preserved peripherals — issuing new scans or connects ahead of that
+    /// call will diverge from what the OS expects.
     ///
     /// See the crate-level [`State restoration`](crate#state-restoration) docs for the
     /// full iOS contract (entitlements, L2CAP caveats, background runtime constraints).
@@ -169,6 +169,28 @@ impl<B: CentralBackend> Central<B> {
     /// Subscribe to central-role events. Each call returns an independent stream.
     pub fn events(&self) -> EventStream<CentralEvent, B::EventStream> {
         EventStream::new(self.backend.events())
+    }
+
+    /// Consume the OS-level state-restoration payload, if any.
+    ///
+    /// On iOS, when `Central::with_config` was called with a `restore_identifier` and the
+    /// OS is relaunching the app, the `CBCentralManager` delegate's `willRestoreState:`
+    /// callback fires during initialisation. `with_config` captures that payload and
+    /// buffers the preserved peripherals here; this method hands them to the caller
+    /// exactly once.
+    ///
+    /// Returns:
+    /// - `Some(devices)` — this launch is an OS-level restoration and `devices` lists
+    ///   the peripherals the OS reconnected on the app's behalf. Your app should
+    ///   rehydrate its own state from these before issuing new scans/connects.
+    /// - `None` — not a restoration launch, or the restored state has already been
+    ///   taken, or the platform is not iOS.
+    ///
+    /// See the crate-level [`State restoration`](crate#state-restoration) docs for why
+    /// this is a `take_*` style API (the event fires before subscribers can attach).
+    #[must_use]
+    pub fn take_restored(&self) -> Option<Vec<BleDevice>> {
+        self.backend.take_restored()
     }
 
     /// Clear the Android GATT service cache for `device_id`.

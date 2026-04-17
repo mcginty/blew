@@ -509,4 +509,8 @@ impl PeripheralBackend for LinuxPeripheral {
             .take()
             .map(UnboundedReceiverStream::new)
     }
+
+    fn take_restored(&self) -> Option<Vec<Uuid>> {
+        None
+    }
 }

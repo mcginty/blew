@@ -118,6 +118,11 @@ struct PeripheralInner {
     request_rx: Mutex<Option<mpsc::UnboundedReceiver<PeripheralRequest>>>,
     /// Broadcast sender for clone-able state events (adapter power, subscription changes).
     state_tx: broadcast::Sender<PeripheralStateEvent>,
+    /// Populated once by `willRestoreState:`; drained exactly once via
+    /// [`PeripheralBackend::take_restored`]. Buffered so callers can observe the
+    /// restored service list after construction returns — broadcast delivery
+    /// would race the callback.
+    restored: Mutex<Option<Vec<Uuid>>>,
     /// Powered state watch.
     powered_tx: watch::Sender<bool>,
     /// Result of `publishL2CAPChannelWithEncryption` -- carries the assigned PSM.
@@ -143,6 +148,7 @@ impl PeripheralInner {
             request_tx,
             request_rx: Mutex::new(Some(request_rx)),
             state_tx,
+            restored: Mutex::new(None),
             powered_tx,
             l2cap_publish_tx: Mutex::new(None),
             l2cap_channel_tx: Mutex::new(None),
@@ -188,7 +194,7 @@ define_class!(
             let inner = self.ivars();
             let key = unsafe { CBPeripheralManagerRestoredStateServicesKey };
             let Some(obj) = dict.objectForKey(key) else {
-                inner.emit_state(PeripheralStateEvent::Restored { services: vec![] });
+                *inner.restored.lock() = Some(Vec::new());
                 return;
             };
             // SAFETY: CoreBluetooth guarantees this key's value is NSArray<CBMutableService>.
@@ -221,9 +227,7 @@ define_class!(
                 count = restored_uuids.len(),
                 "OS-level state restoration recovered peripheral services"
             );
-            inner.emit_state(PeripheralStateEvent::Restored {
-                services: restored_uuids,
-            });
+            *inner.restored.lock() = Some(restored_uuids);
         }
 
         #[unsafe(method(peripheralManagerDidStartAdvertising:error:))]
@@ -834,5 +838,9 @@ impl PeripheralBackend for ApplePeripheral {
             .lock()
             .take()
             .map(UnboundedReceiverStream::new)
+    }
+
+    fn take_restored(&self) -> Option<Vec<Uuid>> {
+        self.0.inner.restored.lock().take()
     }
 }

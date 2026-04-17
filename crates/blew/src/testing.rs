@@ -115,6 +115,7 @@ impl MockLink {
             periph_request_tx: periph_request_tx.clone(),
             periph_state_tx: periph_state_tx.clone(),
             powered: Arc::new(Mutex::new(true)),
+            restored: Arc::new(Mutex::new(None)),
         };
 
         let peripheral = MockPeripheral {
@@ -124,6 +125,7 @@ impl MockLink {
             state_tx: periph_state_tx,
             central_sender_keepalive: central_event_tx.clone(),
             powered: Arc::new(Mutex::new(true)),
+            restored: Arc::new(Mutex::new(None)),
         };
 
         (
@@ -148,6 +150,7 @@ pub struct MockCentral {
     periph_request_tx: mpsc::UnboundedSender<PeripheralRequest>,
     periph_state_tx: broadcast::Sender<PeripheralStateEvent>,
     powered: Arc<Mutex<bool>>,
+    restored: Arc<Mutex<Option<Vec<BleDevice>>>>,
 }
 
 impl Clone for MockCentral {
@@ -159,6 +162,7 @@ impl Clone for MockCentral {
             periph_request_tx: self.periph_request_tx.clone(),
             periph_state_tx: self.periph_state_tx.clone(),
             powered: Arc::clone(&self.powered),
+            restored: Arc::clone(&self.restored),
         }
     }
 }
@@ -199,7 +203,13 @@ impl MockCentral {
             periph_request_tx,
             periph_state_tx,
             powered: Arc::new(Mutex::new(powered)),
+            restored: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Seed the restored-peripherals buffer as if `willRestoreState:` had fired.
+    pub fn mock_set_restored(&self, devices: Vec<BleDevice>) {
+        *self.restored.lock() = Some(devices);
     }
 
     /// Emit an `AdapterStateChanged` event and update the powered flag.
@@ -519,6 +529,10 @@ impl CentralBackend for MockCentral {
             .expect("events() called more than once on MockCentral");
         tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
     }
+
+    fn take_restored(&self) -> Option<Vec<BleDevice>> {
+        self.restored.lock().take()
+    }
 }
 /// In-memory mock [`PeripheralBackend`].
 pub struct MockPeripheral {
@@ -528,6 +542,7 @@ pub struct MockPeripheral {
     state_tx: broadcast::Sender<PeripheralStateEvent>,
     central_sender_keepalive: mpsc::UnboundedSender<CentralEvent>,
     powered: Arc<Mutex<bool>>,
+    restored: Arc<Mutex<Option<Vec<Uuid>>>>,
 }
 
 impl Clone for MockPeripheral {
@@ -539,6 +554,7 @@ impl Clone for MockPeripheral {
             state_tx: self.state_tx.clone(),
             central_sender_keepalive: self.central_sender_keepalive.clone(),
             powered: Arc::clone(&self.powered),
+            restored: Arc::clone(&self.restored),
         }
     }
 }
@@ -582,6 +598,7 @@ impl MockPeripheral {
             state_tx,
             central_sender_keepalive: central_event_tx,
             powered: Arc::new(Mutex::new(powered)),
+            restored: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -591,6 +608,11 @@ impl MockPeripheral {
         let _ = self
             .state_tx
             .send(PeripheralStateEvent::AdapterStateChanged { powered });
+    }
+
+    /// Seed the restored-services buffer as if `willRestoreState:` had fired.
+    pub fn mock_set_restored(&self, services: Vec<Uuid>) {
+        *self.restored.lock() = Some(services);
     }
 }
 
@@ -691,6 +713,10 @@ impl PeripheralBackend for MockPeripheral {
             .lock()
             .take()
             .map(tokio_stream::wrappers::UnboundedReceiverStream::new)
+    }
+
+    fn take_restored(&self) -> Option<Vec<Uuid>> {
+        self.restored.lock().take()
     }
 }
 impl<B: CentralBackend> crate::central::Central<B> {

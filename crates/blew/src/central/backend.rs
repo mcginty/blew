@@ -96,4 +96,11 @@ pub trait CentralBackend: private::Sealed + Send + Sync + 'static {
     /// Subscribe to central-role events. Each call returns an independent stream
     /// backed by its own channel so back-pressure is per-subscriber.
     fn events(&self) -> Self::EventStream;
+
+    /// Consume the OS-level state-restoration payload, if any.
+    ///
+    /// Populated by the platform's `willRestoreState:` callback (iOS only). Returns
+    /// `Some(devices)` on the first call after a background relaunch; returns `None`
+    /// on every subsequent call and on platforms without state restoration.
+    fn take_restored(&self) -> Option<Vec<BleDevice>>;
 }

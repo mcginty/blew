@@ -81,4 +81,11 @@ pub trait PeripheralBackend: private::Sealed + Send + Sync + 'static {
     /// Take ownership of the GATT request stream. Single-consumer by construction:
     /// the first call returns `Some`, subsequent calls return `None`.
     fn take_requests(&self) -> Option<Self::Requests>;
+
+    /// Consume the OS-level state-restoration payload, if any.
+    ///
+    /// Populated by the platform's `willRestoreState:` callback (iOS only). Returns
+    /// `Some(service_uuids)` on the first call after a background relaunch; returns
+    /// `None` on every subsequent call and on platforms without state restoration.
+    fn take_restored(&self) -> Option<Vec<Uuid>>;
 }

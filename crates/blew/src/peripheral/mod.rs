@@ -23,10 +23,10 @@ impl Peripheral {
     ///
     /// When `restore_identifier` is set, this must be called synchronously from
     /// `application:didFinishLaunchingWithOptions:` with the same identifier as the
-    /// previous launch. Before issuing any new `add_service` / `start_advertising` calls,
-    /// drain [`PeripheralStateEvent::Restored`] — the OS re-registers the preserved
-    /// services on the manager for you, and racing `add_service` against that callback
-    /// can produce duplicate-service errors.
+    /// previous launch. Immediately after it returns, call [`Self::take_restored`] to
+    /// recover any preserved service UUIDs — the OS re-registers those services on the
+    /// manager for you, so racing `add_service` against the restored list can produce
+    /// duplicate-service errors.
     ///
     /// See the crate-level [`State restoration`](crate#state-restoration) docs for the
     /// full iOS contract (entitlements, L2CAP re-open requirement, background runtime
@@ -120,6 +120,32 @@ impl<B: PeripheralBackend> Peripheral<B> {
     /// must be consumed by exactly one reader; this method enforces that at the type level.
     pub fn take_requests(&self) -> Option<EventStream<PeripheralRequest, B::Requests>> {
         self.backend.take_requests().map(EventStream::new)
+    }
+
+    /// Consume the OS-level state-restoration payload, if any.
+    ///
+    /// On iOS, when `Peripheral::with_config` was called with a `restore_identifier` and
+    /// the OS is relaunching the app, the `CBPeripheralManager` delegate's
+    /// `willRestoreState:` callback fires during initialisation. `with_config` captures
+    /// that payload and buffers the preserved service UUIDs here; this method hands
+    /// them to the caller exactly once.
+    ///
+    /// Returns:
+    /// - `Some(uuids)` — this launch is an OS-level restoration and `uuids` lists the
+    ///   services the OS re-registered on the manager. The app does **not** need to
+    ///   re-call [`add_service`](Self::add_service) for these. If advertising was active
+    ///   at termination it resumes automatically.
+    /// - `None` — not a restoration launch, or the restored state has already been
+    ///   taken, or the platform is not iOS.
+    ///
+    /// **L2CAP channels are never restored.** If the previous session had one open, the
+    /// peripheral must re-publish via [`l2cap_listener`](Self::l2cap_listener).
+    ///
+    /// See the crate-level [`State restoration`](crate#state-restoration) docs for why
+    /// this is a `take_*` style API (the event fires before subscribers can attach).
+    #[must_use]
+    pub fn take_restored(&self) -> Option<Vec<Uuid>> {
+        self.backend.take_restored()
     }
 
     /// Wait until the adapter is powered on, or return `BlewError::Timeout`.

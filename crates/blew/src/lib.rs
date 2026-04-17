@@ -62,28 +62,28 @@
 //!
 //! ## Runtime contract
 //!
-//! After calling [`Central::with_config`] or [`Peripheral::with_config`] you **must** drain
-//! [`CentralEvent::Restored`](central::CentralEvent::Restored) /
-//! [`PeripheralStateEvent::Restored`](peripheral::PeripheralStateEvent::Restored) *before* issuing any new
-//! work (scanning, connecting, adding services, advertising). The OS fires the restore
-//! callback exactly once, synchronously during initialisation; if new work races ahead the
-//! two states can diverge in ways that look like random disconnects.
+//! The `willRestoreState:` callback fires *during* manager construction, before
+//! [`Central::with_config`] / [`Peripheral::with_config`] returns, so subscribers attached
+//! afterwards would miss it. Instead, the payload is buffered and handed out once via
+//! [`Central::take_restored`] / [`Peripheral::take_restored`]. Call it immediately after
+//! `with_config`, before issuing any new work (scanning, connecting, adding services,
+//! advertising) — otherwise the app's state can diverge from the OS's in ways that look
+//! like random disconnects.
 //!
 //! Typical shape:
 //!
 //! ```no_run
 //! # async fn example() -> blew::error::BlewResult<()> {
-//! use blew::central::{Central, CentralConfig, CentralEvent};
-//! use tokio_stream::StreamExt as _;
+//! use blew::central::{Central, CentralConfig};
 //!
 //! let central: Central = Central::with_config(CentralConfig {
 //!     restore_identifier: Some("com.example.app.central".into()),
 //!     ..Default::default()
 //! }).await?;
 //!
-//! let mut events = central.events();
-//! if let Some(CentralEvent::Restored { devices }) = events.next().await {
-//!     // Re-hydrate app-level state from `devices` before kicking off new scans.
+//! if let Some(devices) = central.take_restored() {
+//!     // Re-hydrate app-level state from the restored peripherals before
+//!     // kicking off any new scans or connects.
 //!     for _dev in devices { /* ... */ }
 //! }
 //! # Ok(()) }

@@ -53,8 +53,6 @@ pub enum CentralEvent {
         char_uuid: Uuid,
         value: Bytes,
     },
-    /// Fired during OS-level state restoration (iOS only) when the system relaunches the app with preserved BLE state.
-    Restored { devices: Vec<BleDevice> },
 }
 
 /// Scan duty cycle / power trade-off.

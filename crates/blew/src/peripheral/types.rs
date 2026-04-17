@@ -26,17 +26,6 @@ pub enum PeripheralStateEvent {
         char_uuid: Uuid,
         subscribed: bool,
     },
-
-    /// Fired during OS-level state restoration (iOS only) when the system relaunches the app
-    /// with preserved BLE peripheral state.
-    ///
-    /// `services` lists the UUIDs of services the OS restored on our behalf — the app does
-    /// **not** need to re-call [`Peripheral::add_service`](crate::peripheral::Peripheral::add_service)
-    /// for those. Advertising, if it was active at termination, resumes automatically.
-    ///
-    /// **L2CAP channels are not restored.** Any previously-open L2CAP session must be
-    /// re-published via [`Peripheral::l2cap_listener`](crate::peripheral::Peripheral::l2cap_listener).
-    Restored { services: Vec<Uuid> },
 }
 
 /// Inbound GATT requests from remote centrals.

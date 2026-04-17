@@ -606,6 +606,10 @@ impl CentralBackend for AndroidCentral {
         let rx = state().event_fanout.lock().subscribe(256);
         ReceiverStream::new(rx)
     }
+
+    fn take_restored(&self) -> Option<Vec<BleDevice>> {
+        None
+    }
 }
 
 fn jni_err(e: jni::errors::Error) -> BlewError {

@@ -104,6 +104,11 @@ struct CentralInner {
     l2cap_pendings: KeyedRequestMap<DeviceId, oneshot::Sender<BlewResult<L2capChannel>>>,
     event_tx: EventFanoutTx<CentralEvent>,
     event_fanout: EventFanout<CentralEvent>,
+    /// Populated once by `willRestoreState:`; drained exactly once via
+    /// [`CentralBackend::take_restored`]. Buffered so callers can observe the
+    /// restored peripheral list after construction returns — broadcast
+    /// delivery would race the callback.
+    restored: Mutex<Option<Vec<BleDevice>>>,
     powered_tx: watch::Sender<bool>,
     /// Tokio runtime handle, captured at construction time so GCD callbacks
     /// (which run off the Tokio thread) can spawn tasks onto the runtime.
@@ -125,6 +130,7 @@ impl CentralInner {
             l2cap_pendings: Default::default(),
             event_tx,
             event_fanout,
+            restored: Mutex::new(None),
             powered_tx,
             runtime: Handle::current(),
         });
@@ -320,7 +326,7 @@ define_class!(
                 count = recovered.len(),
                 "OS-level state restoration recovered peripherals"
             );
-            inner.emit(CentralEvent::Restored { devices: recovered });
+            *inner.restored.lock() = Some(recovered);
         }
     }
 
@@ -881,6 +887,10 @@ impl CentralBackend for AppleCentral {
     fn events(&self) -> Self::EventStream {
         let rx = self.0.inner.event_fanout.subscribe(128);
         ReceiverStream::new(rx)
+    }
+
+    fn take_restored(&self) -> Option<Vec<BleDevice>> {
+        self.0.inner.restored.lock().take()
     }
 }
 

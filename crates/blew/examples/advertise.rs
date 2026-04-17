@@ -68,9 +68,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                          subscribed={subscribed}"
                     );
                 }
-                PeripheralStateEvent::Restored { services } => {
-                    println!("  restored: {} services", services.len());
-                }
             }
         }
     });
