@@ -72,6 +72,28 @@ cargo run --example l2cap_client -p blew  # central: scan, connect, open L2CAP, 
 cargo run --example restore -p blew       # iOS state-restoration launch sequence
 ```
 
+## Testing on real hardware
+
+Unit tests run against an in-memory mock backend and do not exercise a real
+radio. For end-to-end coverage there's a two-process integration harness --
+`integration_peripheral` advertises a known service + L2CAP listener, and
+`integration_central` runs a scripted protocol against it and exits 0 on
+success. Run the two binaries on two separate hosts (CoreBluetooth blocks
+same-process loopback on Apple, and a single Linux adapter cannot scan for its
+own advertisements either):
+
+```sh
+# host A
+cargo run --example integration_peripheral -p blew
+
+# host B
+cargo run --example integration_central -p blew
+```
+
+The protocol covers scan + connect + service discovery, read of a fixed
+status characteristic, a write-then-notify round-trip, and an L2CAP CoC
+echo. On success the central prints `integration-central: PASS` and exits 0.
+
 ## Alternative Libraries
 
 This library was customized primarily to be used for Iroh, and there are plenty

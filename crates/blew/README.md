@@ -41,6 +41,10 @@ cargo run --example l2cap_client -p blew  # central: scan, connect, open L2CAP, 
 cargo run --example restore -p blew       # iOS state-restoration launch sequence
 ```
 
+The `integration_peripheral` / `integration_central` pair is a scripted
+real-hardware smoke test -- run them on two separate hosts to verify the
+backend end-to-end. See the top-level README for details.
+
 ## Alternative Libraries
 
 This library was customized primarily to be used for Iroh, and there are plenty
