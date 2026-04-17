@@ -1783,4 +1783,119 @@ mod tests {
         assert_eq!(taken, vec![svc]);
         assert!(peripheral.take_restored().is_none());
     }
+
+    #[tokio::test]
+    async fn contract_gatt_ops_after_disconnect_error() {
+        let (c, p) = MockLink::pair();
+        let central = Central::from_backend(c.central);
+        let peripheral = Peripheral::from_backend(p.peripheral);
+
+        let char_uuid = Uuid::from_u128(0xAAAA);
+        peripheral
+            .add_service(&GattService {
+                uuid: Uuid::from_u128(0x1234),
+                primary: true,
+                characteristics: vec![GattCharacteristic {
+                    uuid: char_uuid,
+                    properties: CharacteristicProperties::READ
+                        | CharacteristicProperties::WRITE
+                        | CharacteristicProperties::NOTIFY,
+                    permissions: AttributePermissions::READ | AttributePermissions::WRITE,
+                    value: vec![1, 2, 3],
+                    descriptors: vec![],
+                }],
+            })
+            .await
+            .unwrap();
+
+        let device_id = DeviceId::from("mock-peripheral");
+        central.connect(&device_id).await.unwrap();
+        central.disconnect(&device_id).await.unwrap();
+
+        for err in [
+            central.read_characteristic(&device_id, char_uuid).await,
+            central
+                .write_characteristic(
+                    &device_id,
+                    char_uuid,
+                    b"x".to_vec(),
+                    WriteType::WithResponse,
+                )
+                .await
+                .map(|()| Vec::new()),
+            central
+                .subscribe_characteristic(&device_id, char_uuid)
+                .await
+                .map(|()| Vec::new()),
+        ] {
+            match err {
+                Err(BlewError::NotConnected(id)) => assert_eq!(id, device_id),
+                other => panic!("expected NotConnected, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_adapter_off_mid_session_reaches_subscribers() {
+        let (c, _p) = MockLink::pair();
+        let central_backend = c.central.clone();
+        let central = Central::from_backend(c.central);
+
+        let mut events = central.events();
+        assert!(matches!(
+            events.next().await.unwrap(),
+            CentralEvent::AdapterStateChanged { powered: true }
+        ));
+        assert!(central.is_powered().await.unwrap());
+
+        central_backend.mock_emit_adapter_state(false);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(100), events.next())
+            .await
+            .expect("should receive AdapterStateChanged(false)")
+            .expect("stream should not end");
+        assert!(matches!(
+            ev,
+            CentralEvent::AdapterStateChanged { powered: false }
+        ));
+        assert!(!central.is_powered().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn contract_reconnect_after_disconnect_restores_ops() {
+        let (c, p) = MockLink::pair();
+        let central = Central::from_backend(c.central);
+        let peripheral = Peripheral::from_backend(p.peripheral);
+
+        let char_uuid = Uuid::from_u128(0xCAFE);
+        peripheral
+            .add_service(&GattService {
+                uuid: Uuid::from_u128(0x1234),
+                primary: true,
+                characteristics: vec![GattCharacteristic {
+                    uuid: char_uuid,
+                    properties: CharacteristicProperties::READ,
+                    permissions: AttributePermissions::READ,
+                    value: b"hello".to_vec(),
+                    descriptors: vec![],
+                }],
+            })
+            .await
+            .unwrap();
+
+        let device_id = DeviceId::from("mock-peripheral");
+        central.connect(&device_id).await.unwrap();
+        central.disconnect(&device_id).await.unwrap();
+        assert!(matches!(
+            central.read_characteristic(&device_id, char_uuid).await,
+            Err(BlewError::NotConnected(_))
+        ));
+
+        central.connect(&device_id).await.unwrap();
+        let value = central
+            .read_characteristic(&device_id, char_uuid)
+            .await
+            .unwrap();
+        assert_eq!(value, b"hello");
+    }
 }
