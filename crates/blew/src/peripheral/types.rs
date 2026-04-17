@@ -223,4 +223,98 @@ mod tests {
         let result = rx.await.unwrap();
         assert!(result);
     }
+
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+
+    #[derive(Debug, Clone)]
+    enum ReadAction {
+        Drop,
+        Respond(Vec<u8>),
+        Error,
+    }
+
+    fn read_action() -> impl Strategy<Value = ReadAction> {
+        prop_oneof![
+            Just(ReadAction::Drop),
+            vec(any::<u8>(), 0..32).prop_map(ReadAction::Respond),
+            Just(ReadAction::Error),
+        ]
+    }
+
+    #[derive(Debug, Clone)]
+    enum WriteAction {
+        Drop,
+        Success,
+        Error,
+    }
+
+    fn write_action() -> impl Strategy<Value = WriteAction> {
+        prop_oneof![
+            Just(WriteAction::Drop),
+            Just(WriteAction::Success),
+            Just(WriteAction::Error),
+        ]
+    }
+
+    proptest! {
+        /// For any `ReadResponder` action (respond / error / drop), the receiver
+        /// observes exactly one value with the correct polarity. Drop is
+        /// equivalent to `error()`.
+        #[test]
+        fn read_responder_value_matches_action(actions in vec(read_action(), 0..64)) {
+            for action in actions {
+                let (tx, mut rx) = oneshot::channel::<Result<Vec<u8>, ()>>();
+                let responder = ReadResponder::new(tx);
+                let expected: Result<Vec<u8>, ()> = match action {
+                    ReadAction::Drop => {
+                        drop(responder);
+                        Err(())
+                    }
+                    ReadAction::Respond(v) => {
+                        let expected = Ok(v.clone());
+                        responder.respond(v);
+                        expected
+                    }
+                    ReadAction::Error => {
+                        responder.error();
+                        Err(())
+                    }
+                };
+                let got = rx
+                    .try_recv()
+                    .expect("responder must deliver a value synchronously");
+                prop_assert_eq!(got, expected);
+            }
+        }
+
+        /// For any `WriteResponder` action (success / error / drop), the receiver
+        /// observes exactly one `bool` with the correct polarity. Drop is
+        /// equivalent to `error()` (both deliver `false`).
+        #[test]
+        fn write_responder_value_matches_action(actions in vec(write_action(), 0..64)) {
+            for action in actions {
+                let (tx, mut rx) = oneshot::channel::<bool>();
+                let responder = WriteResponder::new(tx);
+                let expected = match action {
+                    WriteAction::Drop => {
+                        drop(responder);
+                        false
+                    }
+                    WriteAction::Success => {
+                        responder.success();
+                        true
+                    }
+                    WriteAction::Error => {
+                        responder.error();
+                        false
+                    }
+                };
+                let got = rx
+                    .try_recv()
+                    .expect("responder must deliver a value synchronously");
+                prop_assert_eq!(got, expected);
+            }
+        }
+    }
 }
