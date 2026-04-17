@@ -35,7 +35,7 @@ const STATUS_CHAR_UUID: Uuid = Uuid::from_u128(0x626c_6577_0000_0000_0000_0000_0
 const ECHO_CHAR_UUID: Uuid = Uuid::from_u128(0x626c_6577_0000_0000_0000_0000_0000_0003);
 const PSM_CHAR_UUID: Uuid = Uuid::from_u128(0x626c_6577_0000_0000_0000_0000_0000_0004);
 const STATUS_VALUE: &[u8] = b"BLEW-OK";
-const SPEEDTEST_BYTES: usize = 1024 * 1024;
+const BIDIRECTIONAL_SPEEDTEST_BYTES: usize = 500 * 1024;
 const SPEEDTEST_CHUNK_SIZE: usize = 4096;
 const UPLOAD_PROGRESS_INTERVAL: usize = 64 * 1024;
 const CMD_ECHO: u8 = 0x01;
@@ -87,7 +87,9 @@ async fn drain_exact_pattern_with_progress(
     let mut last_reported = 0_usize;
     let mut buf = vec![0_u8; SPEEDTEST_CHUNK_SIZE];
     while remaining > 0 {
-        let n = ch.read(&mut buf[..remaining.min(SPEEDTEST_CHUNK_SIZE)]).await?;
+        let n = ch
+            .read(&mut buf[..remaining.min(SPEEDTEST_CHUNK_SIZE)])
+            .await?;
         if n == 0 {
             return Err("L2CAP speedtest hit EOF early".into());
         }
@@ -124,7 +126,7 @@ async fn serve_l2cap_protocol(mut ch: blew::L2capChannel) -> Result<(), DynError
                 send_pattern(&mut ch, len, PERIPHERAL_PATTERN).await?;
             }
             CMD_BIDIRECTIONAL => {
-                if len != SPEEDTEST_BYTES {
+                if len != BIDIRECTIONAL_SPEEDTEST_BYTES {
                     return Err(format!("unexpected bidirectional size: {len}").into());
                 }
                 let (mut reader, mut writer) = tokio::io::split(ch);

@@ -25,7 +25,6 @@
 use blew::Central;
 use blew::central::{CentralEvent, ScanFilter, WriteType};
 use blew::l2cap::Psm;
-use indicatif::{ProgressBar, ProgressStyle};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -46,8 +45,10 @@ const BIDIRECTIONAL_SPEEDTEST_TIMEOUT: Duration = Duration::from_secs(180);
 const ECHO_PAYLOAD: &[u8] = b"the quick brown fox jumps over a lazy dog";
 const L2CAP_PAYLOAD_LEN: usize = 1024;
 const SPEEDTEST_BYTES: usize = 1024 * 1024;
+const BIDIRECTIONAL_SPEEDTEST_BYTES: usize = 500 * 1024;
 const SPEEDTEST_CHUNK_SIZE: usize = 4096;
 const PROGRESS_YIELD_INTERVAL: usize = 64 * 1024;
+const PROGRESS_PRINT_INTERVAL: Duration = Duration::from_millis(250);
 const CMD_ECHO: u8 = 0x01;
 const CMD_UPLOAD: u8 = 0x02;
 const CMD_DOWNLOAD: u8 = 0x03;
@@ -82,36 +83,50 @@ fn print_speed(label: &str, bytes: usize, elapsed: Duration) {
     );
 }
 
-fn live_speed_label(label: &str, bytes: usize, start: Instant) -> String {
-    let elapsed = start.elapsed().as_secs_f64().max(0.001);
-    let bytes = u32::try_from(bytes).expect("speedtest byte count fits in u32");
-    let mib_per_s = f64::from(bytes) / (1024.0 * 1024.0) / elapsed;
-    format!("{label} ({mib_per_s:.2} MiB/s)")
+struct ProgressPrinter {
+    label: &'static str,
+    total: usize,
+    start: Instant,
+    last_print: Option<Instant>,
 }
 
-fn spinner(message: &str) -> ProgressBar {
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::with_template("{spinner:.cyan} {msg}")
-            .expect("valid spinner template")
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-    );
-    pb.set_message(message.to_string());
-    pb.enable_steady_tick(Duration::from_millis(100));
-    pb
-}
+impl ProgressPrinter {
+    fn new(label: &'static str, total: usize) -> Self {
+        println!("{label}: starting ({} KiB total)", total / 1024);
+        Self {
+            label,
+            total,
+            start: Instant::now(),
+            last_print: None,
+        }
+    }
 
-fn bytes_bar(message: &str, total: usize) -> ProgressBar {
-    let pb = ProgressBar::new(u64::try_from(total).expect("progress total fits in u64"));
-    pb.set_style(
-        ProgressStyle::with_template(
-            "{msg:<48} [{bar:30.cyan/blue}] {bytes:>8}/{total_bytes:8} ETA {eta:>4}",
-        )
-        .expect("valid bytes template")
-        .progress_chars("=> "),
-    );
-    pb.set_message(message.to_string());
-    pb
+    fn update(&mut self, bytes: usize) {
+        let now = Instant::now();
+        if bytes < self.total
+            && self
+                .last_print
+                .is_some_and(|last| now.duration_since(last) < PROGRESS_PRINT_INTERVAL)
+        {
+            return;
+        }
+
+        let elapsed = self.start.elapsed().max(Duration::from_millis(1));
+        let bytes_u32 = u32::try_from(bytes).expect("speedtest byte count fits in u32");
+        let mib_per_s = f64::from(bytes_u32) / (1024.0 * 1024.0) / elapsed.as_secs_f64();
+        println!(
+            "{}: {:>4}/{:>4} KiB, {:.2} MiB/s",
+            self.label,
+            bytes / 1024,
+            self.total / 1024,
+            mib_per_s,
+        );
+        self.last_print = Some(now);
+    }
+
+    fn finish(&mut self) {
+        self.update(self.total);
+    }
 }
 
 async fn run_echo(
@@ -130,10 +145,9 @@ async fn run_echo(
 
 async fn run_upload_speedtest(
     ch: &mut blew::L2capChannel,
-    progress: &ProgressBar,
+    progress: &mut ProgressPrinter,
 ) -> Result<Duration, Box<dyn std::error::Error>> {
     write_command_header(ch, CMD_UPLOAD, SPEEDTEST_BYTES).await?;
-    let start = Instant::now();
     let label = "speedtest central->peripheral";
     let (mut reader, mut writer) = tokio::io::split(ch);
 
@@ -167,27 +181,23 @@ async fn run_upload_speedtest(
                     "invalid upload progress report",
                 ));
             }
-            progress.set_position(u64::try_from(received).expect("progress fits in u64"));
-            progress.set_message(live_speed_label(label, received, start));
+            progress.update(received);
             last_reported = received;
         }
         Ok::<(), std::io::Error>(())
     };
 
     tokio::try_join!(sender, receiver)?;
-    if progress.position() < u64::try_from(SPEEDTEST_BYTES).expect("speedtest bytes fit in u64") {
-        progress.set_position(u64::try_from(SPEEDTEST_BYTES).expect("speedtest bytes fit in u64"));
-    }
-    Ok(start.elapsed())
+    progress.finish();
+    let _ = label;
+    Ok(progress.start.elapsed())
 }
 
 async fn run_download_speedtest(
     ch: &mut blew::L2capChannel,
-    progress: &ProgressBar,
+    progress: &mut ProgressPrinter,
 ) -> Result<Duration, Box<dyn std::error::Error>> {
     write_command_header(ch, CMD_DOWNLOAD, SPEEDTEST_BYTES).await?;
-    let start = Instant::now();
-    let label = "speedtest peripheral->central";
     let mut remaining = SPEEDTEST_BYTES;
     let mut buf = vec![0_u8; SPEEDTEST_CHUNK_SIZE];
     while remaining > 0 {
@@ -200,38 +210,34 @@ async fn run_download_speedtest(
         if buf[..n].iter().any(|&b| b != PERIPHERAL_PATTERN) {
             return Err("download speedtest received unexpected payload bytes".into());
         }
-        progress.inc(u64::try_from(n).expect("chunk size fits in u64"));
         remaining -= n;
         let received = SPEEDTEST_BYTES - remaining;
-        progress.set_message(live_speed_label(label, received, start));
+        progress.update(received);
     }
-    Ok(start.elapsed())
+    progress.finish();
+    Ok(progress.start.elapsed())
 }
 
 async fn run_bidirectional_speedtest(
     ch: blew::L2capChannel,
-    progress: ProgressBar,
+    progress: Arc<tokio::sync::Mutex<ProgressPrinter>>,
 ) -> Result<Duration, Box<dyn std::error::Error>> {
     let (mut reader, mut writer) = tokio::io::split(ch);
-    let start = Instant::now();
-    let label = "speedtest concurrent";
-    let progress = Arc::new(progress);
+    let finish_progress = Arc::clone(&progress);
     let sender_progress = Arc::clone(&progress);
-    let sender_label = label;
 
     let sender = async move {
         let chunk = [CENTRAL_PATTERN; SPEEDTEST_CHUNK_SIZE];
-        let mut remaining = SPEEDTEST_BYTES;
+        let mut remaining = BIDIRECTIONAL_SPEEDTEST_BYTES;
+        let mut sent = 0_usize;
         let mut bytes_since_yield = 0_usize;
         while remaining > 0 {
             let n = remaining.min(SPEEDTEST_CHUNK_SIZE);
             writer.write_all(&chunk[..n]).await?;
-            sender_progress.inc(u64::try_from(n).expect("chunk size fits in u64"));
             remaining -= n;
+            sent += n;
             bytes_since_yield += n;
-            let transferred = usize::try_from(sender_progress.position())
-                .expect("progress position fits in usize");
-            sender_progress.set_message(live_speed_label(sender_label, transferred, start));
+            sender_progress.lock().await.update(sent);
             if bytes_since_yield >= PROGRESS_YIELD_INTERVAL {
                 bytes_since_yield = 0;
                 tokio::task::yield_now().await;
@@ -242,9 +248,9 @@ async fn run_bidirectional_speedtest(
     };
 
     let progress = Arc::clone(&progress);
-    let receiver_label = label;
     let receiver = async move {
-        let mut remaining = SPEEDTEST_BYTES;
+        let mut remaining = BIDIRECTIONAL_SPEEDTEST_BYTES;
+        let mut received_total = 0_usize;
         let mut buf = vec![0_u8; SPEEDTEST_CHUNK_SIZE];
         while remaining > 0 {
             let n = reader
@@ -262,17 +268,20 @@ async fn run_bidirectional_speedtest(
                     "bidirectional speedtest received unexpected payload bytes",
                 ));
             }
-            progress.inc(u64::try_from(n).expect("chunk size fits in u64"));
             remaining -= n;
-            let transferred =
-                usize::try_from(progress.position()).expect("progress position fits in usize");
-            progress.set_message(live_speed_label(receiver_label, transferred, start));
+            received_total += n;
+            progress
+                .lock()
+                .await
+                .update(BIDIRECTIONAL_SPEEDTEST_BYTES + received_total);
         }
         Ok::<_, std::io::Error>(())
     };
 
     tokio::try_join!(sender, receiver)?;
-    Ok(start.elapsed())
+    let mut progress = finish_progress.lock().await;
+    progress.finish();
+    Ok(progress.start.elapsed())
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -298,7 +307,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let central: Central = Central::new().await?;
     let mut events = central.events();
 
-    let scan_pb = spinner("scan: waiting for integration peripheral");
+    println!("scan: waiting for integration peripheral");
     central
         .start_scan(ScanFilter {
             services: vec![SVC_UUID],
@@ -321,15 +330,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .map_err(|_| "scan timeout")??;
 
     central.stop_scan().await?;
-    scan_pb.finish_with_message(format!("scan: found {device_id}"));
+    println!("scan: found {device_id}");
 
-    let connect_pb = spinner("connect: opening BLE link");
+    println!("connect: opening BLE link");
     timeout(OP_TIMEOUT, central.connect(&device_id))
         .await
         .map_err(|_| "connect timeout")??;
-    connect_pb.finish_with_message("connect: ok");
+    println!("connect: ok");
 
-    let discover_pb = spinner("discover: loading GATT services");
+    println!("discover: loading GATT services");
     let services = timeout(OP_TIMEOUT, central.discover_services(&device_id))
         .await
         .map_err(|_| "discover_services timeout")??;
@@ -342,12 +351,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("peer missing characteristic {want}").into());
         }
     }
-    discover_pb.finish_with_message(format!(
+    println!(
         "discover: ok ({} characteristics)",
         svc.characteristics.len()
-    ));
+    );
 
-    let status_pb = spinner("read status: reading STATUS_CHAR");
+    println!("read status: reading STATUS_CHAR");
     let status = timeout(
         OP_TIMEOUT,
         central.read_characteristic(&device_id, STATUS_CHAR_UUID),
@@ -357,9 +366,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if status != STATUS_VALUE {
         return Err(format!("STATUS mismatch: got {status:?}, want {STATUS_VALUE:?}").into());
     }
-    status_pb.finish_with_message("read status: ok");
+    println!("read status: ok");
 
-    let gatt_pb = spinner("gatt echo: write + notify round-trip");
+    println!("gatt echo: write + notify round-trip");
     timeout(
         OP_TIMEOUT,
         central.subscribe_characteristic(&device_id, ECHO_CHAR_UUID),
@@ -402,9 +411,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    gatt_pb.finish_with_message(format!("gatt echo: ok ({} bytes round-trip)", echo.len()));
+    println!("gatt echo: ok ({} bytes round-trip)", echo.len());
 
-    let psm_pb = spinner("l2cap: reading PSM and opening channel");
+    println!("l2cap: reading PSM and opening channel");
     let psm_data = timeout(
         OP_TIMEOUT,
         central.read_characteristic(&device_id, PSM_CHAR_UUID),
@@ -420,56 +429,59 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut ch = timeout(OP_TIMEOUT, central.open_l2cap_channel(&device_id, psm))
         .await
         .map_err(|_| "open L2CAP timeout")??;
-    psm_pb.finish_with_message("l2cap: channel open");
+    println!("l2cap: channel open");
 
-    let echo_pb = spinner("l2cap echo: 1 KiB round-trip");
+    println!("l2cap echo: 1 KiB round-trip");
     let payload: Vec<u8> = (0..L2CAP_PAYLOAD_LEN)
         .map(|i| u8::try_from(i & 0xff).expect("masked payload byte fits in u8"))
         .collect();
     timeout(OP_TIMEOUT, run_echo(&mut ch, &payload))
         .await
         .map_err(|_| "L2CAP echo timeout")??;
-    echo_pb.finish_with_message(format!(
-        "l2cap echo: ok ({L2CAP_PAYLOAD_LEN} bytes round-trip)"
-    ));
+    println!("l2cap echo: ok ({L2CAP_PAYLOAD_LEN} bytes round-trip)");
 
-    let upload_pb = bytes_bar("speedtest central->peripheral", SPEEDTEST_BYTES);
-    let upload_elapsed = timeout(SPEEDTEST_TIMEOUT, run_upload_speedtest(&mut ch, &upload_pb))
-        .await
-        .map_err(|_| "central->peripheral speedtest timeout")??;
-    upload_pb.finish_and_clear();
+    let mut upload_progress =
+        ProgressPrinter::new("speedtest central->peripheral", SPEEDTEST_BYTES);
+    let upload_elapsed = timeout(
+        SPEEDTEST_TIMEOUT,
+        run_upload_speedtest(&mut ch, &mut upload_progress),
+    )
+    .await
+    .map_err(|_| "central->peripheral speedtest timeout")??;
     print_speed(
         "speedtest central->peripheral",
         SPEEDTEST_BYTES,
         upload_elapsed,
     );
 
-    let download_pb = bytes_bar("speedtest peripheral->central", SPEEDTEST_BYTES);
+    let mut download_progress =
+        ProgressPrinter::new("speedtest peripheral->central", SPEEDTEST_BYTES);
     let download_elapsed = timeout(
         SPEEDTEST_TIMEOUT,
-        run_download_speedtest(&mut ch, &download_pb),
+        run_download_speedtest(&mut ch, &mut download_progress),
     )
     .await
     .map_err(|_| "peripheral->central speedtest timeout")??;
-    download_pb.finish_and_clear();
     print_speed(
         "speedtest peripheral->central",
         SPEEDTEST_BYTES,
         download_elapsed,
     );
 
-    write_command_header(&mut ch, CMD_BIDIRECTIONAL, SPEEDTEST_BYTES).await?;
-    let concurrent_pb = bytes_bar("speedtest concurrent", SPEEDTEST_BYTES * 2);
+    write_command_header(&mut ch, CMD_BIDIRECTIONAL, BIDIRECTIONAL_SPEEDTEST_BYTES).await?;
+    let concurrent_progress = Arc::new(tokio::sync::Mutex::new(ProgressPrinter::new(
+        "speedtest concurrent",
+        BIDIRECTIONAL_SPEEDTEST_BYTES * 2,
+    )));
     let bidirectional_elapsed = timeout(
         BIDIRECTIONAL_SPEEDTEST_TIMEOUT,
-        run_bidirectional_speedtest(ch, concurrent_pb.clone()),
+        run_bidirectional_speedtest(ch, Arc::clone(&concurrent_progress)),
     )
     .await
     .map_err(|_| "bidirectional speedtest timeout")??;
-    concurrent_pb.finish_and_clear();
     print_speed(
         "speedtest concurrent",
-        SPEEDTEST_BYTES * 2,
+        BIDIRECTIONAL_SPEEDTEST_BYTES * 2,
         bidirectional_elapsed,
     );
 

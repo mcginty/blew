@@ -39,7 +39,6 @@ parking_lot = "0.12"
 [dev-dependencies]
 proptest = { version = "1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-indicatif = "0.17"
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 objc2 = "0.6"
