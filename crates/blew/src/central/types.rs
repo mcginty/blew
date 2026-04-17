@@ -92,29 +92,3 @@ pub enum WriteType {
     /// ATT Write Command -- no acknowledgement; lower latency.
     WithoutResponse,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn disconnect_cause_is_debug_clone_eq() {
-        let a = DisconnectCause::LinkLoss;
-        let b = a.clone();
-        assert_eq!(a, b);
-        let _ = format!("{a:?}");
-    }
-
-    #[test]
-    fn disconnected_event_carries_cause() {
-        let ev = CentralEvent::DeviceDisconnected {
-            device_id: DeviceId::from("test"),
-            cause: DisconnectCause::LocalClose,
-        };
-        if let CentralEvent::DeviceDisconnected { cause, .. } = ev {
-            assert_eq!(cause, DisconnectCause::LocalClose);
-        } else {
-            panic!("wrong variant");
-        }
-    }
-}

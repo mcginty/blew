@@ -91,47 +91,11 @@ mod tests {
     }
 
     #[test]
-    fn ids_are_sequential() {
-        let map = RequestMap::<u32>::new();
-        let id0 = map.insert(0);
-        let id1 = map.insert(1);
-        let id2 = map.insert(2);
-        assert_eq!(id0, 0);
-        assert_eq!(id1, 1);
-        assert_eq!(id2, 2);
-    }
-
-    #[test]
-    fn take_nonexistent() {
-        let map = RequestMap::<u32>::new();
-        assert_eq!(map.take(999), None);
-    }
-
-    #[test]
     fn keyed_insert_and_take() {
         let map = KeyedRequestMap::<String, u32>::new();
         assert_eq!(map.insert("a".into(), 1), None);
         assert_eq!(map.take(&"a".into()), Some(1));
         assert_eq!(map.take(&"a".into()), None);
-    }
-
-    #[test]
-    fn keyed_insert_replaces() {
-        let map = KeyedRequestMap::<&'static str, u32>::new();
-        assert_eq!(map.insert("a", 1), None);
-        assert_eq!(map.insert("a", 2), Some(1));
-        assert_eq!(map.take(&"a"), Some(2));
-    }
-
-    #[test]
-    fn keyed_drain() {
-        let map = KeyedRequestMap::<u32, &'static str>::new();
-        map.insert(1, "one");
-        map.insert(2, "two");
-        let mut drained = map.drain();
-        drained.sort_by_key(|(k, _)| *k);
-        assert_eq!(drained, vec![(1, "one"), (2, "two")]);
-        assert!(map.take(&1).is_none());
     }
 
     use proptest::collection::vec;

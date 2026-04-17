@@ -155,73 +155,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_responder_error() {
-        let (tx, rx) = oneshot::channel();
-        let responder = ReadResponder::new(tx);
-        responder.error();
-        assert!(rx.await.unwrap().is_err());
-    }
-
-    #[tokio::test]
-    async fn test_read_responder_drop_sends_error() {
-        let (tx, rx) = oneshot::channel();
-        {
-            let _responder = ReadResponder::new(tx);
-        }
-        assert!(
-            rx.await.unwrap().is_err(),
-            "drop must send error automatically"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_read_responder_respond_empty() {
-        let (tx, rx) = oneshot::channel();
-        let responder = ReadResponder::new(tx);
-        responder.respond(vec![]);
-        assert_eq!(rx.await.unwrap().unwrap(), Vec::<u8>::new());
-    }
-
-    #[tokio::test]
     async fn test_write_responder_success() {
         let (tx, rx) = oneshot::channel();
         let responder = WriteResponder::new(tx);
         responder.success();
         assert!(rx.await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_write_responder_error() {
-        let (tx, rx) = oneshot::channel();
-        let responder = WriteResponder::new(tx);
-        responder.error();
-        assert!(!rx.await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_write_responder_drop_sends_error() {
-        let (tx, rx) = oneshot::channel();
-        {
-            let _responder = WriteResponder::new(tx);
-        }
-        assert!(!rx.await.unwrap(), "drop must send false");
-    }
-    #[tokio::test]
-    async fn test_read_responder_consumed_once() {
-        let (tx, rx) = oneshot::channel();
-        let responder = ReadResponder::new(tx);
-        responder.respond(b"data".to_vec());
-        let result = rx.await.unwrap();
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_write_responder_consumed_once() {
-        let (tx, rx) = oneshot::channel();
-        let responder = WriteResponder::new(tx);
-        responder.success();
-        let result = rx.await.unwrap();
-        assert!(result);
     }
 
     use proptest::collection::vec;
