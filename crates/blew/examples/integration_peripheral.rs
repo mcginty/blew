@@ -16,12 +16,17 @@
 //! ```sh
 //! cargo run --example integration_peripheral -p blew
 //! ```
+//!
+//! Add `--keep-alive` to keep advertising after the first successful
+//! integration run instead of exiting.
 
 use blew::Peripheral;
 use blew::gatt::props::{AttributePermissions, CharacteristicProperties};
 use blew::gatt::service::{GattCharacteristic, GattService};
 use blew::peripheral::{AdvertisingConfig, PeripheralRequest};
+use std::env;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 use tokio_stream::StreamExt as _;
 use uuid::Uuid;
 
@@ -37,6 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    let keep_alive = env::args().skip(1).any(|arg| arg == "--keep-alive");
     let peripheral: Peripheral = Peripheral::new().await?;
     peripheral
         .add_service(&GattService {
@@ -70,6 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut requests = peripheral.take_requests().expect("requests already taken");
     let (psm, mut l2cap_channels) = peripheral.l2cap_listener().await?;
+    let (l2cap_done_tx, mut l2cap_done_rx) = mpsc::unbounded_channel();
     let psm_bytes = psm.value().to_le_bytes().to_vec();
     println!("L2CAP PSM = {}", psm.value());
 
@@ -79,7 +86,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             service_uuids: vec![SVC_UUID],
         })
         .await?;
-    println!("Advertising as \"blew-integration\" ... (Ctrl-C to stop)");
+    if keep_alive {
+        println!("Advertising as \"blew-integration\" ... (Ctrl-C to stop)");
+    } else {
+        println!("Advertising as \"blew-integration\" for one integration run ...");
+    }
 
     loop {
         tokio::select! {
@@ -117,6 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match result {
                     Ok((device_id, mut ch)) => {
                         println!("  L2CAP accept from {device_id}");
+                        let l2cap_done_tx = l2cap_done_tx.clone();
                         tokio::spawn(async move {
                             let mut buf = vec![0u8; 4096];
                             loop {
@@ -127,10 +139,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                             }
+                            let _ = l2cap_done_tx.send(());
                         });
                     }
                     Err(e) => eprintln!("  L2CAP accept error: {e}"),
                 }
+            }
+            done = l2cap_done_rx.recv(), if !keep_alive => {
+                if done.is_some() {
+                    println!("Integration run complete, shutting down peripheral.");
+                }
+                break;
             }
         }
     }
