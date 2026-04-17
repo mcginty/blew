@@ -171,6 +171,10 @@ impl L2capChannel {
         }
     }
 
+    #[cfg_attr(
+        not(any(target_os = "android", target_vendor = "apple", test)),
+        allow(dead_code)
+    )]
     pub(crate) fn from_duplex_with_close_hook(
         inner: DuplexStream,
         close_hook: impl FnOnce() + Send + 'static,

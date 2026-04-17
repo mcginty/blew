@@ -20,6 +20,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 struct CentralInner {
     _session: Session,
     adapter: Adapter,
@@ -65,7 +67,8 @@ impl CentralInner {
     }
 
     fn update_mtu(&self, device_id: &DeviceId, mtu: usize) {
-        let mtu = mtu.clamp(23, usize::from(u16::MAX)) as u16;
+        let mtu = u16::try_from(mtu.clamp(23, usize::from(u16::MAX)))
+            .expect("clamped MTU fits in u16");
         self.mtu_cache.lock().insert(device_id.clone(), mtu);
     }
 
@@ -342,7 +345,6 @@ impl CentralBackend for LinuxCentral {
                 .map_err(|e| BlewError::Central {
                     source: Box::new(e),
                 })?;
-            const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
             match tokio::time::timeout(CONNECT_TIMEOUT, device.connect()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
