@@ -67,8 +67,8 @@ impl CentralInner {
     }
 
     fn update_mtu(&self, device_id: &DeviceId, mtu: usize) {
-        let mtu = u16::try_from(mtu.clamp(23, usize::from(u16::MAX)))
-            .expect("clamped MTU fits in u16");
+        let mtu =
+            u16::try_from(mtu.clamp(23, usize::from(u16::MAX))).expect("clamped MTU fits in u16");
         self.mtu_cache.lock().insert(device_id.clone(), mtu);
     }
 
