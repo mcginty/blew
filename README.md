@@ -43,11 +43,21 @@ necessary Kotlin/JNI glue to enable Android functionality.
   `Peripheral::new` return `BlewError::PermissionDenied` if not.
 - **iOS state restoration:** opt in via `Central::with_config` / `Peripheral::with_config`
   with a stable `restore_identifier`. This *must* run synchronously from
-  `application:didFinishLaunchingWithOptions:`, the app must declare the matching
-  `UIBackgroundModes`, and the `Restored` event must be drained before issuing new scans,
-  connects, or `add_service` calls. L2CAP channels are never restored. See the crate-level
-  `State restoration` rustdoc for the full contract — misusing it causes silent connection
-  drops.
+  `application:didFinishLaunchingWithOptions:`, and `take_restored()` must be called
+  immediately afterwards — before any new scans, connects, or `add_service` calls — to
+  drain the payload the OS delivered during construction. L2CAP channels are never
+  restored. The app's `Info.plist` must also declare the matching `UIBackgroundModes`:
+
+  ```xml
+  <key>UIBackgroundModes</key>
+  <array>
+      <string>bluetooth-central</string>
+      <string>bluetooth-peripheral</string>
+  </array>
+  ```
+
+  Include only the modes you actually use. See the crate-level `State restoration` rustdoc
+  for the full contract — misusing it causes silent connection drops.
 - **Testing:** the `testing` feature exposes in-memory mock backends that enforce the
   connection/service/MTU invariants the real backends do. Real hardware behavior is not
   covered by CI; plan to smoke-test on device before shipping.
@@ -59,6 +69,7 @@ cargo run --example scan -p blew          # scan for 10s, print discoveries
 cargo run --example advertise -p blew     # advertise a GATT service, handle reads/writes
 cargo run --example l2cap_server -p blew  # peripheral: publish L2CAP CoC, echo data
 cargo run --example l2cap_client -p blew  # central: scan, connect, open L2CAP, send data
+cargo run --example restore -p blew       # iOS state-restoration launch sequence
 ```
 
 ## Alternative Libraries

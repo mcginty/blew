@@ -38,6 +38,7 @@ cargo run --example scan -p blew          # scan for 10s, print discoveries
 cargo run --example advertise -p blew     # advertise a GATT service, handle reads/writes
 cargo run --example l2cap_server -p blew  # peripheral: publish L2CAP CoC, echo data
 cargo run --example l2cap_client -p blew  # central: scan, connect, open L2CAP, send data
+cargo run --example restore -p blew       # iOS state-restoration launch sequence
 ```
 
 ## Alternative Libraries
