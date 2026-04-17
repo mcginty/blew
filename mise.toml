@@ -31,7 +31,11 @@ run = "cargo clippy --workspace --fix"
 
 [tasks.test]
 description = "Run all tests"
-run = "cargo nextest run --workspace"
+run = "cargo nextest run --workspace --features testing"
+
+[tasks."test:all"]
+description = "Run all tests"
+run = "cargo nextest run --workspace --features testing --run-ignored all"
 
 [tasks.fmt]
 description = "Format all Rust and Kotlin code"
