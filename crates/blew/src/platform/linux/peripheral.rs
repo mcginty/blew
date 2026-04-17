@@ -4,7 +4,8 @@ use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, types::Psm};
 use crate::peripheral::backend::{self, PeripheralBackend};
 use crate::peripheral::types::{
-    AdvertisingConfig, PeripheralRequest, PeripheralStateEvent, ReadResponder, WriteResponder,
+    AdvertisingConfig, PeripheralConfig, PeripheralRequest, PeripheralStateEvent, ReadResponder,
+    WriteResponder,
 };
 use crate::platform::linux::l2cap::bridge_l2cap;
 use crate::types::DeviceId;
@@ -45,6 +46,12 @@ struct PeripheralInner {
 }
 
 pub struct LinuxPeripheral(Arc<PeripheralInner>);
+
+impl LinuxPeripheral {
+    pub async fn with_config(_config: PeripheralConfig) -> BlewResult<Self> {
+        <Self as PeripheralBackend>::new().await
+    }
+}
 
 impl backend::private::Sealed for LinuxPeripheral {}
 

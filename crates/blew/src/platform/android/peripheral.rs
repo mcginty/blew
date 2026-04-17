@@ -14,7 +14,9 @@ use crate::gatt::props::CharacteristicProperties;
 use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, types::Psm};
 use crate::peripheral::backend::{self, PeripheralBackend};
-use crate::peripheral::types::{AdvertisingConfig, PeripheralRequest, PeripheralStateEvent};
+use crate::peripheral::types::{
+    AdvertisingConfig, PeripheralConfig, PeripheralRequest, PeripheralStateEvent,
+};
 use crate::types::DeviceId;
 use crate::util::BroadcastEventStream;
 
@@ -45,6 +47,12 @@ pub(crate) fn send_state_event(event: PeripheralStateEvent) {
 }
 
 pub struct AndroidPeripheral;
+
+impl AndroidPeripheral {
+    pub async fn with_config(_config: PeripheralConfig) -> BlewResult<Self> {
+        <Self as PeripheralBackend>::new().await
+    }
+}
 
 impl backend::private::Sealed for AndroidPeripheral {}
 

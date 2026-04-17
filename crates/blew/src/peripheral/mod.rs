@@ -2,7 +2,8 @@ pub mod backend;
 pub mod types;
 
 pub use types::{
-    AdvertisingConfig, PeripheralRequest, PeripheralStateEvent, ReadResponder, WriteResponder,
+    AdvertisingConfig, PeripheralConfig, PeripheralRequest, PeripheralStateEvent, ReadResponder,
+    WriteResponder,
 };
 
 use crate::error::{BlewError, BlewResult};
@@ -13,6 +14,27 @@ use crate::types::DeviceId;
 use crate::util::event_stream::EventStream;
 use backend::PeripheralBackend;
 use uuid::Uuid;
+
+impl Peripheral {
+    /// Initialise the peripheral role with the given configuration.
+    ///
+    /// On Apple platforms this wires `CBPeripheralManagerOptionRestoreIdentifierKey` when
+    /// `config.restore_identifier` is `Some`. On all other platforms the config is ignored.
+    ///
+    /// iOS requires that `CBPeripheralManager` be constructed with the restore identifier
+    /// during `application:didFinishLaunchingWithOptions:`, using the same identifier as the
+    /// previous launch — otherwise the OS discards the preserved state. When
+    /// `restore_identifier` is set, construct `Peripheral` as early as possible in app
+    /// startup. During the next launch, listen for
+    /// [`PeripheralStateEvent::Restored`] to observe the preserved services.
+    ///
+    /// See the crate-level `State restoration` docs for the full iOS contract
+    /// (entitlements, event-drain rules, L2CAP re-open requirement).
+    pub async fn with_config(config: PeripheralConfig) -> BlewResult<Self> {
+        let backend = PlatformPeripheral::with_config(config).await?;
+        Ok(Self { backend })
+    }
+}
 
 /// BLE peripheral (server in bluetooth-speak) role: advertiser, GATT server, L2CAP listener.
 ///
