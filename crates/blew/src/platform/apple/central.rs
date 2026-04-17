@@ -551,9 +551,6 @@ struct CentralHandle {
     /// Retained here so the CB manager's weak-ref delegate stays alive.
     delegate: ObjcSend<CentralDelegate>,
     inner: Arc<CentralInner>,
-    /// Read by the `willRestoreState:` delegate (Task 4) to correlate restored peripherals.
-    #[allow(dead_code)]
-    restore_identifier: Option<String>,
 }
 
 unsafe impl Send for CentralHandle {}
@@ -888,7 +885,9 @@ impl CentralBackend for AppleCentral {
 }
 
 impl AppleCentral {
-    pub async fn with_config(config: CentralConfig) -> BlewResult<Self> {
+    pub async fn with_config(
+        #[cfg_attr(not(target_os = "ios"), allow(unused))] config: CentralConfig,
+    ) -> BlewResult<Self> {
         let (inner, mut powered_rx) = CentralInner::new();
         let delegate = CentralDelegate::new(Arc::clone(&inner));
         let queue = DispatchQueue::new("blew.central", DispatchQueueAttr::SERIAL);
@@ -954,7 +953,6 @@ impl AppleCentral {
             manager,
             delegate,
             inner,
-            restore_identifier: config.restore_identifier,
         })))
     }
 
