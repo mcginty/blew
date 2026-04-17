@@ -414,6 +414,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
     println!("gatt echo: ok ({} bytes round-trip)", echo.len());
+    println!("mtu: {}", central.mtu(&device_id).await);
 
     println!("l2cap: reading PSM and opening channel");
     let psm_data = timeout(
