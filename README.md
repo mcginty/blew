@@ -20,6 +20,10 @@ It also supports opportunistic L2CAP which provides a lower-level socket-type
 interface that tends to be significantly faster than using GATT for data
 transfer.
 
+`blew` is intended to support as many concurrent L2CAP channels as the device
+and platform can sustain. Backend implementations should therefore optimize for
+high L2CAP concurrency, not just single-channel correctness.
+
 There is also an included `tauri-plugin-blew` that vastly simplifies the
 necessary Kotlin/JNI glue to enable Android functionality.
 

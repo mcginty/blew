@@ -8,6 +8,13 @@ A cross-platform BLE (Bluetooth Low Energy) library for Rust, providing both Cen
 
 `blew` was extracted from [iroh-ble-transport](https://github.com/mcginty/iroh-ble-transport) (local clone: `~/git/iroh-ble-transport`) — that project is the primary driver for the API shape, L2CAP focus, and cross-platform requirements. When in doubt about a design decision, check what `iroh-ble-transport` needs. Many of the quirks handled here (e.g., post-connect MTU stability, L2CAP ergonomics) came directly from issues encountered there.
 
+## Project goals
+
+- L2CAP is a first-class transport, not an edge feature.
+- `blew` is expected to run with as many concurrent L2CAP channels as the device and OS will allow.
+- Favor architectures that scale with many simultaneous L2CAP channels. In particular, do not assume a per-channel worker thread model is an acceptable long-term Apple design just because it is simpler.
+- When choosing between short-term fixes and long-term architecture, bias toward backend-owned transport abstractions with explicit shutdown and shared event-loop/reactor designs over generic hooks or per-connection thread ownership.
+
 ## Commands
 
 Uses [mise](https://mise.jdx.dev) for task management. Run `mise tasks` for the full list.
@@ -147,6 +154,8 @@ rx.await...
 **Split peripheral events.** State updates (adapter power, subscription changes) are `Clone` and fan out through a `tokio::sync::broadcast` channel via `state_events()`. GATT requests (reads/writes) carry RAII `ReadResponder`/`WriteResponder` handles and must be owned by a single consumer; `take_requests()` hands out the `mpsc::UnboundedReceiver` and returns `None` on the second call. The broadcast side runs behind `parking_lot::Mutex` for fast, poison-free synchronization.
 
 **RAII responders:** `peripheralManager:didReceiveReadRequest:` and `didReceiveWriteRequests:` build a `ReadResponder`/`WriteResponder` (backed by an `oneshot::Sender`), emit a `PeripheralRequest`, then spawn a task (via `inner.runtime.spawn()`) that awaits the oneshot and calls `respondToRequest:withResult:`. The spawn uses the captured `Handle` because GCD callbacks run outside the Tokio runtime context — bare `tokio::spawn` would panic.
+
+**L2CAP direction:** Apple stream objects are thread-affine enough that L2CAP transport ownership must stay explicit. For short-term debugging it is acceptable to use a per-channel worker thread, but the intended architecture for this codebase is a backend-owned L2CAP transport with explicit close/shutdown and a shared run-loop/reactor thread capable of servicing many concurrent channels efficiently.
 
 ## CoreBluetooth rules that cause crashes
 

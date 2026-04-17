@@ -75,6 +75,23 @@ pub(crate) fn set_pending_open(addr: String, tx: oneshot::Sender<BlewResult<L2ca
     state().pending_open.lock().insert(addr, tx);
 }
 
+fn close_socket(socket_id: i32, is_server: bool) {
+    let _ = jvm().attach_current_thread(|env| {
+        let class = if is_server {
+            peripheral_class()
+        } else {
+            central_class()
+        };
+        let _ = env.call_static_method(
+            class,
+            jni_str!("closeL2cap"),
+            jni_sig!("(I)V"),
+            &[socket_id.into()],
+        );
+        Ok::<_, jni::errors::Error>(())
+    });
+}
+
 pub(crate) fn on_channel_opened(device_addr: &str, socket_id: i32, from_server: bool) {
     let (app_half, bridge_half) = tokio::io::duplex(DUPLEX_BUF_SIZE);
     let (mut bridge_reader, mut bridge_writer) = tokio::io::split(bridge_half);
@@ -123,23 +140,12 @@ pub(crate) fn on_channel_opened(device_addr: &str, socket_id: i32, from_server: 
                 }
             }
         }
-        let _ = jvm().attach_current_thread(|env| {
-            let class = if is_server {
-                peripheral_class()
-            } else {
-                central_class()
-            };
-            let _ = env.call_static_method(
-                class,
-                jni_str!("closeL2cap"),
-                jni_sig!("(I)V"),
-                &[socket_id.into()],
-            );
-            Ok::<_, jni::errors::Error>(())
-        });
+        close_socket(socket_id, is_server);
     });
 
-    let channel = L2capChannel::from_duplex(app_half);
+    let channel = L2capChannel::from_duplex_with_close_hook(app_half, move || {
+        close_socket(socket_id, from_server);
+    });
 
     if from_server {
         if let Some(s) = STATE.get() {

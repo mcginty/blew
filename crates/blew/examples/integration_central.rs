@@ -194,7 +194,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("l2cap echo: ok ({L2CAP_PAYLOAD_LEN} bytes round-trip)");
 
-    drop(ch);
+    if let Err(e) = timeout(OP_TIMEOUT, ch.close()).await {
+        eprintln!("cleanup: L2CAP close timeout: {e}");
+    }
 
     if let Err(e) = timeout(
         OP_TIMEOUT,

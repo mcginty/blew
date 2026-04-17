@@ -1783,6 +1783,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_l2cap_channel_supports_multiple_concurrent_channels() {
+        use crate::central::backend::CentralBackend;
+        use crate::peripheral::backend::PeripheralBackend;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_stream::StreamExt;
+
+        let (central_ep, periph_ep) = MockLink::pair();
+        let (psm, mut listener) = periph_ep.peripheral.l2cap_listener().await.unwrap();
+        let device_id = DeviceId::from("mock-peripheral");
+
+        let (open_a, open_b, open_c) = tokio::join!(
+            central_ep.central.open_l2cap_channel(&device_id, psm),
+            central_ep.central.open_l2cap_channel(&device_id, psm),
+            central_ep.central.open_l2cap_channel(&device_id, psm),
+        );
+        let mut central_channels = vec![open_a.unwrap(), open_b.unwrap(), open_c.unwrap()];
+
+        let accepted_a = listener.next().await.unwrap().unwrap();
+        let accepted_b = listener.next().await.unwrap().unwrap();
+        let accepted_c = listener.next().await.unwrap().unwrap();
+        let mut peripheral_channels = vec![accepted_a.1, accepted_b.1, accepted_c.1];
+
+        let mut central_tasks = Vec::new();
+        for (index, mut channel) in central_channels.drain(..).enumerate() {
+            central_tasks.push(tokio::spawn(async move {
+                let payload = format!("central-{index}").into_bytes();
+                channel.write_all(&payload).await.unwrap();
+                let mut echoed = vec![0_u8; payload.len()];
+                channel.read_exact(&mut echoed).await.unwrap();
+                (payload, echoed)
+            }));
+        }
+
+        let mut peripheral_tasks = Vec::new();
+        for mut channel in peripheral_channels.drain(..) {
+            peripheral_tasks.push(tokio::spawn(async move {
+                let mut buf = vec![0_u8; 16];
+                let n = channel.read(&mut buf).await.unwrap();
+                buf.truncate(n);
+                channel.write_all(&buf).await.unwrap();
+                buf
+            }));
+        }
+
+        let mut central_results = Vec::new();
+        for task in central_tasks {
+            central_results.push(task.await.unwrap());
+        }
+        let mut peripheral_results = Vec::new();
+        for task in peripheral_tasks {
+            peripheral_results.push(task.await.unwrap());
+        }
+
+        for (payload, echoed) in &central_results {
+            assert_eq!(payload, echoed);
+        }
+
+        let mut central_payloads: Vec<Vec<u8>> = central_results
+            .into_iter()
+            .map(|(payload, _)| payload)
+            .collect();
+        central_payloads.sort();
+        peripheral_results.sort();
+        assert_eq!(central_payloads, peripheral_results);
+    }
+
+    #[tokio::test]
+    async fn closing_one_l2cap_channel_does_not_affect_siblings() {
+        use crate::central::backend::CentralBackend;
+        use crate::peripheral::backend::PeripheralBackend;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::timeout;
+        use tokio_stream::StreamExt;
+
+        let (central_ep, periph_ep) = MockLink::pair();
+        let (psm, mut listener) = periph_ep.peripheral.l2cap_listener().await.unwrap();
+        let device_id = DeviceId::from("mock-peripheral");
+
+        let (first, second) = tokio::join!(
+            central_ep.central.open_l2cap_channel(&device_id, psm),
+            central_ep.central.open_l2cap_channel(&device_id, psm),
+        );
+        let mut first = first.unwrap();
+        let mut second = second.unwrap();
+
+        let (_, mut peripheral_first) = listener.next().await.unwrap().unwrap();
+        let (_, mut peripheral_second) = listener.next().await.unwrap().unwrap();
+
+        first.close().await.unwrap();
+        let mut eof = [0_u8; 1];
+        let n = timeout(
+            std::time::Duration::from_millis(100),
+            peripheral_first.read(&mut eof),
+        )
+        .await
+        .expect("closed channel should reach peer EOF")
+        .unwrap();
+        assert_eq!(n, 0);
+
+        second.write_all(b"still-open").await.unwrap();
+        let mut buf = [0_u8; 10];
+        peripheral_second.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"still-open");
+
+        peripheral_second.write_all(b"ack").await.unwrap();
+        let mut ack = [0_u8; 3];
+        second.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"ack");
+    }
+
+    #[tokio::test]
     async fn test_central_emits_adapter_state_on_init() {
         let (central_ep, _periph_ep) = MockLink::pair();
         let central: crate::Central<_> = crate::Central::from_backend(central_ep.central);
