@@ -70,6 +70,30 @@ struct LinkState {
     l2cap_psm: Option<crate::l2cap::types::Psm>,
     l2cap_accept_tx:
         Option<tokio::sync::mpsc::UnboundedSender<BlewResult<(DeviceId, L2capChannel)>>>,
+    next_read_error: Option<MockErrorKind>,
+    next_write_error: Option<MockErrorKind>,
+    next_subscribe_error: Option<MockErrorKind>,
+    drop_next_notification: bool,
+}
+
+impl LinkState {
+    fn new() -> Self {
+        Self {
+            services: Vec::new(),
+            char_values: HashMap::new(),
+            subscriptions: HashMap::new(),
+            advertising: false,
+            adv_config: None,
+            connected: false,
+            l2cap_policy: MockL2capPolicy::default(),
+            l2cap_psm: None,
+            l2cap_accept_tx: None,
+            next_read_error: None,
+            next_write_error: None,
+            next_subscribe_error: None,
+            drop_next_notification: false,
+        }
+    }
 }
 
 type SharedLink = Arc<Mutex<LinkState>>;
@@ -90,17 +114,7 @@ impl MockLink {
     /// Create a mock central and mock peripheral wired together.
     #[must_use]
     pub fn pair() -> (MockLinkEndpoint, MockPeripheralEndpoint) {
-        let link = Arc::new(Mutex::new(LinkState {
-            services: Vec::new(),
-            char_values: HashMap::new(),
-            subscriptions: HashMap::new(),
-            advertising: false,
-            adv_config: None,
-            connected: false,
-            l2cap_policy: MockL2capPolicy::default(),
-            l2cap_psm: None,
-            l2cap_accept_tx: None,
-        }));
+        let link = Arc::new(Mutex::new(LinkState::new()));
 
         let (central_event_tx, central_event_rx) = mpsc::unbounded_channel();
         let (periph_request_tx, periph_request_rx) = mpsc::unbounded_channel();
@@ -185,17 +199,7 @@ impl MockCentral {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (periph_request_tx, _periph_request_rx) = mpsc::unbounded_channel();
         let (periph_state_tx, _) = broadcast::channel(64);
-        let link = Arc::new(Mutex::new(LinkState {
-            services: Vec::new(),
-            char_values: std::collections::HashMap::new(),
-            subscriptions: std::collections::HashMap::new(),
-            advertising: false,
-            adv_config: None,
-            connected: false,
-            l2cap_policy: MockL2capPolicy::default(),
-            l2cap_psm: None,
-            l2cap_accept_tx: None,
-        }));
+        let link = Arc::new(Mutex::new(LinkState::new()));
         crate::central::Central::from_backend(Self {
             link,
             event_tx,
@@ -218,6 +222,44 @@ impl MockCentral {
         let _ = self
             .event_tx
             .send(CentralEvent::AdapterStateChanged { powered });
+    }
+
+    /// Arm the next [`read_characteristic`] call to fail with `kind`.
+    ///
+    /// One-shot: consumed by the next matching op. Subsequent reads behave normally.
+    ///
+    /// [`read_characteristic`]: CentralBackend::read_characteristic
+    pub fn inject_next_read_error(&self, kind: MockErrorKind) {
+        self.link.lock().next_read_error = Some(kind);
+    }
+
+    /// Arm the next [`write_characteristic`] call to fail with `kind`.
+    ///
+    /// [`write_characteristic`]: CentralBackend::write_characteristic
+    pub fn inject_next_write_error(&self, kind: MockErrorKind) {
+        self.link.lock().next_write_error = Some(kind);
+    }
+
+    /// Arm the next [`subscribe_characteristic`] call to fail with `kind`.
+    ///
+    /// [`subscribe_characteristic`]: CentralBackend::subscribe_characteristic
+    pub fn inject_next_subscribe_error(&self, kind: MockErrorKind) {
+        self.link.lock().next_subscribe_error = Some(kind);
+    }
+
+    /// Simulate a peer-initiated disconnect: mark the link disconnected, drop
+    /// subscriptions, and emit [`CentralEvent::DeviceDisconnected`] with
+    /// [`DisconnectCause::LinkLoss`]. Use to verify reconnect/retry flows.
+    pub fn simulate_disconnect(&self) {
+        {
+            let mut link = self.link.lock();
+            link.connected = false;
+            link.subscriptions.clear();
+        }
+        let _ = self.event_tx.send(CentralEvent::DeviceDisconnected {
+            device_id: DeviceId::from("mock-peripheral"),
+            cause: DisconnectCause::LinkLoss,
+        });
     }
 }
 
@@ -308,8 +350,10 @@ impl CentralBackend for MockCentral {
         let device_id = device_id.clone();
         let periph_tx = self.periph_request_tx.clone();
         let precheck = {
-            let link = self.link.lock();
-            if !link.connected {
+            let mut link = self.link.lock();
+            if let Some(kind) = link.next_read_error.take() {
+                Err(kind.to_error())
+            } else if !link.connected {
                 Err(BlewError::NotConnected(device_id.clone()))
             } else if let Some(value) = link.char_values.get(&char_uuid).cloned()
                 && !value.is_empty()
@@ -365,8 +409,10 @@ impl CentralBackend for MockCentral {
         let periph_tx = self.periph_request_tx.clone();
         let max = MOCK_MTU as usize - 3;
         let precheck: BlewResult<()> = {
-            let link = self.link.lock();
-            if !link.connected {
+            let mut link = self.link.lock();
+            if let Some(kind) = link.next_write_error.take() {
+                Err(kind.to_error())
+            } else if !link.connected {
                 Err(BlewError::NotConnected(device_id.clone()))
             } else if !link
                 .services
@@ -431,6 +477,9 @@ impl CentralBackend for MockCentral {
         async move {
             let rx = {
                 let mut link = link.lock();
+                if let Some(kind) = link.next_subscribe_error.take() {
+                    return Err(kind.to_error());
+                }
                 if !link.connected {
                     return Err(BlewError::NotConnected(device_id));
                 }
@@ -562,17 +611,7 @@ impl Clone for MockPeripheral {
 #[cfg(any(test, feature = "testing"))]
 impl MockPeripheral {
     fn make_link() -> SharedLink {
-        Arc::new(Mutex::new(LinkState {
-            services: Vec::new(),
-            char_values: std::collections::HashMap::new(),
-            subscriptions: std::collections::HashMap::new(),
-            advertising: false,
-            adv_config: None,
-            connected: false,
-            l2cap_policy: MockL2capPolicy::default(),
-            l2cap_psm: None,
-            l2cap_accept_tx: None,
-        }))
+        Arc::new(Mutex::new(LinkState::new()))
     }
 
     /// Construct a standalone powered mock peripheral (not linked to any central).
@@ -613,6 +652,14 @@ impl MockPeripheral {
     /// Seed the restored-services buffer as if `willRestoreState:` had fired.
     pub fn mock_set_restored(&self, services: Vec<Uuid>) {
         *self.restored.lock() = Some(services);
+    }
+
+    /// Arm the next [`notify_characteristic`] call to silently drop the
+    /// payload instead of delivering it. One-shot.
+    ///
+    /// [`notify_characteristic`]: PeripheralBackend::notify_characteristic
+    pub fn drop_next_notification(&self) {
+        self.link.lock().drop_next_notification = true;
     }
 }
 
@@ -671,8 +718,10 @@ impl PeripheralBackend for MockPeripheral {
         char_uuid: Uuid,
         value: Vec<u8>,
     ) -> impl Future<Output = BlewResult<()>> + Send {
-        let link = self.link.lock();
-        if let Some(tx) = link.subscriptions.get(&char_uuid) {
+        let mut link = self.link.lock();
+        if std::mem::take(&mut link.drop_next_notification) {
+            // Silently discard the notification, as if it were lost in transit.
+        } else if let Some(tx) = link.subscriptions.get(&char_uuid) {
             let _ = tx.send(Bytes::from(value));
         }
         async { Ok(()) }
@@ -1897,5 +1946,187 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value, b"hello");
+    }
+
+    async fn connected_pair_with_char(
+        char_uuid: Uuid,
+    ) -> (
+        Central<MockCentral>,
+        Peripheral<MockPeripheral>,
+        DeviceId,
+        MockCentral,
+        MockPeripheral,
+    ) {
+        let (c, p) = MockLink::pair();
+        let central_backend = c.central.clone();
+        let peripheral_backend = p.peripheral.clone();
+        let central = Central::from_backend(c.central);
+        let peripheral = Peripheral::from_backend(p.peripheral);
+        peripheral
+            .add_service(&GattService {
+                uuid: Uuid::from_u128(0x1234),
+                primary: true,
+                characteristics: vec![GattCharacteristic {
+                    uuid: char_uuid,
+                    properties: CharacteristicProperties::READ
+                        | CharacteristicProperties::WRITE
+                        | CharacteristicProperties::NOTIFY,
+                    permissions: AttributePermissions::READ | AttributePermissions::WRITE,
+                    value: b"static".to_vec(),
+                    descriptors: vec![],
+                }],
+            })
+            .await
+            .unwrap();
+        let device_id = DeviceId::from("mock-peripheral");
+        central.connect(&device_id).await.unwrap();
+        (
+            central,
+            peripheral,
+            device_id,
+            central_backend,
+            peripheral_backend,
+        )
+    }
+
+    #[tokio::test]
+    async fn fault_inject_next_read_error_is_one_shot() {
+        let char_uuid = Uuid::from_u128(0xF00D);
+        let (central, _peripheral, device_id, central_backend, _p) =
+            connected_pair_with_char(char_uuid).await;
+
+        central_backend.inject_next_read_error(MockErrorKind::Internal);
+        assert!(matches!(
+            central.read_characteristic(&device_id, char_uuid).await,
+            Err(BlewError::Internal(_))
+        ));
+        assert_eq!(
+            central
+                .read_characteristic(&device_id, char_uuid)
+                .await
+                .unwrap(),
+            b"static"
+        );
+    }
+
+    #[tokio::test]
+    async fn fault_inject_next_write_error_is_one_shot() {
+        let char_uuid = Uuid::from_u128(0xF00E);
+        let (central, _peripheral, device_id, central_backend, _p) =
+            connected_pair_with_char(char_uuid).await;
+
+        central_backend.inject_next_write_error(MockErrorKind::NotSupported);
+        assert!(matches!(
+            central
+                .write_characteristic(
+                    &device_id,
+                    char_uuid,
+                    b"x".to_vec(),
+                    WriteType::WithoutResponse,
+                )
+                .await,
+            Err(BlewError::NotSupported)
+        ));
+        central
+            .write_characteristic(
+                &device_id,
+                char_uuid,
+                b"y".to_vec(),
+                WriteType::WithoutResponse,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fault_inject_next_subscribe_error_is_one_shot() {
+        let char_uuid = Uuid::from_u128(0xF00F);
+        let (central, _peripheral, device_id, central_backend, _p) =
+            connected_pair_with_char(char_uuid).await;
+
+        central_backend.inject_next_subscribe_error(MockErrorKind::Internal);
+        assert!(matches!(
+            central
+                .subscribe_characteristic(&device_id, char_uuid)
+                .await,
+            Err(BlewError::Internal(_))
+        ));
+        central
+            .subscribe_characteristic(&device_id, char_uuid)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fault_simulate_disconnect_drops_link_and_notifies() {
+        let char_uuid = Uuid::from_u128(0xF010);
+        let (central, _peripheral, device_id, central_backend, _p) =
+            connected_pair_with_char(char_uuid).await;
+
+        let mut events = central.events();
+        central_backend.simulate_disconnect();
+
+        let disconnect = loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(100), events.next())
+                .await
+                .expect("timed out waiting for disconnect event")
+                .expect("stream closed")
+            {
+                CentralEvent::DeviceDisconnected { device_id, cause } => {
+                    break (device_id, cause);
+                }
+                _ => {}
+            }
+        };
+        assert_eq!(disconnect.0, device_id);
+        assert!(matches!(disconnect.1, DisconnectCause::LinkLoss));
+
+        assert!(matches!(
+            central.read_characteristic(&device_id, char_uuid).await,
+            Err(BlewError::NotConnected(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn fault_drop_next_notification_swallows_one_payload() {
+        let char_uuid = Uuid::from_u128(0xF011);
+        let (central, peripheral, device_id, _c, peripheral_backend) =
+            connected_pair_with_char(char_uuid).await;
+
+        central
+            .subscribe_characteristic(&device_id, char_uuid)
+            .await
+            .unwrap();
+        let mut events = central.events();
+
+        peripheral_backend.drop_next_notification();
+        peripheral
+            .notify_characteristic(
+                &DeviceId::from("mock-central"),
+                char_uuid,
+                b"dropped".to_vec(),
+            )
+            .await
+            .unwrap();
+        peripheral
+            .notify_characteristic(
+                &DeviceId::from("mock-central"),
+                char_uuid,
+                b"delivered".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        let delivered = loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(100), events.next())
+                .await
+                .expect("timed out")
+                .expect("stream closed")
+            {
+                CentralEvent::CharacteristicNotification { value, .. } => break value,
+                _ => {}
+            }
+        };
+        assert_eq!(&delivered[..], b"delivered");
     }
 }
