@@ -23,7 +23,6 @@
 use blew::Central;
 use blew::central::{CentralEvent, ScanFilter, WriteType};
 use blew::l2cap::Psm;
-use std::io::Write as _;
 use std::process::ExitCode;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -50,13 +49,11 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => {
             println!("\nintegration-central: PASS");
-            let _ = std::io::stdout().flush();
-            std::process::exit(0);
+            ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!("\nintegration-central: FAIL -- {e}");
-            let _ = std::io::stderr().flush();
-            std::process::exit(1);
+            ExitCode::FAILURE
         }
     }
 }

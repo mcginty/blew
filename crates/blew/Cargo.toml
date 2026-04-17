@@ -44,12 +44,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = [
     "NSData",
+    "NSDate",
     "NSString",
     "NSUUID",
     "NSArray",
     "NSDictionary",
     "NSObject",
     "NSError",
+    "NSRunLoop",
     "NSValue",
     "NSStream",
 ] }

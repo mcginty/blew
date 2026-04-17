@@ -6,12 +6,17 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 
+type CloseHook = Box<dyn FnOnce() + Send + 'static>;
+
 /// An open L2CAP CoC channel providing a reliable ordered byte stream.
 ///
 /// Implements [`AsyncRead`] and [`AsyncWrite`]. The backing stream is platform-specific;
 /// use [`pair`](Self::pair) for testing.
 pub struct L2capChannel {
     inner: DuplexStream,
+    // Platform backends can install a shutdown hook to tear down transport
+    // resources that live outside the duplex stream.
+    close_hook: Option<CloseHook>,
 }
 
 impl std::fmt::Debug for L2capChannel {
@@ -25,11 +30,41 @@ impl L2capChannel {
     #[must_use]
     pub fn pair(max_buf_size: usize) -> (Self, Self) {
         let (a, b) = tokio::io::duplex(max_buf_size);
-        (Self { inner: a }, Self { inner: b })
+        (
+            Self {
+                inner: a,
+                close_hook: None,
+            },
+            Self {
+                inner: b,
+                close_hook: None,
+            },
+        )
     }
 
     pub(crate) fn from_duplex(inner: DuplexStream) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            close_hook: None,
+        }
+    }
+
+    pub(crate) fn from_duplex_with_close_hook(
+        inner: DuplexStream,
+        close_hook: impl FnOnce() + Send + 'static,
+    ) -> Self {
+        Self {
+            inner,
+            close_hook: Some(Box::new(close_hook)),
+        }
+    }
+}
+
+impl Drop for L2capChannel {
+    fn drop(&mut self) {
+        if let Some(close_hook) = self.close_hook.take() {
+            close_hook();
+        }
     }
 }
 
