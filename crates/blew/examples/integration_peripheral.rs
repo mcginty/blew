@@ -37,11 +37,11 @@ const PSM_CHAR_UUID: Uuid = Uuid::from_u128(0x626c_6577_0000_0000_0000_0000_0000
 const STATUS_VALUE: &[u8] = b"BLEW-OK";
 const SPEEDTEST_BYTES: usize = 1024 * 1024;
 const SPEEDTEST_CHUNK_SIZE: usize = 4096;
+const UPLOAD_PROGRESS_INTERVAL: usize = 64 * 1024;
 const CMD_ECHO: u8 = 0x01;
 const CMD_UPLOAD: u8 = 0x02;
 const CMD_DOWNLOAD: u8 = 0x03;
 const CMD_BIDIRECTIONAL: u8 = 0x04;
-const ACK_OK: u8 = 0xAA;
 const CENTRAL_PATTERN: u8 = 0xC1;
 const PERIPHERAL_PATTERN: u8 = 0xD2;
 
@@ -99,6 +99,55 @@ async fn drain_exact_pattern(
     Ok(())
 }
 
+async fn drain_exact_pattern_with_progress(
+    ch: blew::L2capChannel,
+    total_len: usize,
+    expected: u8,
+) -> Result<blew::L2capChannel, DynError> {
+    let (mut reader, mut writer) = tokio::io::split(ch);
+    let receiver = async {
+        let mut remaining = total_len;
+        let mut total_read = 0_usize;
+        let mut last_reported = 0_usize;
+        let mut buf = vec![0_u8; SPEEDTEST_CHUNK_SIZE];
+        while remaining > 0 {
+            let n = reader
+                .read(&mut buf[..remaining.min(SPEEDTEST_CHUNK_SIZE)])
+                .await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "L2CAP speedtest hit EOF early",
+                ));
+            }
+            if buf[..n].iter().any(|&b| b != expected) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "L2CAP speedtest received unexpected payload bytes",
+                ));
+            }
+            remaining -= n;
+            total_read += n;
+            if total_read - last_reported >= UPLOAD_PROGRESS_INTERVAL || remaining == 0 {
+                writer
+                    .write_all(
+                        &u32::try_from(total_read)
+                            .expect("progress fits in u32")
+                            .to_le_bytes(),
+                    )
+                    .await?;
+                last_reported = total_read;
+            }
+        }
+        Ok::<_, std::io::Error>(())
+    };
+
+    receiver.await?;
+    Ok(reader
+        .reunite(writer)
+        .map_err(|_| "failed to reunite upload channel halves")?)
+}
+
 async fn serve_l2cap_protocol(mut ch: blew::L2capChannel) -> Result<(), DynError> {
     while let Some((cmd, len)) = read_command_header(&mut ch).await? {
         match cmd {
@@ -108,8 +157,7 @@ async fn serve_l2cap_protocol(mut ch: blew::L2capChannel) -> Result<(), DynError
                 ch.write_all(&buf).await?;
             }
             CMD_UPLOAD => {
-                drain_exact_pattern(&mut ch, len, CENTRAL_PATTERN).await?;
-                ch.write_all(&[ACK_OK]).await?;
+                ch = drain_exact_pattern_with_progress(ch, len, CENTRAL_PATTERN).await?;
             }
             CMD_DOWNLOAD => {
                 send_pattern(&mut ch, len, PERIPHERAL_PATTERN).await?;

@@ -48,11 +48,11 @@ const L2CAP_PAYLOAD_LEN: usize = 1024;
 const SPEEDTEST_BYTES: usize = 1024 * 1024;
 const SPEEDTEST_CHUNK_SIZE: usize = 4096;
 const PROGRESS_YIELD_INTERVAL: usize = 64 * 1024;
+const UPLOAD_PROGRESS_INTERVAL: usize = 64 * 1024;
 const CMD_ECHO: u8 = 0x01;
 const CMD_UPLOAD: u8 = 0x02;
 const CMD_DOWNLOAD: u8 = 0x03;
 const CMD_BIDIRECTIONAL: u8 = 0x04;
-const ACK_OK: u8 = 0xAA;
 const CENTRAL_PATTERN: u8 = 0xC1;
 const PERIPHERAL_PATTERN: u8 = 0xD2;
 
@@ -132,28 +132,50 @@ async fn run_upload_speedtest(
     progress: &ProgressBar,
 ) -> Result<Duration, Box<dyn std::error::Error>> {
     write_command_header(ch, CMD_UPLOAD, SPEEDTEST_BYTES).await?;
-    let chunk = [CENTRAL_PATTERN; SPEEDTEST_CHUNK_SIZE];
     let start = Instant::now();
     let label = "speedtest central->peripheral";
-    let mut remaining = SPEEDTEST_BYTES;
-    let mut bytes_since_yield = 0_usize;
-    while remaining > 0 {
-        let n = remaining.min(SPEEDTEST_CHUNK_SIZE);
-        ch.write_all(&chunk[..n]).await?;
-        progress.inc(u64::try_from(n).expect("chunk size fits in u64"));
-        remaining -= n;
-        bytes_since_yield += n;
-        let sent = SPEEDTEST_BYTES - remaining;
-        progress.set_message(live_speed_label(label, sent, start));
-        if bytes_since_yield >= PROGRESS_YIELD_INTERVAL {
-            bytes_since_yield = 0;
-            tokio::task::yield_now().await;
+    let (mut reader, mut writer) = tokio::io::split(ch);
+
+    let sender = async {
+        let chunk = [CENTRAL_PATTERN; SPEEDTEST_CHUNK_SIZE];
+        let mut remaining = SPEEDTEST_BYTES;
+        let mut bytes_since_yield = 0_usize;
+        while remaining > 0 {
+            let n = remaining.min(SPEEDTEST_CHUNK_SIZE);
+            writer.write_all(&chunk[..n]).await?;
+            remaining -= n;
+            bytes_since_yield += n;
+            if bytes_since_yield >= PROGRESS_YIELD_INTERVAL {
+                bytes_since_yield = 0;
+                tokio::task::yield_now().await;
+            }
         }
-    }
-    let mut ack = [0_u8; 1];
-    ch.read_exact(&mut ack).await?;
-    if ack[0] != ACK_OK {
-        return Err(format!("unexpected upload ack byte: {}", ack[0]).into());
+        Ok::<(), std::io::Error>(())
+    };
+
+    let receiver = async {
+        let mut last_reported = 0_usize;
+        while last_reported < SPEEDTEST_BYTES {
+            let mut report = [0_u8; 4];
+            reader.read_exact(&mut report).await?;
+            let received =
+                usize::try_from(u32::from_le_bytes(report)).expect("progress report fits in usize");
+            if received < last_reported || received > SPEEDTEST_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid upload progress report",
+                ));
+            }
+            progress.set_position(u64::try_from(received).expect("progress fits in u64"));
+            progress.set_message(live_speed_label(label, received, start));
+            last_reported = received;
+        }
+        Ok::<(), std::io::Error>(())
+    };
+
+    tokio::try_join!(sender, receiver)?;
+    if progress.position() < u64::try_from(SPEEDTEST_BYTES).expect("speedtest bytes fit in u64") {
+        progress.set_position(u64::try_from(SPEEDTEST_BYTES).expect("speedtest bytes fit in u64"));
     }
     Ok(start.elapsed())
 }
