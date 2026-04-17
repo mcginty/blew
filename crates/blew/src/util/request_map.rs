@@ -133,4 +133,95 @@ mod tests {
         assert_eq!(drained, vec![(1, "one"), (2, "two")]);
         assert!(map.take(&1).is_none());
     }
+
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+
+    #[derive(Debug, Clone)]
+    enum RequestMapOp {
+        Insert(u32),
+        TakeExisting(usize),
+        TakeBogus(u64),
+    }
+
+    fn request_map_op() -> impl Strategy<Value = RequestMapOp> {
+        prop_oneof![
+            any::<u32>().prop_map(RequestMapOp::Insert),
+            any::<usize>().prop_map(RequestMapOp::TakeExisting),
+            any::<u64>().prop_map(RequestMapOp::TakeBogus),
+        ]
+    }
+
+    proptest! {
+        /// `RequestMap::take(id)` returns `Some(v)` iff `id` was returned by a
+        /// prior `insert(v)` that has not yet been taken.
+        #[test]
+        fn request_map_matches_hashmap_model(ops in vec(request_map_op(), 0..200)) {
+            let map = RequestMap::<u32>::new();
+            let mut model: HashMap<u64, u32> = HashMap::new();
+            let mut issued_ids: Vec<u64> = Vec::new();
+
+            for op in ops {
+                match op {
+                    RequestMapOp::Insert(v) => {
+                        let id = map.insert(v);
+                        prop_assert!(model.insert(id, v).is_none(), "id reuse: {id}");
+                        issued_ids.push(id);
+                    }
+                    RequestMapOp::TakeExisting(i) if !issued_ids.is_empty() => {
+                        let id = issued_ids[i % issued_ids.len()];
+                        prop_assert_eq!(map.take(id), model.remove(&id));
+                    }
+                    RequestMapOp::TakeExisting(_) => {}
+                    RequestMapOp::TakeBogus(id) => {
+                        prop_assert_eq!(map.take(id), model.get(&id).copied());
+                        model.remove(&id);
+                    }
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    enum KeyedOp {
+        Insert(u8, u32),
+        Take(u8),
+        Drain,
+    }
+
+    fn keyed_op() -> impl Strategy<Value = KeyedOp> {
+        prop_oneof![
+            (any::<u8>(), any::<u32>()).prop_map(|(k, v)| KeyedOp::Insert(k, v)),
+            any::<u8>().prop_map(KeyedOp::Take),
+            Just(KeyedOp::Drain),
+        ]
+    }
+
+    proptest! {
+        /// `KeyedRequestMap` operations behave identically to a reference
+        /// `HashMap` across any mixed sequence of insert/take/drain.
+        #[test]
+        fn keyed_request_map_matches_hashmap_model(ops in vec(keyed_op(), 0..200)) {
+            let map = KeyedRequestMap::<u8, u32>::new();
+            let mut model: HashMap<u8, u32> = HashMap::new();
+
+            for op in ops {
+                match op {
+                    KeyedOp::Insert(k, v) => {
+                        prop_assert_eq!(map.insert(k, v), model.insert(k, v));
+                    }
+                    KeyedOp::Take(k) => {
+                        prop_assert_eq!(map.take(&k), model.remove(&k));
+                    }
+                    KeyedOp::Drain => {
+                        let mut drained = map.drain();
+                        drained.sort_by_key(|(k, _)| *k);
+                        let mut expected: Vec<_> = model.drain().collect();
+                        expected.sort_by_key(|(k, _)| *k);
+                        prop_assert_eq!(drained, expected);
+                    }
+                }
+            }
+        }
+    }
 }

@@ -37,6 +37,7 @@ bytes = "1"
 parking_lot = "0.12"
 
 [dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
