@@ -2129,4 +2129,154 @@ mod tests {
         };
         assert_eq!(&delivered[..], b"delivered");
     }
+
+    use proptest::collection::vec as prop_vec;
+    use proptest::prelude::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum OpKind {
+        Read,
+        Write,
+        Subscribe,
+    }
+
+    impl OpKind {
+        fn idx(self) -> usize {
+            match self {
+                Self::Read => 0,
+                Self::Write => 1,
+                Self::Subscribe => 2,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum FaultCmd {
+        Arm(OpKind, MockErrorKind),
+        Do(OpKind),
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Outcome {
+        Ok,
+        NotSupported,
+        Internal,
+        Other,
+    }
+
+    impl From<BlewResult<()>> for Outcome {
+        fn from(r: BlewResult<()>) -> Self {
+            match r {
+                Ok(()) => Self::Ok,
+                Err(BlewError::NotSupported) => Self::NotSupported,
+                Err(BlewError::Internal(_)) => Self::Internal,
+                Err(_) => Self::Other,
+            }
+        }
+    }
+
+    fn op_kind_strategy() -> impl Strategy<Value = OpKind> {
+        prop_oneof![
+            Just(OpKind::Read),
+            Just(OpKind::Write),
+            Just(OpKind::Subscribe),
+        ]
+    }
+
+    fn mock_error_kind_strategy() -> impl Strategy<Value = MockErrorKind> {
+        prop_oneof![
+            Just(MockErrorKind::NotSupported),
+            Just(MockErrorKind::Internal),
+        ]
+    }
+
+    fn fault_cmd_strategy() -> impl Strategy<Value = FaultCmd> {
+        prop_oneof![
+            (op_kind_strategy(), mock_error_kind_strategy()).prop_map(|(k, e)| FaultCmd::Arm(k, e)),
+            op_kind_strategy().prop_map(FaultCmd::Do),
+        ]
+    }
+
+    fn expected_outcome(slot: Option<MockErrorKind>) -> Outcome {
+        match slot {
+            None => Outcome::Ok,
+            Some(MockErrorKind::NotSupported) => Outcome::NotSupported,
+            Some(MockErrorKind::Internal) => Outcome::Internal,
+        }
+    }
+
+    proptest! {
+        /// Each fault slot (`next_read_error`, `next_write_error`,
+        /// `next_subscribe_error`) behaves as an independent `Option<MockErrorKind>`:
+        /// repeated arms overwrite (last-write-wins), the next matching op consumes
+        /// it, and arms on different op kinds never interfere with each other.
+        #[test]
+        fn fault_injection_matches_three_slot_model(
+            cmds in prop_vec(fault_cmd_strategy(), 0..64)
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let trace: Vec<(OpKind, Outcome, Outcome)> = rt.block_on(async move {
+                let char_uuid = Uuid::from_u128(0xF012);
+                let (central, _peripheral, device_id, central_backend, _p) =
+                    connected_pair_with_char(char_uuid).await;
+
+                let mut model: [Option<MockErrorKind>; 3] = [None, None, None];
+                let mut trace = Vec::new();
+
+                for cmd in cmds {
+                    match cmd {
+                        FaultCmd::Arm(k, e) => {
+                            match k {
+                                OpKind::Read => central_backend.inject_next_read_error(e),
+                                OpKind::Write => central_backend.inject_next_write_error(e),
+                                OpKind::Subscribe => central_backend.inject_next_subscribe_error(e),
+                            }
+                            model[k.idx()] = Some(e);
+                        }
+                        FaultCmd::Do(k) => {
+                            let expected = expected_outcome(model[k.idx()].take());
+                            let result: BlewResult<()> = match k {
+                                OpKind::Read => central
+                                    .read_characteristic(&device_id, char_uuid)
+                                    .await
+                                    .map(|_| ()),
+                                OpKind::Write => central
+                                    .write_characteristic(
+                                        &device_id,
+                                        char_uuid,
+                                        b"x".to_vec(),
+                                        WriteType::WithoutResponse,
+                                    )
+                                    .await,
+                                OpKind::Subscribe => {
+                                    let r = central
+                                        .subscribe_characteristic(&device_id, char_uuid)
+                                        .await;
+                                    if r.is_ok() {
+                                        central
+                                            .unsubscribe_characteristic(&device_id, char_uuid)
+                                            .await
+                                            .expect("unsubscribe is infallible");
+                                    }
+                                    r
+                                }
+                            };
+                            trace.push((k, expected, Outcome::from(result)));
+                        }
+                    }
+                }
+                trace
+            });
+
+            for (k, expected, got) in trace {
+                prop_assert_eq!(
+                    &expected, &got,
+                    "op {:?}: expected {:?}, got {:?}", k, expected, got
+                );
+            }
+        }
+    }
 }
