@@ -24,6 +24,7 @@ struct CentralInner {
     _session: Session,
     adapter: Adapter,
     discovered: Mutex<HashMap<DeviceId, BleDevice>>,
+    mtu_cache: Mutex<HashMap<DeviceId, u16>>,
     event_tx: EventFanoutTx<CentralEvent>,
     event_fanout: EventFanout<CentralEvent>,
     scan_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -47,6 +48,29 @@ impl CentralInner {
             .as_str()
             .parse()
             .map_err(|_| BlewError::DeviceNotFound(device_id.clone()))
+    }
+
+    fn drain_notify_tasks(&self, device_id: &DeviceId) {
+        let mut tasks = self.notify_tasks.lock();
+        let keys: Vec<_> = tasks
+            .keys()
+            .filter(|(did, _)| did == device_id)
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(task) = tasks.remove(&key) {
+                task.abort();
+            }
+        }
+    }
+
+    fn update_mtu(&self, device_id: &DeviceId, mtu: usize) {
+        let mtu = mtu.clamp(23, usize::from(u16::MAX)) as u16;
+        self.mtu_cache.lock().insert(device_id.clone(), mtu);
+    }
+
+    fn clear_mtu(&self, device_id: &DeviceId) {
+        self.mtu_cache.lock().remove(device_id);
     }
 
     async fn find_characteristic(
@@ -142,6 +166,7 @@ impl CentralBackend for LinuxCentral {
             _session: session,
             adapter,
             discovered: Mutex::new(HashMap::new()),
+            mtu_cache: Mutex::new(HashMap::new()),
             event_tx,
             event_fanout,
             scan_task: Mutex::new(None),
@@ -268,6 +293,8 @@ impl CentralBackend for LinuxCentral {
                             let device_id = DeviceId(addr.to_string());
                             debug!(device_id = %device_id, "device removed");
                             handle.discovered.lock().remove(&device_id);
+                            handle.clear_mtu(&device_id);
+                            handle.drain_notify_tasks(&device_id);
                             let cause = if handle.adapter.is_powered().await.unwrap_or(true) {
                                 DisconnectCause::LinkLoss
                             } else {
@@ -326,6 +353,7 @@ impl CentralBackend for LinuxCentral {
                 Err(_) => return Err(BlewError::Timeout),
             }
             debug!(device_id = %device_id, "device connected");
+            handle.clear_mtu(&device_id);
             handle
                 .event_tx
                 .send(CentralEvent::DeviceConnected { device_id });
@@ -349,6 +377,8 @@ impl CentralBackend for LinuxCentral {
                 source: Box::new(e),
             })?;
             debug!(device_id = %device_id, "device disconnected");
+            handle.clear_mtu(&device_id);
+            handle.drain_notify_tasks(&device_id);
             handle.event_tx.send(CentralEvent::DeviceDisconnected {
                 device_id,
                 cause: DisconnectCause::LocalClose,
@@ -454,6 +484,7 @@ impl CentralBackend for LinuxCentral {
                         device_id: device_id.clone(),
                         source: Box::new(e),
                     })?;
+                    handle.update_mtu(&device_id, writer.mtu());
                     writer
                         .write_all(&value)
                         .await
@@ -496,6 +527,7 @@ impl CentralBackend for LinuxCentral {
                 device_id: device_id.clone(),
                 source: Box::new(e),
             })?;
+            handle.update_mtu(&device_id, reader.mtu());
             let h = Arc::clone(&handle);
             let did = device_id.clone();
             let task = tokio::spawn(async move {
@@ -547,14 +579,13 @@ impl CentralBackend for LinuxCentral {
         }
     }
 
-    async fn mtu(&self, _device_id: &DeviceId) -> u16 {
-        // bluer does not expose negotiated ATT MTU on `Device`. Real value is available per
-        // CharacteristicWriter/Reader after opening a socket. Until we plumb that through,
-        // return a conservative LE DLE-era default that matches what BlueZ negotiates on
-        // almost all modern hardware. See also `iroh-ble-transport` discussion on
-        // MTU-at-rest defaults.
-        // TODO(mtu-plumb): thread the real negotiated MTU through from the open socket.
-        247_u16
+    async fn mtu(&self, device_id: &DeviceId) -> u16 {
+        self.0
+            .mtu_cache
+            .lock()
+            .get(device_id)
+            .copied()
+            .unwrap_or(23)
     }
 
     fn open_l2cap_channel(

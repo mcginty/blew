@@ -205,10 +205,10 @@ impl<B: CentralBackend> Central<B> {
 
     /// Wait until the adapter is powered on, or return `BlewError::Timeout`.
     pub async fn wait_ready(&self, timeout: std::time::Duration) -> BlewResult<()> {
+        let mut events = self.events();
         if self.backend.is_powered().await.unwrap_or(false) {
             return Ok(());
         }
-        let mut events = self.events();
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());

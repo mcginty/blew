@@ -8,8 +8,10 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ClosedSendChannelException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Per-device GATT operation queue.
@@ -28,8 +30,11 @@ class GattOperationQueue(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val channel = Channel<Task<*>>(capacity = Channel.UNLIMITED)
     private val worker: Job
+    private val taskSeq = AtomicLong(0)
 
     @Volatile private var current: Task<*>? = null
+
+    fun currentNonce(): Long? = current?.nonce
 
     init {
         worker =
@@ -47,13 +52,21 @@ class GattOperationQueue(
         onComplete: (Task<T>) -> Unit = {},
     ): Result<T> {
         val task = Task<T>(name, timeoutMs, kick, onComplete)
-        channel.send(task)
+        try {
+            channel.send(task)
+        } catch (_: ClosedSendChannelException) {
+            return Result.failure(CancellationException("queue closed before $name could be enqueued"))
+        }
         return task.await()
     }
 
     @Suppress("UNCHECKED_CAST")
-    fun <T> completeCurrent(value: T) {
+    fun <T> completeCurrent(
+        nonce: Long,
+        value: T,
+    ) {
         val task = current ?: return
+        if (task.nonce != nonce) return
         (task as Task<T>).complete(value)
     }
 
@@ -75,6 +88,7 @@ class GattOperationQueue(
         private val kick: () -> Boolean,
         private val onComplete: (Task<T>) -> Unit,
     ) {
+        val nonce: Long = taskSeq.getAndIncrement()
         private val deferred = CompletableDeferred<Result<T>>()
 
         suspend fun run() {

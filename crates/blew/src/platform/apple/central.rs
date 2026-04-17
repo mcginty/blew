@@ -637,7 +637,10 @@ impl CentralBackend for AppleCentral {
                 };
 
                 let (tx, rx) = oneshot::channel();
-                handle.inner.connects.insert(device_id, tx);
+                let evicted = handle.inner.connects.insert(device_id, tx);
+                if evicted.is_some() {
+                    warn!(device_id = %id_for_err, "concurrent connect evicted pending waiter");
+                }
 
                 unsafe {
                     peripheral.setDelegate(Some(ProtocolObject::from_ref(&*handle.delegate)));
@@ -732,7 +735,10 @@ impl CentralBackend for AppleCentral {
                     })?;
 
                 let (tx, rx) = oneshot::channel();
-                handle.inner.reads.insert((device_id, char_uuid), tx);
+                let evicted = handle.inner.reads.insert((device_id, char_uuid), tx);
+                if evicted.is_some() {
+                    warn!(%char_uuid, "concurrent read evicted pending waiter");
+                }
                 unsafe { peripheral.readValueForCharacteristic(&characteristic) };
                 rx
                 // peripheral and characteristic drop here, before .await
@@ -801,7 +807,10 @@ impl CentralBackend for AppleCentral {
                 }
 
                 let (tx, rx) = oneshot::channel();
-                handle.inner.writes.insert((device_id, char_uuid), tx);
+                let evicted = handle.inner.writes.insert((device_id, char_uuid), tx);
+                if evicted.is_some() {
+                    warn!(%char_uuid, "concurrent write evicted pending waiter");
+                }
                 unsafe {
                     peripheral.writeValue_forCharacteristic_type(&data, &characteristic, cb_type);
                 };
@@ -875,7 +884,10 @@ impl CentralBackend for AppleCentral {
                     return Err(BlewError::DeviceNotFound(device_id));
                 };
                 let (tx, rx) = oneshot::channel();
-                handle.inner.l2cap_pendings.insert(device_id, tx);
+                let evicted = handle.inner.l2cap_pendings.insert(device_id, tx);
+                if evicted.is_some() {
+                    warn!("concurrent L2CAP open evicted pending waiter");
+                }
                 unsafe { peripheral.openL2CAPChannel(psm.0) };
                 rx
             };
@@ -990,10 +1002,13 @@ impl AppleCentral {
                 })?;
 
             let (tx, rx) = oneshot::channel();
-            handle
+            let evicted = handle
                 .inner
                 .notify_states
                 .insert((device_id, char_uuid), tx);
+            if evicted.is_some() {
+                warn!(%char_uuid, "concurrent notify-state change evicted pending waiter");
+            }
             unsafe { peripheral.setNotifyValue_forCharacteristic(enabled, &characteristic) };
             rx
         };

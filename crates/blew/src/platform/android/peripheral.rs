@@ -1,5 +1,4 @@
 use std::future::Future;
-use std::sync::OnceLock;
 
 use jni::objects::{JObject, JObjectArray};
 use jni::{jni_sig, jni_str};
@@ -28,20 +27,16 @@ struct PeripheralState {
     state_tx: broadcast::Sender<PeripheralStateEvent>,
 }
 
-static STATE: OnceLock<PeripheralState> = OnceLock::new();
-
-fn state() -> &'static PeripheralState {
-    STATE.get().expect("AndroidPeripheral not initialized")
-}
+static STATE: Mutex<Option<PeripheralState>> = Mutex::new(None);
 
 pub(crate) fn send_request(request: PeripheralRequest) {
-    if let Some(s) = STATE.get() {
+    if let Some(s) = STATE.lock().as_ref() {
         let _ = s.request_tx.send(request);
     }
 }
 
 pub(crate) fn send_state_event(event: PeripheralStateEvent) {
-    if let Some(s) = STATE.get() {
+    if let Some(s) = STATE.lock().as_ref() {
         let _ = s.state_tx.send(event);
     }
 }
@@ -70,7 +65,7 @@ impl PeripheralBackend for AndroidPeripheral {
             }
             let (request_tx, request_rx) = mpsc::unbounded_channel();
             let (state_tx, _) = broadcast::channel(64);
-            let _ = STATE.set(PeripheralState {
+            *STATE.lock() = Some(PeripheralState {
                 request_tx,
                 request_rx: Mutex::new(Some(request_rx)),
                 state_tx,
@@ -299,15 +294,21 @@ impl PeripheralBackend for AndroidPeripheral {
     }
 
     fn state_events(&self) -> Self::StateEvents {
-        BroadcastEventStream::new(state().state_tx.subscribe())
+        let receiver = STATE
+            .lock()
+            .as_ref()
+            .expect("AndroidPeripheral not initialized")
+            .state_tx
+            .subscribe();
+        BroadcastEventStream::new(receiver)
     }
 
     fn take_requests(&self) -> Option<Self::Requests> {
-        state()
-            .request_rx
-            .lock()
-            .take()
-            .map(UnboundedReceiverStream::new)
+        let rx = {
+            let guard = STATE.lock();
+            guard.as_ref()?.request_rx.lock().take()
+        };
+        rx.map(UnboundedReceiverStream::new)
     }
 
     fn take_restored(&self) -> Option<Vec<Uuid>> {
