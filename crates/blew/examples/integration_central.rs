@@ -48,7 +48,6 @@ const L2CAP_PAYLOAD_LEN: usize = 1024;
 const SPEEDTEST_BYTES: usize = 1024 * 1024;
 const SPEEDTEST_CHUNK_SIZE: usize = 4096;
 const PROGRESS_YIELD_INTERVAL: usize = 64 * 1024;
-const UPLOAD_PROGRESS_INTERVAL: usize = 64 * 1024;
 const CMD_ECHO: u8 = 0x01;
 const CMD_UPLOAD: u8 = 0x02;
 const CMD_DOWNLOAD: u8 = 0x03;
@@ -68,7 +67,8 @@ async fn write_command_header(
 }
 
 fn speed_kib_per_s(bytes: usize, elapsed: Duration) -> f64 {
-    (bytes as f64 / 1024.0) / elapsed.as_secs_f64()
+    let bytes = u32::try_from(bytes).expect("speedtest byte count fits in u32");
+    (f64::from(bytes) / 1024.0) / elapsed.as_secs_f64()
 }
 
 fn print_speed(label: &str, bytes: usize, elapsed: Duration) {
@@ -84,7 +84,8 @@ fn print_speed(label: &str, bytes: usize, elapsed: Duration) {
 
 fn live_speed_label(label: &str, bytes: usize, start: Instant) -> String {
     let elapsed = start.elapsed().as_secs_f64().max(0.001);
-    let mib_per_s = bytes as f64 / (1024.0 * 1024.0) / elapsed;
+    let bytes = u32::try_from(bytes).expect("speedtest byte count fits in u32");
+    let mib_per_s = f64::from(bytes) / (1024.0 * 1024.0) / elapsed;
     format!("{label} ({mib_per_s:.2} MiB/s)")
 }
 
@@ -292,6 +293,7 @@ async fn main() -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let central: Central = Central::new().await?;
     let mut events = central.events();
@@ -421,7 +423,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     psm_pb.finish_with_message("l2cap: channel open");
 
     let echo_pb = spinner("l2cap echo: 1 KiB round-trip");
-    let payload: Vec<u8> = (0..L2CAP_PAYLOAD_LEN).map(|i| (i & 0xff) as u8).collect();
+    let payload: Vec<u8> = (0..L2CAP_PAYLOAD_LEN)
+        .map(|i| u8::try_from(i & 0xff).expect("masked payload byte fits in u8"))
+        .collect();
     timeout(OP_TIMEOUT, run_echo(&mut ch, &payload))
         .await
         .map_err(|_| "L2CAP echo timeout")??;
