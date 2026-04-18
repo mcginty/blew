@@ -10,6 +10,7 @@ keywords = ["bluetooth", "ble", "gatt", "l2cap"]
 categories = ["hardware-support", "network-programming"]
 include = [
     "src/**/*.rs",
+    "examples/**/*.rs",
     "Cargo.toml",
     "LICENSE",
     "README.md",
