@@ -11,9 +11,8 @@ A cross-platform BLE (Bluetooth Low Energy) library for Rust, providing both Cen
 ## Project goals
 
 - L2CAP is a first-class transport, not an edge feature.
-- `blew` is expected to run with as many concurrent L2CAP channels as the device and OS will allow.
-- Favor architectures that scale with many simultaneous L2CAP channels. In particular, do not assume a per-channel worker thread model is an acceptable long-term Apple design just because it is simpler.
-- When choosing between short-term fixes and long-term architecture, bias toward backend-owned transport abstractions with explicit shutdown and shared event-loop/reactor designs over generic hooks or per-connection thread ownership.
+- Designed to run with as many concurrent L2CAP channels as the device and OS will allow.
+- Backend-owned transports with explicit close/shutdown. Shared event-loop / reactor threads (Apple `L2capReactor`, Linux BlueZ, Android Kotlin coroutines) instead of per-channel worker threads. When a short-term fix is tempting, bias toward the reactor-shaped architecture anyway.
 
 ## Commands
 
@@ -36,6 +35,11 @@ cargo run --example advertise -p blew    # advertise GATT service
 - Don't add features, refactor, or "improve" code beyond what was asked.
 - Clippy pedantic is enabled (`pedantic = "warn"` in blew). Fix warnings, don't suppress them unless there's a good reason.
 - Test with nextest: `cargo nextest run --workspace`.
+- **Update `CHANGELOG.md` alongside user-visible changes.** New entries go under
+  `## [Unreleased]` (creating that heading if missing) in the `Added` / `Changed` /
+  `Removed` / `Fixed` buckets. Breaking changes must also include a before/after
+  snippet in the upgrade guide at the bottom of the file. Pure-internal refactors
+  that don't alter public API or observable behavior can skip the changelog.
 
 ## Key dependencies
 
@@ -53,12 +57,12 @@ crates/blew/src/
 ├── lib.rs                        # pub use re-exports; top-level doc example
 ├── error.rs                      # BlewError (typed enum), BlewResult<T>
 ├── types.rs                      # DeviceId (Display + as_str()), BleDevice
+├── testing.rs                    # In-memory mock backends (feature = "testing")
 ├── gatt/
 │   ├── props.rs                  # CharacteristicProperties, AttributePermissions (bitflags)
 │   └── service.rs                # GattService, GattCharacteristic, GattDescriptor
 ├── central/
 │   ├── mod.rs                    # Central<B>  (default B = PlatformCentral)
-│   │                             #   + CentralEvents<S> wrapper type
 │   ├── types.rs                  # CentralEvent, ScanFilter, WriteType
 │   └── backend.rs                # CentralBackend sealed trait (RPITIT, no async_trait)
 ├── peripheral/
@@ -68,31 +72,34 @@ crates/blew/src/
 │   │                             #   ReadResponder, WriteResponder, AdvertisingConfig
 │   └── backend.rs                # PeripheralBackend sealed trait
 ├── l2cap/
-│   ├── mod.rs                    # L2capChannel stub (AsyncRead + AsyncWrite)
+│   ├── mod.rs                    # L2capChannel (AsyncRead + AsyncWrite) with close hook
 │   └── types.rs                  # Psm(u16) newtype
 ├── platform/
 │   ├── mod.rs                    # #[cfg] type aliases: PlatformCentral, PlatformPeripheral
 │   ├── apple/
 │   │   ├── central.rs            # AppleCentral — full CoreBluetooth implementation
-│   │   └── peripheral.rs         # ApplePeripheral — full CoreBluetooth implementation
+│   │   ├── peripheral.rs         # ApplePeripheral — full CoreBluetooth implementation
+│   │   └── l2cap.rs              # L2capReactor — single-thread NSRunLoop for all channels
 │   ├── linux/
 │   │   ├── central.rs            # LinuxCentral — full bluer/BlueZ implementation
-│   │   └── peripheral.rs         # LinuxPeripheral — full bluer/BlueZ implementation
+│   │   ├── peripheral.rs         # LinuxPeripheral — full bluer/BlueZ implementation
+│   │   └── l2cap.rs              # bluer::l2cap::Stream → L2capChannel bridge
 │   └── android/
 │       ├── mod.rs                # Exports + init_jvm re-export
 │       ├── jni_globals.rs        # OnceLock<JavaVM>, init_jvm(), jvm()
 │       ├── central.rs            # AndroidCentral — JNI bridge to BleCentralManager.kt
 │       ├── peripheral.rs         # AndroidPeripheral — JNI bridge to BlePeripheralManager.kt
+│       ├── l2cap_state.rs        # Global L2CAP channel map + JNI data-path bridges
 │       └── jni_hooks.rs          # #[unsafe(no_mangle)] extern "C" JNI callbacks
+└── util/
+    ├── event_stream.rs           # EventStream<T,S> + BroadcastEventStream<T> (lag-swallowing)
+    └── request_map.rs            # RequestMap<V> / KeyedRequestMap<K,V>
+
 crates/blew/android/                  # Co-located Kotlin/Gradle module for the Android backend
 ├── src/main/java/org/jakebot/blew/   # BleCentralManager.kt, BlePeripheralManager.kt,
 │                                     #   GattOperationQueue.kt, L2capSocketManager.kt,
 │                                     #   BlewPlugin.kt (Tauri entry point)
 └── AndroidManifest.xml               # Runtime permission declarations (merged into host app)
-├── testing.rs                    # In-memory mock backends (feature = "testing")
-└── util/
-    ├── event_stream.rs           # EventStream<T,S> + BroadcastEventStream<T> (lag-swallowing)
-    └── request_map.rs            # RequestMap<V> — thread-safe pending request/response coupling
 ```
 
 ## Public API pattern
@@ -151,11 +158,50 @@ rx.await...
 - `use objc2::DefinedClass` — provides `ivars()` inside `define_class!` method bodies.
 - Both imports are required; missing either gives "no method found" errors.
 
-**Split peripheral events.** State updates (adapter power, subscription changes) are `Clone` and fan out through a `tokio::sync::broadcast` channel via `state_events()`. GATT requests (reads/writes) carry RAII `ReadResponder`/`WriteResponder` handles and must be owned by a single consumer; `take_requests()` hands out the `mpsc::UnboundedReceiver` and returns `None` on the second call. The broadcast side runs behind `parking_lot::Mutex` for fast, poison-free synchronization.
+**RAII responders:** `peripheralManager:didReceiveReadRequest:` and `didReceiveWriteRequests:` build a `ReadResponder`/`WriteResponder` (backed by an `oneshot::Sender`), emit a `PeripheralRequest` on the `mpsc::UnboundedSender` handed out by `take_requests()`, then spawn a task (via `inner.runtime.spawn()`) that awaits the oneshot and calls `respondToRequest:withResult:`. The spawn uses the captured `Handle` because GCD callbacks run outside the Tokio runtime context — bare `tokio::spawn` would panic. All Rust-side synchronization uses `parking_lot::Mutex` (poison-free, faster than `std::sync::Mutex`).
 
-**RAII responders:** `peripheralManager:didReceiveReadRequest:` and `didReceiveWriteRequests:` build a `ReadResponder`/`WriteResponder` (backed by an `oneshot::Sender`), emit a `PeripheralRequest`, then spawn a task (via `inner.runtime.spawn()`) that awaits the oneshot and calls `respondToRequest:withResult:`. The spawn uses the captured `Handle` because GCD callbacks run outside the Tokio runtime context — bare `tokio::spawn` would panic.
+**L2CAP reactor** (`platform/apple/l2cap.rs`): one dedicated OS thread owns an `NSRunLoop` and all `NSInputStream`/`NSOutputStream` objects. Channels register via `ReactorCmd::Register { id, channel_ref, input, output, inbound_tx }`, writes go via `ReactorCmd::Write`, close via `ReactorCmd::Close`. Bytes flow Reactor→App through `mpsc::UnboundedSender<Vec<u8>>`; App→Reactor through a `tokio::io::duplex` + outbound bridge task. No per-channel threads.
 
-**L2CAP direction:** Apple stream objects are thread-affine enough that L2CAP transport ownership must stay explicit. For short-term debugging it is acceptable to use a per-channel worker thread, but the intended architecture for this codebase is a backend-owned L2CAP transport with explicit close/shutdown and a shared run-loop/reactor thread capable of servicing many concurrent channels efficiently.
+**L2CAP close invariant:** exactly one `ReactorCmd::Close` per channel. `DuplexTransport::trigger_close` uses `Option::take` on the close hook so `.close().await` and `Drop` both route to the same single-fire path. **Do not** add defensive `ReactorCmd::Close` sends from the bridge tasks — the hook is the only sender.
+
+**L2CAP accept channel policy:**
+- Apple: `mpsc::unbounded_channel()`. Blocking the GCD delegate queue on `blocking_send` would stall every subsequent CB callback (disconnects, restore, etc.).
+- Android: `mpsc::unbounded_channel()`. `try_send` on a bounded channel would silently drop incoming L2CAP connections.
+- Linux: `mpsc::channel(16)` + `send().await`. Backpressure flows into BlueZ's kernel-side socket accept queue, which is the right place to cap.
+
+## Event fan-out convention
+
+All Central event streams and Peripheral `state_events()` streams use
+`tokio::sync::broadcast::channel(256)` wrapped in `util::BroadcastEventStream`.
+The wrapper silently drops `Lagged(n)` errors so slow subscribers miss events
+but stay connected. Don't introduce new custom fan-out utilities — use
+`broadcast::Sender` directly (it's `Clone + Sync`; no external `Mutex` needed).
+
+Buffer depth is 256 across every role/backend; keep it uniform unless there's
+a specific reason to diverge. Backend-emitted `send()` calls should be
+`let _ = tx.send(event);` because broadcast returns `Err(SendError)` when
+there are zero subscribers (normal at startup and for apps that don't need events).
+
+## iOS state restoration (Apple-only surface)
+
+`Central::take_restored()` and `Peripheral::take_restored()` are **not** on the
+sealed `CentralBackend` / `PeripheralBackend` traits. They live as inherent
+methods on Apple-only `impl` blocks:
+
+```rust
+#[cfg(target_vendor = "apple")]
+impl Peripheral { pub fn take_restored(&self) -> Option<Vec<Uuid>> { … } }
+```
+
+Mocks get their own `impl Peripheral<MockPeripheral>` block in `testing.rs`.
+Non-Apple backends have no stub method. Any code that calls `take_restored()`
+on a shared cross-platform path must `#[cfg(target_vendor = "apple")]`-gate the
+call. `restore_identifier` on `PeripheralConfig` / `CentralConfig` remains
+cross-platform (inert on non-Apple) so `with_config` can be called unconditionally.
+
+Android has no `willRestoreState:` equivalent. If background scan survival
+becomes a requirement, the natural surface is a separate `PendingIntent`-backed
+API (see Android's BLE background guide), **not** an extension of `take_restored`.
 
 ## CoreBluetooth rules that cause crashes
 
