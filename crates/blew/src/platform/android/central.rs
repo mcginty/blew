@@ -5,8 +5,7 @@ use std::sync::OnceLock;
 use jni::objects::{JObject, JObjectArray};
 use jni::{jni_sig, jni_str};
 use parking_lot::Mutex;
-use tokio::sync::oneshot;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::{broadcast, oneshot};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -17,14 +16,13 @@ use crate::gatt::props::CharacteristicProperties;
 use crate::gatt::service::{GattCharacteristic, GattService};
 use crate::l2cap::{L2capChannel, types::Psm};
 use crate::types::{BleDevice, DeviceId};
-use crate::util::event_fanout::{EventFanout, EventFanoutTx};
+use crate::util::BroadcastEventStream;
 use crate::util::request_map::RequestMap;
 
 use super::jni_globals::{central_class, jvm};
 
 struct CentralState {
-    event_fanout_tx: EventFanoutTx<CentralEvent>,
-    event_fanout: Mutex<EventFanout<CentralEvent>>,
+    event_tx: broadcast::Sender<CentralEvent>,
     pending_ops: RequestMap<oneshot::Sender<BlewResult<Vec<u8>>>>,
     pending_connects: RequestMap<oneshot::Sender<BlewResult<()>>>,
     connect_keys: Mutex<HashMap<String, u64>>,
@@ -42,10 +40,9 @@ fn state() -> &'static CentralState {
 }
 
 fn init_statics() {
-    let (tx, fanout) = EventFanout::new(64);
+    let (event_tx, _) = broadcast::channel(256);
     let _ = STATE.set(CentralState {
-        event_fanout_tx: tx,
-        event_fanout: Mutex::new(fanout),
+        event_tx,
         pending_ops: RequestMap::new(),
         pending_connects: RequestMap::new(),
         connect_keys: Mutex::new(HashMap::new()),
@@ -60,7 +57,7 @@ fn init_statics() {
 
 pub(crate) fn send_event(event: CentralEvent) {
     if let Some(s) = STATE.get() {
-        s.event_fanout_tx.send(event);
+        let _ = s.event_tx.send(event);
     }
 }
 
@@ -216,13 +213,16 @@ impl AndroidCentral {
 impl backend::private::Sealed for AndroidCentral {}
 
 impl CentralBackend for AndroidCentral {
-    type EventStream = ReceiverStream<CentralEvent>;
+    type EventStream = BroadcastEventStream<CentralEvent>;
 
     fn new() -> impl Future<Output = BlewResult<Self>> + Send
     where
         Self: Sized,
     {
         async {
+            if !super::are_ble_permissions_granted() {
+                return Err(BlewError::PermissionDenied);
+            }
             init_statics();
             debug!("AndroidCentral initialized");
             Ok(AndroidCentral)
@@ -305,6 +305,7 @@ impl CentralBackend for AndroidCentral {
 
     fn connect(&self, device_id: &DeviceId) -> impl Future<Output = BlewResult<()>> + Send {
         let addr = device_id.as_str().to_owned();
+        let id_for_err = device_id.clone();
         async move {
             let (tx, rx) = oneshot::channel();
 
@@ -326,7 +327,7 @@ impl CentralBackend for AndroidCentral {
                 .map_err(jni_err)?;
 
             rx.await
-                .map_err(|_| BlewError::Internal("connect cancelled".into()))?
+                .map_err(|_| BlewError::DisconnectedDuringOperation(id_for_err))?
         }
     }
 
@@ -383,7 +384,7 @@ impl CentralBackend for AndroidCentral {
             }
 
             rx.await
-                .map_err(|_| BlewError::Internal("discover_services cancelled".into()))?
+                .map_err(|_| BlewError::DisconnectedDuringOperation(did))?
         }
     }
 
@@ -424,7 +425,7 @@ impl CentralBackend for AndroidCentral {
             }
 
             rx.await
-                .map_err(|_| BlewError::Internal("read cancelled".into()))?
+                .map_err(|_| BlewError::DisconnectedDuringOperation(did))?
         }
     }
 
@@ -488,7 +489,7 @@ impl CentralBackend for AndroidCentral {
 
             if let Some(rx) = rx {
                 rx.await
-                    .map_err(|_| BlewError::Internal("write cancelled".into()))??;
+                    .map_err(|_| BlewError::DisconnectedDuringOperation(did))??;
             }
 
             Ok(())
@@ -575,6 +576,7 @@ impl CentralBackend for AndroidCentral {
         psm: Psm,
     ) -> impl Future<Output = BlewResult<L2capChannel>> + Send {
         let addr = device_id.as_str().to_owned();
+        let id_for_err = device_id.clone();
         async move {
             let (tx, rx) = oneshot::channel();
             super::l2cap_state::set_pending_open(addr.clone(), tx);
@@ -593,13 +595,12 @@ impl CentralBackend for AndroidCentral {
                 .map_err(jni_err)?;
 
             rx.await
-                .map_err(|_| BlewError::Internal("L2CAP open cancelled".into()))?
+                .map_err(|_| BlewError::DisconnectedDuringOperation(id_for_err))?
         }
     }
 
     fn events(&self) -> Self::EventStream {
-        let rx = state().event_fanout.lock().subscribe(256);
-        ReceiverStream::new(rx)
+        BroadcastEventStream::new(state().event_tx.subscribe())
     }
 }
 

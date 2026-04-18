@@ -2,12 +2,21 @@ use crate::types::DeviceId;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-/// Events emitted by the peripheral (advertiser/GATT server) role.
-///
-/// `PeripheralEvent` is intentionally **not** `Clone`: [`ReadRequest`] and [`WriteRequest`]
-/// carry owned responder handles that must be consumed exactly once.
-#[derive(Debug)]
-pub enum PeripheralEvent {
+/// Configuration for initialising the peripheral role.
+#[derive(Debug, Clone, Default)]
+pub struct PeripheralConfig {
+    /// On Apple platforms, passed as `CBPeripheralManagerOptionRestoreIdentifierKey` to
+    /// `initWithDelegate:queue:options:`, enabling state restoration for the app's
+    /// background BLE peripheral session. Ignored on all other platforms.
+    ///
+    /// See the crate-level "State restoration" docs for the iOS usage contract
+    /// (entitlements, event-drain rules, L2CAP re-open requirement).
+    pub restore_identifier: Option<String>,
+}
+
+/// Non-request events from the peripheral role. Clone-able; multiple subscribers welcome.
+#[derive(Debug, Clone)]
+pub enum PeripheralStateEvent {
     /// The local Bluetooth adapter was powered on or off.
     AdapterStateChanged { powered: bool },
 
@@ -17,11 +26,18 @@ pub enum PeripheralEvent {
         char_uuid: Uuid,
         subscribed: bool,
     },
+}
 
+/// Inbound GATT requests from remote centrals.
+///
+/// Each variant carries an owned responder that must be consumed exactly once,
+/// or dropped (which sends an ATT Application Error automatically). Single-consumer:
+/// the request stream is handed out via
+/// [`Peripheral::take_requests`](crate::peripheral::Peripheral::take_requests).
+#[derive(Debug)]
+pub enum PeripheralRequest {
     /// A remote central sent an ATT Read Request.
-    /// Consume `responder` to send the value; dropping it without responding sends an
-    /// ATT Application Error automatically.
-    ReadRequest {
+    Read {
         client_id: DeviceId,
         service_uuid: Uuid,
         char_uuid: Uuid,
@@ -32,7 +48,7 @@ pub enum PeripheralEvent {
     /// A remote central sent an ATT Write Request or Write Command.
     /// `responder` is `Some` for Write Request (needs an ATT response) and
     /// `None` for Write Without Response.
-    WriteRequest {
+    Write {
         client_id: DeviceId,
         service_uuid: Uuid,
         char_uuid: Uuid,
@@ -82,7 +98,6 @@ impl<T: Send + Clone + 'static> Drop for ResponderInner<T> {
 pub struct ReadResponder(ResponderInner<Result<Vec<u8>, ()>>);
 
 impl ReadResponder {
-    #[allow(dead_code)]
     pub(crate) fn new(tx: ReadResponseTx) -> Self {
         Self(ResponderInner::new(tx, Err(())))
     }
@@ -106,7 +121,6 @@ impl ReadResponder {
 pub struct WriteResponder(ResponderInner<bool>);
 
 impl WriteResponder {
-    #[allow(dead_code)]
     pub(crate) fn new(tx: WriteResponseTx) -> Self {
         Self(ResponderInner::new(tx, false))
     }
@@ -141,34 +155,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_responder_error() {
-        let (tx, rx) = oneshot::channel();
-        let responder = ReadResponder::new(tx);
-        responder.error();
-        assert!(rx.await.unwrap().is_err());
-    }
-
-    #[tokio::test]
-    async fn test_read_responder_drop_sends_error() {
-        let (tx, rx) = oneshot::channel();
-        {
-            let _responder = ReadResponder::new(tx);
-        }
-        assert!(
-            rx.await.unwrap().is_err(),
-            "drop must send error automatically"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_read_responder_respond_empty() {
-        let (tx, rx) = oneshot::channel();
-        let responder = ReadResponder::new(tx);
-        responder.respond(vec![]);
-        assert_eq!(rx.await.unwrap().unwrap(), Vec::<u8>::new());
-    }
-
-    #[tokio::test]
     async fn test_write_responder_success() {
         let (tx, rx) = oneshot::channel();
         let responder = WriteResponder::new(tx);
@@ -176,37 +162,97 @@ mod tests {
         assert!(rx.await.unwrap());
     }
 
-    #[tokio::test]
-    async fn test_write_responder_error() {
-        let (tx, rx) = oneshot::channel();
-        let responder = WriteResponder::new(tx);
-        responder.error();
-        assert!(!rx.await.unwrap());
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+
+    #[derive(Debug, Clone)]
+    enum ReadAction {
+        Drop,
+        Respond(Vec<u8>),
+        Error,
     }
 
-    #[tokio::test]
-    async fn test_write_responder_drop_sends_error() {
-        let (tx, rx) = oneshot::channel();
-        {
-            let _responder = WriteResponder::new(tx);
+    fn read_action() -> impl Strategy<Value = ReadAction> {
+        prop_oneof![
+            Just(ReadAction::Drop),
+            vec(any::<u8>(), 0..32).prop_map(ReadAction::Respond),
+            Just(ReadAction::Error),
+        ]
+    }
+
+    #[derive(Debug, Clone)]
+    enum WriteAction {
+        Drop,
+        Success,
+        Error,
+    }
+
+    fn write_action() -> impl Strategy<Value = WriteAction> {
+        prop_oneof![
+            Just(WriteAction::Drop),
+            Just(WriteAction::Success),
+            Just(WriteAction::Error),
+        ]
+    }
+
+    proptest! {
+        /// For any `ReadResponder` action (respond / error / drop), the receiver
+        /// observes exactly one value with the correct polarity. Drop is
+        /// equivalent to `error()`.
+        #[test]
+        fn read_responder_value_matches_action(actions in vec(read_action(), 0..64)) {
+            for action in actions {
+                let (tx, mut rx) = oneshot::channel::<Result<Vec<u8>, ()>>();
+                let responder = ReadResponder::new(tx);
+                let expected: Result<Vec<u8>, ()> = match action {
+                    ReadAction::Drop => {
+                        drop(responder);
+                        Err(())
+                    }
+                    ReadAction::Respond(v) => {
+                        let expected = Ok(v.clone());
+                        responder.respond(v);
+                        expected
+                    }
+                    ReadAction::Error => {
+                        responder.error();
+                        Err(())
+                    }
+                };
+                let got = rx
+                    .try_recv()
+                    .expect("responder must deliver a value synchronously");
+                prop_assert_eq!(got, expected);
+            }
         }
-        assert!(!rx.await.unwrap(), "drop must send false");
-    }
-    #[tokio::test]
-    async fn test_read_responder_consumed_once() {
-        let (tx, rx) = oneshot::channel();
-        let responder = ReadResponder::new(tx);
-        responder.respond(b"data".to_vec());
-        let result = rx.await.unwrap();
-        assert!(result.is_ok());
-    }
 
-    #[tokio::test]
-    async fn test_write_responder_consumed_once() {
-        let (tx, rx) = oneshot::channel();
-        let responder = WriteResponder::new(tx);
-        responder.success();
-        let result = rx.await.unwrap();
-        assert!(result);
+        /// For any `WriteResponder` action (success / error / drop), the receiver
+        /// observes exactly one `bool` with the correct polarity. Drop is
+        /// equivalent to `error()` (both deliver `false`).
+        #[test]
+        fn write_responder_value_matches_action(actions in vec(write_action(), 0..64)) {
+            for action in actions {
+                let (tx, mut rx) = oneshot::channel::<bool>();
+                let responder = WriteResponder::new(tx);
+                let expected = match action {
+                    WriteAction::Drop => {
+                        drop(responder);
+                        false
+                    }
+                    WriteAction::Success => {
+                        responder.success();
+                        true
+                    }
+                    WriteAction::Error => {
+                        responder.error();
+                        false
+                    }
+                };
+                let got = rx
+                    .try_recv()
+                    .expect("responder must deliver a value synchronously");
+                prop_assert_eq!(got, expected);
+            }
+        }
     }
 }

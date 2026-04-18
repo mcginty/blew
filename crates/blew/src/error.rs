@@ -16,6 +16,9 @@ pub enum BlewError {
     #[error("Bluetooth adapter is not powered on")]
     NotPowered,
 
+    #[error("required Android BLE permissions are not granted")]
+    PermissionDenied,
+
     #[error("device not found: {0}")]
     DeviceNotFound(DeviceId),
 
@@ -39,6 +42,24 @@ pub enum BlewError {
 
     #[error("GATT busy on device {0} (another operation in flight)")]
     GattBusy(DeviceId),
+
+    #[error("value too large for current MTU: got {got} bytes, max {max}")]
+    ValueTooLarge { got: usize, max: usize },
+
+    #[error("already subscribed to characteristic {char_uuid} on {device_id}")]
+    AlreadySubscribed {
+        device_id: DeviceId,
+        char_uuid: Uuid,
+    },
+
+    #[error("event stream closed unexpectedly")]
+    StreamClosed,
+
+    #[error("device {0} disconnected during operation")]
+    DisconnectedDuringOperation(DeviceId),
+
+    #[error("GATT discovery failed on {device_id}: {reason}")]
+    DiscoveryFailed { device_id: DeviceId, reason: String },
 
     #[error("GATT error on device {device_id}: {source}")]
     Gatt {

@@ -8,6 +8,13 @@ description = "Cross-platform async BLE library for Rust (Apple, Linux, Android)
 repository = "https://github.com/mcginty/blew"
 keywords = ["bluetooth", "ble", "gatt", "l2cap"]
 categories = ["hardware-support", "network-programming"]
+include = [
+    "src/**/*.rs",
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+    "android/**/*",
+]
 
 [features]
 testing = []
@@ -30,18 +37,21 @@ bytes = "1"
 parking_lot = "0.12"
 
 [dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = [
     "NSData",
+    "NSDate",
     "NSString",
     "NSUUID",
     "NSArray",
     "NSDictionary",
     "NSObject",
     "NSError",
+    "NSRunLoop",
     "NSValue",
     "NSStream",
 ] }

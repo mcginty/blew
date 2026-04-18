@@ -1,7 +1,10 @@
 pub mod backend;
 pub mod types;
 
-pub use types::{AdvertisingConfig, PeripheralEvent, ReadResponder, WriteResponder};
+pub use types::{
+    AdvertisingConfig, PeripheralConfig, PeripheralRequest, PeripheralStateEvent, ReadResponder,
+    WriteResponder,
+};
 
 use crate::error::{BlewError, BlewResult};
 use crate::gatt::service::GattService;
@@ -11,6 +14,28 @@ use crate::types::DeviceId;
 use crate::util::event_stream::EventStream;
 use backend::PeripheralBackend;
 use uuid::Uuid;
+
+impl Peripheral {
+    /// Initialise the peripheral role with the given configuration.
+    ///
+    /// On Apple platforms this wires `CBPeripheralManagerOptionRestoreIdentifierKey` when
+    /// `config.restore_identifier` is `Some`. On all other platforms the config is ignored.
+    ///
+    /// When `restore_identifier` is set, this must be called synchronously from
+    /// `application:didFinishLaunchingWithOptions:` with the same identifier as the
+    /// previous launch. Immediately after it returns, call [`Self::take_restored`] to
+    /// recover any preserved service UUIDs — the OS re-registers those services on the
+    /// manager for you, so racing `add_service` against the restored list can produce
+    /// duplicate-service errors.
+    ///
+    /// See the crate-level [`State restoration`](crate#state-restoration) docs for the
+    /// full iOS contract (entitlements, L2CAP re-open requirement, background runtime
+    /// constraints).
+    pub async fn with_config(config: PeripheralConfig) -> BlewResult<Self> {
+        let backend = PlatformPeripheral::with_config(config).await?;
+        Ok(Self { backend })
+    }
+}
 
 /// BLE peripheral (server in bluetooth-speak) role: advertiser, GATT server, L2CAP listener.
 ///
@@ -27,8 +52,6 @@ use uuid::Uuid;
 /// ```
 pub struct Peripheral<B: PeripheralBackend = PlatformPeripheral> {
     pub(crate) backend: B,
-    #[cfg(debug_assertions)]
-    pub(crate) events_taken: std::sync::atomic::AtomicBool,
 }
 
 impl<B: PeripheralBackend> Peripheral<B> {
@@ -36,8 +59,6 @@ impl<B: PeripheralBackend> Peripheral<B> {
     pub async fn new() -> BlewResult<Self> {
         Ok(Self {
             backend: B::new().await?,
-            #[cfg(debug_assertions)]
-            events_taken: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -87,45 +108,26 @@ impl<B: PeripheralBackend> Peripheral<B> {
         self.backend.l2cap_listener().await
     }
 
-    /// Returns the peripheral event stream.
-    ///
-    /// # Single-consumer contract
-    ///
-    /// [`PeripheralEvent`] is `!Clone` because it carries RAII
-    /// [`ReadResponder`]/[`WriteResponder`] handles. Because of that, this
-    /// method is **single-consumer**: calling it a second time replaces the
-    /// internal sender and silently steals the stream from the previous
-    /// caller. Debug builds will panic on the second call to catch this
-    /// early; release builds will not.
-    pub fn events(&self) -> EventStream<PeripheralEvent, B::EventStream> {
-        #[cfg(debug_assertions)]
-        {
-            let was_taken = self
-                .events_taken
-                .swap(true, std::sync::atomic::Ordering::SeqCst);
-            assert!(
-                !was_taken,
-                "Peripheral::events() called more than once — this is not \
-                 supported (single-consumer contract); PeripheralEvent is !Clone \
-                 and a second call would silently steal the stream"
-            );
-        }
-        self.events_inner()
+    /// Subscribe to clone-able peripheral state events (adapter power, subscription changes).
+    /// Each call returns an independent stream; fan-out is safe.
+    pub fn state_events(&self) -> EventStream<PeripheralStateEvent, B::StateEvents> {
+        EventStream::new(self.backend.state_events())
     }
 
-    fn events_inner(&self) -> EventStream<PeripheralEvent, B::EventStream> {
-        EventStream::new(self.backend.events())
+    /// Take ownership of the inbound GATT request stream. Returns `None` on the second call.
+    ///
+    /// [`PeripheralRequest`] carries RAII [`ReadResponder`]/[`WriteResponder`] handles and
+    /// must be consumed by exactly one reader; this method enforces that at the type level.
+    pub fn take_requests(&self) -> Option<EventStream<PeripheralRequest, B::Requests>> {
+        self.backend.take_requests().map(EventStream::new)
     }
 
     /// Wait until the adapter is powered on, or return `BlewError::Timeout`.
     pub async fn wait_ready(&self, timeout: std::time::Duration) -> BlewResult<()> {
+        let mut events = self.state_events();
         if self.backend.is_powered().await.unwrap_or(false) {
             return Ok(());
         }
-        // Uses events_inner() to bypass the single-consumer check since
-        // wait_ready is an internal operation; calling it should not "use up"
-        // the caller's one allowed events() call.
-        let mut events = self.events_inner();
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -135,21 +137,50 @@ impl<B: PeripheralBackend> Peripheral<B> {
             match tokio::time::timeout(remaining, tokio_stream::StreamExt::next(&mut events)).await
             {
                 Err(_) => return Err(BlewError::Timeout),
-                Ok(None) => return Err(BlewError::Internal("adapter event stream closed".into())),
-                Ok(Some(PeripheralEvent::AdapterStateChanged { powered: true })) => return Ok(()),
+                Ok(None) => return Err(BlewError::StreamClosed),
+                Ok(Some(PeripheralStateEvent::AdapterStateChanged { powered: true })) => {
+                    return Ok(());
+                }
                 Ok(Some(_)) => {}
             }
         }
     }
 }
 
-#[cfg(all(test, feature = "testing", debug_assertions))]
-mod single_consumer_test {
-    #[test]
-    #[should_panic(expected = "single-consumer contract")]
-    fn events_twice_panics_in_debug() {
+#[cfg(target_vendor = "apple")]
+impl Peripheral {
+    /// Consume the OS-level state-restoration payload, if any.
+    ///
+    /// On iOS, when [`Peripheral::with_config`] was called with a `restore_identifier` and
+    /// the OS is relaunching the app, the `CBPeripheralManager` delegate's
+    /// `willRestoreState:` callback fires during initialisation. `with_config` captures
+    /// that payload and buffers the preserved service UUIDs here; this method hands
+    /// them to the caller exactly once.
+    ///
+    /// Returns:
+    /// - `Some(uuids)` — this launch is an OS-level restoration and `uuids` lists the
+    ///   services the OS re-registered on the manager. The app does **not** need to
+    ///   re-call [`add_service`](Self::add_service) for these. If advertising was active
+    ///   at termination it resumes automatically.
+    /// - `None` — not a restoration launch, or the restored state has already been taken.
+    ///
+    /// **L2CAP channels are never restored.** If the previous session had one open, the
+    /// peripheral must re-publish via [`l2cap_listener`](Self::l2cap_listener).
+    ///
+    /// See the crate-level [`State restoration`](crate#state-restoration) docs for why
+    /// this is a `take_*` style API (the event fires before subscribers can attach).
+    #[must_use]
+    pub fn take_restored(&self) -> Option<Vec<Uuid>> {
+        self.backend.take_restored()
+    }
+}
+
+#[cfg(all(test, feature = "testing"))]
+mod take_requests_tests {
+    #[tokio::test]
+    async fn second_take_returns_none() {
         let p = crate::testing::MockPeripheral::new_powered();
-        let _ev1 = p.events();
-        let _ev2 = p.events();
+        assert!(p.take_requests().is_some());
+        assert!(p.take_requests().is_none());
     }
 }

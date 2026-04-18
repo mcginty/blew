@@ -30,7 +30,7 @@ const L2CAP_READ_BUF_SIZE: usize = 4096;
 struct L2capState {
     pending_server: Mutex<Option<oneshot::Sender<BlewResult<Psm>>>>,
     pending_open: Mutex<HashMap<String, oneshot::Sender<BlewResult<L2capChannel>>>>,
-    accept_tx: Mutex<Option<mpsc::Sender<BlewResult<(DeviceId, L2capChannel)>>>>,
+    accept_tx: Mutex<Option<mpsc::UnboundedSender<BlewResult<(DeviceId, L2capChannel)>>>>,
     data_tx: Mutex<HashMap<i32, mpsc::UnboundedSender<Vec<u8>>>>,
 }
 
@@ -67,12 +67,29 @@ pub(crate) fn complete_server_open(result: BlewResult<Psm>) {
     }
 }
 
-pub(crate) fn set_accept_tx(tx: mpsc::Sender<BlewResult<(DeviceId, L2capChannel)>>) {
+pub(crate) fn set_accept_tx(tx: mpsc::UnboundedSender<BlewResult<(DeviceId, L2capChannel)>>) {
     *state().accept_tx.lock() = Some(tx);
 }
 
 pub(crate) fn set_pending_open(addr: String, tx: oneshot::Sender<BlewResult<L2capChannel>>) {
     state().pending_open.lock().insert(addr, tx);
+}
+
+fn close_socket(socket_id: i32, is_server: bool) {
+    let _ = jvm().attach_current_thread(|env| {
+        let class = if is_server {
+            peripheral_class()
+        } else {
+            central_class()
+        };
+        let _ = env.call_static_method(
+            class,
+            jni_str!("closeL2cap"),
+            jni_sig!("(I)V"),
+            &[socket_id.into()],
+        );
+        Ok::<_, jni::errors::Error>(())
+    });
 }
 
 pub(crate) fn on_channel_opened(device_addr: &str, socket_id: i32, from_server: bool) {
@@ -123,30 +140,22 @@ pub(crate) fn on_channel_opened(device_addr: &str, socket_id: i32, from_server: 
                 }
             }
         }
-        let _ = jvm().attach_current_thread(|env| {
-            let class = if is_server {
-                peripheral_class()
-            } else {
-                central_class()
-            };
-            let _ = env.call_static_method(
-                class,
-                jni_str!("closeL2cap"),
-                jni_sig!("(I)V"),
-                &[socket_id.into()],
-            );
-            Ok::<_, jni::errors::Error>(())
-        });
+        close_socket(socket_id, is_server);
     });
 
-    let channel = L2capChannel::from_duplex(app_half);
+    let channel = L2capChannel::from_duplex_with_close_hook(app_half, move || {
+        close_socket(socket_id, from_server);
+    });
 
     if from_server {
         if let Some(s) = STATE.get() {
             if let Some(tx) = s.accept_tx.lock().as_ref() {
                 let device_id = DeviceId(device_addr.to_string());
-                if tx.try_send(Ok((device_id, channel))).is_err() {
-                    tracing::warn!(socket_id, "L2CAP accept buffer full, dropping channel");
+                if tx.send(Ok((device_id, channel))).is_err() {
+                    tracing::warn!(
+                        socket_id,
+                        "L2CAP accept receiver dropped, discarding channel"
+                    );
                 }
             }
         }

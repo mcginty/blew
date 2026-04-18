@@ -7,12 +7,10 @@
 use std::collections::BTreeSet;
 
 const JNI_HOOKS_RS: &str = include_str!("../src/platform/android/jni_hooks.rs");
-const CENTRAL_KT: &str = include_str!(
-    "../../../crates/tauri-plugin-blew/android/src/main/java/org/jakebot/blew/BleCentralManager.kt"
-);
-const PERIPHERAL_KT: &str = include_str!(
-    "../../../crates/tauri-plugin-blew/android/src/main/java/org/jakebot/blew/BlePeripheralManager.kt"
-);
+const CENTRAL_KT: &str =
+    include_str!("../android/src/main/java/org/jakebot/blew/BleCentralManager.kt");
+const PERIPHERAL_KT: &str =
+    include_str!("../android/src/main/java/org/jakebot/blew/BlePeripheralManager.kt");
 
 /// Extract Kotlin `external fun` names from a `.kt` file.
 fn kotlin_external_funs(source: &str) -> BTreeSet<String> {

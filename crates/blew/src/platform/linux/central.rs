@@ -6,24 +6,28 @@ use crate::gatt::service::{GattCharacteristic, GattService};
 use crate::l2cap::{L2capChannel, types::Psm};
 use crate::platform::linux::l2cap::bridge_l2cap;
 use crate::types::{BleDevice, DeviceId};
-use crate::util::event_fanout::{EventFanout, EventFanoutTx};
+use crate::util::BroadcastEventStream;
 use bluer::gatt::CharacteristicFlags;
 use bluer::{Adapter, AdapterEvent, Session};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+use tokio::sync::broadcast;
 use tokio_stream::StreamExt as _;
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
+
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 struct CentralInner {
     _session: Session,
     adapter: Adapter,
     discovered: Mutex<HashMap<DeviceId, BleDevice>>,
-    event_tx: EventFanoutTx<CentralEvent>,
-    event_fanout: EventFanout<CentralEvent>,
+    mtu_cache: Mutex<HashMap<DeviceId, u16>>,
+    event_tx: broadcast::Sender<CentralEvent>,
     scan_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     notify_tasks: Mutex<HashMap<(DeviceId, Uuid), tokio::task::JoinHandle<()>>>,
     adapter_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -45,6 +49,30 @@ impl CentralInner {
             .as_str()
             .parse()
             .map_err(|_| BlewError::DeviceNotFound(device_id.clone()))
+    }
+
+    fn drain_notify_tasks(&self, device_id: &DeviceId) {
+        let mut tasks = self.notify_tasks.lock();
+        let keys: Vec<_> = tasks
+            .keys()
+            .filter(|(did, _)| did == device_id)
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(task) = tasks.remove(&key) {
+                task.abort();
+            }
+        }
+    }
+
+    fn update_mtu(&self, device_id: &DeviceId, mtu: usize) {
+        let mtu =
+            u16::try_from(mtu.clamp(23, usize::from(u16::MAX))).expect("clamped MTU fits in u16");
+        self.mtu_cache.lock().insert(device_id.clone(), mtu);
+    }
+
+    fn clear_mtu(&self, device_id: &DeviceId) {
+        self.mtu_cache.lock().remove(device_id);
     }
 
     async fn find_characteristic(
@@ -112,7 +140,7 @@ fn flags_to_props(flags: &CharacteristicFlags) -> CharacteristicProperties {
 }
 
 impl CentralBackend for LinuxCentral {
-    type EventStream = ReceiverStream<CentralEvent>;
+    type EventStream = BroadcastEventStream<CentralEvent>;
 
     async fn new() -> BlewResult<Self>
     where
@@ -135,13 +163,13 @@ impl CentralBackend for LinuxCentral {
         }
 
         check_bluez_config();
-        let (event_tx, event_fanout) = EventFanout::new(64);
+        let (event_tx, _) = broadcast::channel(256);
         let inner = Arc::new(CentralInner {
             _session: session,
             adapter,
             discovered: Mutex::new(HashMap::new()),
+            mtu_cache: Mutex::new(HashMap::new()),
             event_tx,
-            event_fanout,
             scan_task: Mutex::new(None),
             notify_tasks: Mutex::new(HashMap::new()),
             adapter_task: Mutex::new(None),
@@ -158,13 +186,13 @@ impl CentralBackend for LinuxCentral {
                     event
                 {
                     debug!(powered, "central adapter state changed");
-                    inner_clone
+                    let _ = inner_clone
                         .event_tx
                         .send(CentralEvent::AdapterStateChanged { powered });
                 }
             }
         });
-        *inner.adapter_task.lock().unwrap() = Some(adapter_task);
+        *inner.adapter_task.lock() = Some(adapter_task);
         Ok(LinuxCentral(inner))
     }
 
@@ -224,7 +252,7 @@ impl CentralBackend for LinuxCentral {
             let mut stream = Box::pin(stream);
 
             // Dropping a JoinHandle only detaches; we must abort explicitly.
-            if let Some(old) = handle.scan_task.lock().unwrap().take() {
+            if let Some(old) = handle.scan_task.lock().take() {
                 old.abort();
             }
 
@@ -257,22 +285,23 @@ impl CentralBackend for LinuxCentral {
                             handle
                                 .discovered
                                 .lock()
-                                .unwrap()
                                 .insert(device_id, ble_device.clone());
-                            handle
+                            let _ = handle
                                 .event_tx
                                 .send(CentralEvent::DeviceDiscovered(ble_device));
                         }
                         AdapterEvent::DeviceRemoved(addr) => {
                             let device_id = DeviceId(addr.to_string());
                             debug!(device_id = %device_id, "device removed");
-                            handle.discovered.lock().unwrap().remove(&device_id);
+                            handle.discovered.lock().remove(&device_id);
+                            handle.clear_mtu(&device_id);
+                            handle.drain_notify_tasks(&device_id);
                             let cause = if handle.adapter.is_powered().await.unwrap_or(true) {
                                 DisconnectCause::LinkLoss
                             } else {
                                 DisconnectCause::AdapterOff
                             };
-                            handle
+                            let _ = handle
                                 .event_tx
                                 .send(CentralEvent::DeviceDisconnected { device_id, cause });
                         }
@@ -281,7 +310,7 @@ impl CentralBackend for LinuxCentral {
                 }
             });
 
-            *handle.scan_task.lock().unwrap() = Some(task);
+            *handle.scan_task.lock() = Some(task);
             Ok(())
         }
     }
@@ -290,7 +319,7 @@ impl CentralBackend for LinuxCentral {
         let handle = Arc::clone(&self.0);
         async move {
             debug!("stopping BLE scan");
-            if let Some(task) = handle.scan_task.lock().unwrap().take() {
+            if let Some(task) = handle.scan_task.lock().take() {
                 task.abort();
             }
             Ok(())
@@ -299,15 +328,7 @@ impl CentralBackend for LinuxCentral {
 
     fn discovered_devices(&self) -> impl Future<Output = BlewResult<Vec<BleDevice>>> + Send {
         let handle = Arc::clone(&self.0);
-        async move {
-            Ok(handle
-                .discovered
-                .lock()
-                .unwrap()
-                .values()
-                .cloned()
-                .collect())
-        }
+        async move { Ok(handle.discovered.lock().values().cloned().collect()) }
     }
 
     fn connect(&self, device_id: &DeviceId) -> impl Future<Output = BlewResult<()>> + Send {
@@ -322,11 +343,18 @@ impl CentralBackend for LinuxCentral {
                 .map_err(|e| BlewError::Central {
                     source: Box::new(e),
                 })?;
-            device.connect().await.map_err(|e| BlewError::Central {
-                source: Box::new(e),
-            })?;
+            match tokio::time::timeout(CONNECT_TIMEOUT, device.connect()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    return Err(BlewError::Central {
+                        source: Box::new(e),
+                    });
+                }
+                Err(_) => return Err(BlewError::Timeout),
+            }
             debug!(device_id = %device_id, "device connected");
-            handle
+            handle.clear_mtu(&device_id);
+            let _ = handle
                 .event_tx
                 .send(CentralEvent::DeviceConnected { device_id });
             Ok(())
@@ -349,7 +377,9 @@ impl CentralBackend for LinuxCentral {
                 source: Box::new(e),
             })?;
             debug!(device_id = %device_id, "device disconnected");
-            handle.event_tx.send(CentralEvent::DeviceDisconnected {
+            handle.clear_mtu(&device_id);
+            handle.drain_notify_tasks(&device_id);
+            let _ = handle.event_tx.send(CentralEvent::DeviceDisconnected {
                 device_id,
                 cause: DisconnectCause::LocalClose,
             });
@@ -454,6 +484,7 @@ impl CentralBackend for LinuxCentral {
                         device_id: device_id.clone(),
                         source: Box::new(e),
                     })?;
+                    handle.update_mtu(&device_id, writer.mtu());
                     writer
                         .write_all(&value)
                         .await
@@ -479,11 +510,24 @@ impl CentralBackend for LinuxCentral {
         let device_id = device_id.clone();
         async move {
             debug!(device_id = %device_id, %char_uuid, "subscribing to characteristic");
+            // Reject duplicates before acquiring a new notify_io socket -- otherwise
+            // each subscriber reads from its own stream and they each see partial data.
+            if handle
+                .notify_tasks
+                .lock()
+                .contains_key(&(device_id.clone(), char_uuid))
+            {
+                return Err(BlewError::AlreadySubscribed {
+                    device_id,
+                    char_uuid,
+                });
+            }
             let ch = handle.find_characteristic(&device_id, char_uuid).await?;
             let reader = ch.notify_io().await.map_err(|e| BlewError::Gatt {
                 device_id: device_id.clone(),
                 source: Box::new(e),
             })?;
+            handle.update_mtu(&device_id, reader.mtu());
             let h = Arc::clone(&handle);
             let did = device_id.clone();
             let task = tokio::spawn(async move {
@@ -495,7 +539,7 @@ impl CentralBackend for LinuxCentral {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             trace!(device_id = %did, %char_uuid, len = n, "characteristic notification");
-                            h.event_tx.send(CentralEvent::CharacteristicNotification {
+                            let _ = h.event_tx.send(CentralEvent::CharacteristicNotification {
                                 device_id: did.clone(),
                                 char_uuid,
                                 value: Bytes::copy_from_slice(&buf[..n]),
@@ -504,11 +548,18 @@ impl CentralBackend for LinuxCentral {
                     }
                 }
             });
-            handle
-                .notify_tasks
-                .lock()
-                .unwrap()
-                .insert((device_id, char_uuid), task);
+            // Race check: another caller may have inserted between our contains_key
+            // check and now. Use entry/or_insert_with semantics via a second lock.
+            let mut tasks = handle.notify_tasks.lock();
+            if tasks.contains_key(&(device_id.clone(), char_uuid)) {
+                drop(tasks);
+                task.abort();
+                return Err(BlewError::AlreadySubscribed {
+                    device_id,
+                    char_uuid,
+                });
+            }
+            tasks.insert((device_id, char_uuid), task);
             Ok(())
         }
     }
@@ -521,20 +572,20 @@ impl CentralBackend for LinuxCentral {
         let handle = Arc::clone(&self.0);
         let device_id = device_id.clone();
         async move {
-            if let Some(task) = handle
-                .notify_tasks
-                .lock()
-                .unwrap()
-                .remove(&(device_id, char_uuid))
-            {
+            if let Some(task) = handle.notify_tasks.lock().remove(&(device_id, char_uuid)) {
                 task.abort();
             }
             Ok(())
         }
     }
 
-    async fn mtu(&self, _device_id: &DeviceId) -> u16 {
-        23_u16
+    async fn mtu(&self, device_id: &DeviceId) -> u16 {
+        self.0
+            .mtu_cache
+            .lock()
+            .get(device_id)
+            .copied()
+            .unwrap_or(23)
     }
 
     fn open_l2cap_channel(
@@ -590,7 +641,7 @@ impl CentralBackend for LinuxCentral {
     }
 
     fn events(&self) -> Self::EventStream {
-        ReceiverStream::new(self.0.event_fanout.subscribe(64))
+        BroadcastEventStream::new(self.0.event_tx.subscribe())
     }
 }
 

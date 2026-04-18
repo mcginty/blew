@@ -53,8 +53,6 @@ pub enum CentralEvent {
         char_uuid: Uuid,
         value: Bytes,
     },
-    /// Fired during OS-level state restoration (iOS only) when the system relaunches the app with preserved BLE state.
-    Restored { devices: Vec<BleDevice> },
 }
 
 /// Scan duty cycle / power trade-off.
@@ -70,6 +68,14 @@ pub enum ScanMode {
 }
 
 /// Filter applied during scanning.
+///
+/// # Platform caveats
+///
+/// **Linux/BlueZ:** BlueZ's device cache may emit `DeviceAdded` events for devices that do
+/// not match [`services`](Self::services) on the first tick after a fresh scan start. If you
+/// need strict filtering, re-check against
+/// [`CentralEvent::DeviceDiscovered`] on the client
+/// side rather than relying on the filter alone.
 #[derive(Debug, Clone, Default)]
 pub struct ScanFilter {
     /// Only report peripherals advertising at least one of these service UUIDs.
@@ -85,30 +91,4 @@ pub enum WriteType {
     WithResponse,
     /// ATT Write Command -- no acknowledgement; lower latency.
     WithoutResponse,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn disconnect_cause_is_debug_clone_eq() {
-        let a = DisconnectCause::LinkLoss;
-        let b = a.clone();
-        assert_eq!(a, b);
-        let _ = format!("{a:?}");
-    }
-
-    #[test]
-    fn disconnected_event_carries_cause() {
-        let ev = CentralEvent::DeviceDisconnected {
-            device_id: DeviceId::from("test"),
-            cause: DisconnectCause::LocalClose,
-        };
-        if let CentralEvent::DeviceDisconnected { cause, .. } = ev {
-            assert_eq!(cause, DisconnectCause::LocalClose);
-        } else {
-            panic!("wrong variant");
-        }
-    }
 }

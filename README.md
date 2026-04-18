@@ -20,6 +20,10 @@ It also supports opportunistic L2CAP which provides a lower-level socket-type
 interface that tends to be significantly faster than using GATT for data
 transfer.
 
+`blew` is intended to support as many concurrent L2CAP channels as the device
+and platform can sustain. Backend implementations should therefore optimize for
+high L2CAP concurrency, not just single-channel correctness.
+
 There is also an included `tauri-plugin-blew` that vastly simplifies the
 necessary Kotlin/JNI glue to enable Android functionality.
 
@@ -31,6 +35,37 @@ necessary Kotlin/JNI glue to enable Android functionality.
 | Linux | BlueZ (via `bluer`) | Yes | Yes | Yes |
 | Android | JNI + Kotlin (via `jni` and `ndk-context`) | Yes | Yes | Yes |
 
+## Platform notes
+
+- **macOS/iOS:** writable characteristics must be constructed with `value: vec![]` — otherwise
+  CoreBluetooth raises `NSInvalidArgumentException` → `SIGABRT`. See `GattCharacteristic` docs.
+- **Linux/BlueZ:** negotiated ATT MTU is not plumbed through the API yet; `Central::mtu` returns
+  a conservative default of 247. Writes larger than 244 bytes may be rejected by peers with
+  smaller negotiated MTUs.
+- **Android:** BLE permissions (`BLUETOOTH_SCAN`/`CONNECT`/`ADVERTISE` on API 31+, plus
+  `ACCESS_FINE_LOCATION` on older versions) must be granted at runtime — `Central::new` /
+  `Peripheral::new` return `BlewError::PermissionDenied` if not.
+- **iOS state restoration:** opt in via `Central::with_config` / `Peripheral::with_config`
+  with a stable `restore_identifier`. This *must* run synchronously from
+  `application:didFinishLaunchingWithOptions:`, and `take_restored()` must be called
+  immediately afterwards — before any new scans, connects, or `add_service` calls — to
+  drain the payload the OS delivered during construction. L2CAP channels are never
+  restored. The app's `Info.plist` must also declare the matching `UIBackgroundModes`:
+
+  ```xml
+  <key>UIBackgroundModes</key>
+  <array>
+      <string>bluetooth-central</string>
+      <string>bluetooth-peripheral</string>
+  </array>
+  ```
+
+  Include only the modes you actually use. See the crate-level `State restoration` rustdoc
+  for the full contract — misusing it causes silent connection drops.
+- **Testing:** the `testing` feature exposes in-memory mock backends that enforce the
+  connection/service/MTU invariants the real backends do. Real hardware behavior is not
+  covered by CI; plan to smoke-test on device before shipping.
+
 ## Examples
 
 ```sh
@@ -38,7 +73,30 @@ cargo run --example scan -p blew          # scan for 10s, print discoveries
 cargo run --example advertise -p blew     # advertise a GATT service, handle reads/writes
 cargo run --example l2cap_server -p blew  # peripheral: publish L2CAP CoC, echo data
 cargo run --example l2cap_client -p blew  # central: scan, connect, open L2CAP, send data
+cargo run --example restore -p blew       # iOS state-restoration launch sequence
 ```
+
+## Testing on real hardware
+
+Unit tests run against an in-memory mock backend and do not exercise a real
+radio. For end-to-end coverage there's a two-process integration harness --
+`integration_peripheral` advertises a known service + L2CAP listener, and
+`integration_central` runs a scripted protocol against it and exits 0 on
+success. Run the two binaries on two separate hosts (CoreBluetooth blocks
+same-process loopback on Apple, and a single Linux adapter cannot scan for its
+own advertisements either):
+
+```sh
+# host A
+cargo run --example integration_peripheral -p blew
+
+# host B
+cargo run --example integration_central -p blew
+```
+
+The protocol covers scan + connect + service discovery, read of a fixed
+status characteristic, a write-then-notify round-trip, and an L2CAP CoC
+echo. On success the central prints `integration-central: PASS` and exits 0.
 
 ## Alternative Libraries
 

@@ -1,11 +1,10 @@
 use std::future::Future;
-use std::sync::OnceLock;
 
 use jni::objects::{JObject, JObjectArray};
 use jni::{jni_sig, jni_str};
 use parking_lot::Mutex;
-use tokio::sync::{mpsc, oneshot};
-use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
+use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -14,42 +13,62 @@ use crate::gatt::props::CharacteristicProperties;
 use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, types::Psm};
 use crate::peripheral::backend::{self, PeripheralBackend};
-use crate::peripheral::types::{AdvertisingConfig, PeripheralEvent};
+use crate::peripheral::types::{
+    AdvertisingConfig, PeripheralConfig, PeripheralRequest, PeripheralStateEvent,
+};
 use crate::types::DeviceId;
+use crate::util::BroadcastEventStream;
 
 use super::jni_globals::{jvm, peripheral_class};
 
 struct PeripheralState {
-    event_tx: Mutex<mpsc::UnboundedSender<PeripheralEvent>>,
+    request_tx: mpsc::UnboundedSender<PeripheralRequest>,
+    request_rx: Mutex<Option<mpsc::UnboundedReceiver<PeripheralRequest>>>,
+    state_tx: broadcast::Sender<PeripheralStateEvent>,
 }
 
-static STATE: OnceLock<PeripheralState> = OnceLock::new();
+static STATE: Mutex<Option<PeripheralState>> = Mutex::new(None);
 
-fn state() -> &'static PeripheralState {
-    STATE.get().expect("AndroidPeripheral not initialized")
+pub(crate) fn send_request(request: PeripheralRequest) {
+    if let Some(s) = STATE.lock().as_ref() {
+        let _ = s.request_tx.send(request);
+    }
 }
 
-pub(crate) fn send_event(event: PeripheralEvent) {
-    if let Some(s) = STATE.get() {
-        let _ = s.event_tx.lock().send(event);
+pub(crate) fn send_state_event(event: PeripheralStateEvent) {
+    if let Some(s) = STATE.lock().as_ref() {
+        let _ = s.state_tx.send(event);
     }
 }
 
 pub struct AndroidPeripheral;
 
+impl AndroidPeripheral {
+    pub async fn with_config(_config: PeripheralConfig) -> BlewResult<Self> {
+        <Self as PeripheralBackend>::new().await
+    }
+}
+
 impl backend::private::Sealed for AndroidPeripheral {}
 
 impl PeripheralBackend for AndroidPeripheral {
-    type EventStream = UnboundedReceiverStream<PeripheralEvent>;
+    type StateEvents = BroadcastEventStream<PeripheralStateEvent>;
+    type Requests = UnboundedReceiverStream<PeripheralRequest>;
 
     fn new() -> impl Future<Output = BlewResult<Self>> + Send
     where
         Self: Sized,
     {
         async {
-            let (tx, _rx) = mpsc::unbounded_channel();
-            let _ = STATE.set(PeripheralState {
-                event_tx: Mutex::new(tx),
+            if !super::are_ble_permissions_granted() {
+                return Err(BlewError::PermissionDenied);
+            }
+            let (request_tx, request_rx) = mpsc::unbounded_channel();
+            let (state_tx, _) = broadcast::channel(256);
+            *STATE.lock() = Some(PeripheralState {
+                request_tx,
+                request_rx: Mutex::new(Some(request_rx)),
+                state_tx,
             });
             debug!("AndroidPeripheral initialized");
             Ok(AndroidPeripheral)
@@ -251,7 +270,7 @@ impl PeripheralBackend for AndroidPeripheral {
             let (psm_tx, psm_rx) = oneshot::channel();
             super::l2cap_state::set_pending_server(psm_tx);
 
-            let (accept_tx, accept_rx) = mpsc::channel(16);
+            let (accept_tx, accept_rx) = mpsc::unbounded_channel();
             super::l2cap_state::set_accept_tx(accept_tx);
 
             jvm()
@@ -270,15 +289,26 @@ impl PeripheralBackend for AndroidPeripheral {
                 .await
                 .map_err(|_| BlewError::Internal("L2CAP server open cancelled".into()))??;
 
-            Ok((psm, ReceiverStream::new(accept_rx)))
+            Ok((psm, UnboundedReceiverStream::new(accept_rx)))
         }
     }
 
-    fn events(&self) -> Self::EventStream {
-        // Only the most recent subscriber receives events.
-        let (tx, rx) = mpsc::unbounded_channel();
-        *state().event_tx.lock() = tx;
-        UnboundedReceiverStream::new(rx)
+    fn state_events(&self) -> Self::StateEvents {
+        let receiver = STATE
+            .lock()
+            .as_ref()
+            .expect("AndroidPeripheral not initialized")
+            .state_tx
+            .subscribe();
+        BroadcastEventStream::new(receiver)
+    }
+
+    fn take_requests(&self) -> Option<Self::Requests> {
+        let rx = {
+            let guard = STATE.lock();
+            guard.as_ref()?.request_rx.lock().take()
+        };
+        rx.map(UnboundedReceiverStream::new)
     }
 }
 

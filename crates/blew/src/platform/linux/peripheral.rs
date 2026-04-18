@@ -3,9 +3,13 @@ use crate::gatt::props::CharacteristicProperties;
 use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, types::Psm};
 use crate::peripheral::backend::{self, PeripheralBackend};
-use crate::peripheral::types::{AdvertisingConfig, PeripheralEvent, ReadResponder, WriteResponder};
+use crate::peripheral::types::{
+    AdvertisingConfig, PeripheralConfig, PeripheralRequest, PeripheralStateEvent, ReadResponder,
+    WriteResponder,
+};
 use crate::platform::linux::l2cap::bridge_l2cap;
 use crate::types::DeviceId;
+use crate::util::BroadcastEventStream;
 use bluer::adv::{Advertisement, SecondaryChannel, Type as AdvType};
 use bluer::gatt::local::{
     Application, ApplicationHandle, Characteristic, CharacteristicControlHandle,
@@ -16,8 +20,10 @@ use bluer::gatt::local::{
 use bluer::{Adapter, Session};
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
@@ -33,19 +39,28 @@ struct PeripheralInner {
     adv_handle: Mutex<Option<bluer::adv::AdvertisementHandle>>,
     app_handle: Mutex<Option<ApplicationHandle>>,
     notifiers: Mutex<HashMap<Uuid, Vec<SharedNotifier>>>,
-    event_tx: Arc<Mutex<Option<mpsc::UnboundedSender<PeripheralEvent>>>>,
+    request_tx: mpsc::UnboundedSender<PeripheralRequest>,
+    request_rx: Mutex<Option<mpsc::UnboundedReceiver<PeripheralRequest>>>,
+    state_tx: broadcast::Sender<PeripheralStateEvent>,
     _adapter_task: tokio::task::JoinHandle<()>,
 }
 
 pub struct LinuxPeripheral(Arc<PeripheralInner>);
 
+impl LinuxPeripheral {
+    pub async fn with_config(_config: PeripheralConfig) -> BlewResult<Self> {
+        <Self as PeripheralBackend>::new().await
+    }
+}
+
 impl backend::private::Sealed for LinuxPeripheral {}
 
-fn emit(inner: &Arc<PeripheralInner>, event: PeripheralEvent) {
-    let guard = inner.event_tx.lock().unwrap();
-    if let Some(tx) = guard.as_ref() {
-        let _ = tx.send(event);
-    }
+fn emit_state(inner: &Arc<PeripheralInner>, event: PeripheralStateEvent) {
+    let _ = inner.state_tx.send(event);
+}
+
+fn emit_request(inner: &Arc<PeripheralInner>, request: PeripheralRequest) {
+    let _ = inner.request_tx.send(request);
 }
 
 #[allow(clippy::too_many_lines)]
@@ -85,9 +100,9 @@ fn build_characteristic(
 
                     let client_id = DeviceId(req.device_address.to_string());
                     let (tx, rx) = tokio::sync::oneshot::channel();
-                    emit(
+                    emit_request(
                         &inner_r,
-                        PeripheralEvent::ReadRequest {
+                        PeripheralRequest::Read {
                             client_id,
                             service_uuid: svc_uuid,
                             char_uuid: uuid,
@@ -127,9 +142,9 @@ fn build_characteristic(
                         } else {
                             (None, None)
                         };
-                        emit(
+                        emit_request(
                             &inner_w,
-                            PeripheralEvent::WriteRequest {
+                            PeripheralRequest::Write {
                                 client_id,
                                 service_uuid: svc_uuid,
                                 char_uuid: uuid,
@@ -165,13 +180,12 @@ fn build_characteristic(
                         inner_n
                             .notifiers
                             .lock()
-                            .unwrap()
                             .entry(uuid)
                             .or_default()
                             .push(Arc::new(tokio::sync::Mutex::new(notifier)));
-                        emit(
+                        emit_state(
                             &inner_n,
-                            PeripheralEvent::SubscriptionChanged {
+                            PeripheralStateEvent::SubscriptionChanged {
                                 client_id: DeviceId(String::new()),
                                 char_uuid: uuid,
                                 subscribed: true,
@@ -202,7 +216,8 @@ fn build_characteristic(
 }
 
 impl PeripheralBackend for LinuxPeripheral {
-    type EventStream = UnboundedReceiverStream<PeripheralEvent>;
+    type StateEvents = BroadcastEventStream<PeripheralStateEvent>;
+    type Requests = UnboundedReceiverStream<PeripheralRequest>;
 
     async fn new() -> BlewResult<Self>
     where
@@ -216,9 +231,9 @@ impl PeripheralBackend for LinuxPeripheral {
             .await
             .map_err(|_| BlewError::AdapterNotFound)?;
         debug!(adapter = %adapter.name(), "BLE adapter initialized");
-        let event_tx: Arc<Mutex<Option<mpsc::UnboundedSender<PeripheralEvent>>>> =
-            Arc::new(Mutex::new(None));
-        let event_tx_clone = Arc::clone(&event_tx);
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (state_tx, _) = broadcast::channel(256);
+        let state_tx_clone = state_tx.clone();
         let adapter_clone = adapter.clone();
         let adapter_task = tokio::spawn(async move {
             use tokio_stream::StreamExt as _;
@@ -233,10 +248,8 @@ impl PeripheralBackend for LinuxPeripheral {
                 )) = event
                 {
                     debug!(powered, "peripheral adapter state changed");
-                    let guard = event_tx_clone.lock().unwrap();
-                    if let Some(tx) = guard.as_ref() {
-                        let _ = tx.send(PeripheralEvent::AdapterStateChanged { powered });
-                    }
+                    let _ =
+                        state_tx_clone.send(PeripheralStateEvent::AdapterStateChanged { powered });
                 }
             }
         });
@@ -247,7 +260,9 @@ impl PeripheralBackend for LinuxPeripheral {
             adv_handle: Mutex::new(None),
             app_handle: Mutex::new(None),
             notifiers: Mutex::new(HashMap::new()),
-            event_tx,
+            request_tx,
+            request_rx: Mutex::new(Some(request_rx)),
+            state_tx,
             _adapter_task: adapter_task,
         })))
     }
@@ -270,7 +285,7 @@ impl PeripheralBackend for LinuxPeripheral {
         let service = service.clone();
         async move {
             debug!(service_uuid = %service.uuid, characteristics = service.characteristics.len(), "queuing GATT service");
-            handle.pending_services.lock().unwrap().push(service);
+            handle.pending_services.lock().push(service);
             Ok(())
         }
     }
@@ -282,12 +297,12 @@ impl PeripheralBackend for LinuxPeripheral {
         let handle = Arc::clone(&self.0);
         let config = config.clone();
         async move {
-            if handle.adv_handle.lock().unwrap().is_some() {
+            if handle.adv_handle.lock().is_some() {
                 return Err(BlewError::AlreadyAdvertising);
             }
             debug!(local_name = %config.local_name, "starting advertising");
 
-            let pending: Vec<GattService> = handle.pending_services.lock().unwrap().clone();
+            let pending: Vec<GattService> = handle.pending_services.lock().clone();
             let bluer_services: Vec<Service> = pending
                 .iter()
                 .map(|svc| {
@@ -318,7 +333,7 @@ impl PeripheralBackend for LinuxPeripheral {
                 .map_err(|e| BlewError::Peripheral {
                     source: Box::new(e),
                 })?;
-            *handle.app_handle.lock().unwrap() = Some(app_handle);
+            *handle.app_handle.lock() = Some(app_handle);
 
             // Prefer BLE 5 extended advertising with a 2M secondary channel so
             // that BLE 5 centrals can connect at 2M PHY from the start.
@@ -353,7 +368,7 @@ impl PeripheralBackend for LinuxPeripheral {
                     h
                 }
             };
-            *handle.adv_handle.lock().unwrap() = Some(adv_handle);
+            *handle.adv_handle.lock() = Some(adv_handle);
 
             Ok(())
         }
@@ -363,9 +378,9 @@ impl PeripheralBackend for LinuxPeripheral {
         let handle = Arc::clone(&self.0);
         async move {
             debug!("stopping advertising");
-            handle.adv_handle.lock().unwrap().take();
-            handle.app_handle.lock().unwrap().take();
-            handle.notifiers.lock().unwrap().clear();
+            handle.adv_handle.lock().take();
+            handle.app_handle.lock().take();
+            handle.notifiers.lock().clear();
             Ok(())
         }
     }
@@ -387,7 +402,6 @@ impl PeripheralBackend for LinuxPeripheral {
             let arcs: Vec<SharedNotifier> = handle
                 .notifiers
                 .lock()
-                .unwrap()
                 .get(&char_uuid)
                 .cloned()
                 .unwrap_or_default();
@@ -404,14 +418,9 @@ impl PeripheralBackend for LinuxPeripheral {
             }
 
             if any_stopped {
-                handle
-                    .notifiers
-                    .lock()
-                    .unwrap()
-                    .entry(char_uuid)
-                    .and_modify(|v| {
-                        v.retain(|arc| !arc.try_lock().map_or(true, |n| n.is_stopped()));
-                    });
+                handle.notifiers.lock().entry(char_uuid).and_modify(|v| {
+                    v.retain(|arc| !arc.try_lock().map_or(true, |n| n.is_stopped()));
+                });
             }
             Ok(())
         }
@@ -489,9 +498,15 @@ impl PeripheralBackend for LinuxPeripheral {
         Ok((psm, ReceiverStream::new(rx)))
     }
 
-    fn events(&self) -> Self::EventStream {
-        let (tx, rx) = mpsc::unbounded_channel();
-        *self.0.event_tx.lock().unwrap() = Some(tx);
-        UnboundedReceiverStream::new(rx)
+    fn state_events(&self) -> Self::StateEvents {
+        BroadcastEventStream::new(self.0.state_tx.subscribe())
+    }
+
+    fn take_requests(&self) -> Option<Self::Requests> {
+        self.0
+            .request_rx
+            .lock()
+            .take()
+            .map(UnboundedReceiverStream::new)
     }
 }

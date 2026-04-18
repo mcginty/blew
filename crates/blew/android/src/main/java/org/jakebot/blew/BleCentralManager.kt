@@ -12,10 +12,13 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.os.ParcelUuid
 import android.util.Log
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Semaphore
-import java.util.concurrent.TimeUnit
 
 /**
  * Singleton managing the Android BLE central role (scanner + GATT client).
@@ -26,15 +29,10 @@ import java.util.concurrent.TimeUnit
  * ## GATT operation serialization
  *
  * Android's [BluetoothGatt] allows only one in-flight operation at a time
- * (read, write, descriptor write, discover services, request MTU). Issuing
- * a second operation while one is pending causes the second to silently fail.
- *
- * We use a single global [Semaphore] with one permit to serialize all GATT
- * operations across all devices. Android's Bluetooth controller has a single
- * HCI command queue — concurrent operations on different [BluetoothGatt]
- * objects can silently fail. The semaphore is acquired before issuing an
- * operation and released in the corresponding callback (or immediately for
- * fire-and-forget operations like write-without-response).
+ * (read, write, descriptor write, discover services, request MTU). Each device
+ * gets its own [GattOperationQueue] that serializes operations for that device,
+ * with per-operation timeouts to guard against firmware bugs where callbacks
+ * never fire.
  */
 @SuppressLint("MissingPermission")
 object BleCentralManager {
@@ -57,19 +55,21 @@ object BleCentralManager {
     // Per-device MTU (default 23 until negotiated).
     private val mtuMap = ConcurrentHashMap<String, Int>()
 
-    // Global GATT operation semaphore (1 permit = 1 op at a time across ALL
-    // devices). Android's Bluetooth controller has a single HCI command queue;
-    // concurrent operations on different BluetoothGatt objects can silently fail.
-    private val gattSemaphore = Semaphore(1)
+    // Per-device GATT operation queues.
+    private val gattQueues = ConcurrentHashMap<String, GattOperationQueue>()
 
-    // Devices whose global semaphore hold is for MTU negotiation (acquired in
-    // onConnectionStateChange, released in onMtuChanged). Tracked so we can
-    // release the semaphore on disconnect if MTU never completed.
-    private val mtuHoldDevices: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    // Nonces for in-flight GATT operations. Callbacks consume these before
+    // completing the queue or notifying Rust so stale callbacks are ignored.
+    private val pendingNonces = ConcurrentHashMap<String, Long>()
 
-    // Devices with a pending write-with-response. Used by onCharacteristicWrite
-    // to avoid double-releasing the semaphore for write-without-response.
-    private val pendingWriteResponse: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    // Device addresses with a write-without-response already completed from the
+    // kick lambda. onCharacteristicWrite may still fire on some devices; the
+    // entry here tells the callback to skip completeCurrent and the native
+    // notification (the coroutine has already delivered both).
+    private val noResponseHandled = ConcurrentHashMap<String, Boolean>()
+
+    // Coroutine scope for launching GATT operation coroutines.
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     // ── L2CAP state ──
     private val l2cap =
@@ -182,18 +182,9 @@ object BleCentralManager {
         ctx.registerReceiver(adapterStateReceiver, filter)
     }
 
-    // ── GATT operation serialization helpers ──
+    // ── Per-device queue helper ──
 
-    /**
-     * Acquire the global GATT semaphore, blocking up to [timeoutMs].
-     * Returns true if acquired, false on timeout (GATT busy).
-     */
-    private fun acquireGatt(timeoutMs: Long = 5000): Boolean = gattSemaphore.tryAcquire(timeoutMs, TimeUnit.MILLISECONDS)
-
-    /** Release the global GATT semaphore after an operation completes. */
-    private fun releaseGatt() {
-        gattSemaphore.release()
-    }
+    private fun queueFor(addr: String): GattOperationQueue = gattQueues.getOrPut(addr) { GattOperationQueue("gatt-$addr") }
 
     // ── Scanning ──
 
@@ -286,28 +277,38 @@ object BleCentralManager {
 
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     gattConnections[addr] = gatt
-                    // Hold the global GATT semaphore during MTU negotiation so
-                    // that no operations (from any device) proceed until the
-                    // chipset finishes. Don't notify Rust yet — wait for onMtuChanged.
-                    gattSemaphore.drainPermits()
-                    mtuHoldDevices.add(addr)
-                    if (!gatt.requestMtu(512)) {
-                        // MTU request failed — release semaphore and notify Rust anyway.
-                        Log.w(TAG, "requestMtu failed for $addr, proceeding without MTU negotiation")
-                        mtuHoldDevices.remove(addr)
-                        releaseGatt()
+                    // Capture the queue reference before launching so a racing
+                    // disconnect (which removes the entry from gattQueues) can't
+                    // cause this coroutine to create an orphaned queue.
+                    val q = queueFor(addr)
+                    scope.launch {
+                        // Enqueue MTU request so other ops queue behind it per device.
+                        val mtuResult =
+                            q.enqueue<Int>(
+                                name = "request-mtu",
+                                timeoutMs = 5000L,
+                                kick = {
+                                    val nonce = q.currentNonce() ?: return@enqueue false
+                                    val key = "$addr:mtu"
+                                    pendingNonces[key] = nonce
+                                    val started = gatt.requestMtu(512)
+                                    if (!started) {
+                                        pendingNonces.remove(key)
+                                    }
+                                    started
+                                },
+                            )
+                        if (mtuResult.isFailure) {
+                            Log.w(TAG, "MTU negotiation failed for $addr: ${mtuResult.exceptionOrNull()?.message}")
+                        }
                         nativeOnConnectionStateChanged(addr, true, 0)
                     }
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     gattConnections.remove(addr)
                     mtuMap.remove(addr)
-                    // If this device was holding the semaphore for MTU negotiation,
-                    // release it so other devices aren't deadlocked.
-                    if (mtuHoldDevices.remove(addr)) {
-                        releaseGatt()
-                    }
-                    // For regular operations, gatt.close() triggers pending
-                    // callbacks (with error status) which release the semaphore.
+                    noResponseHandled.remove(addr)
+                    pendingNonces.keys.removeIf { it.startsWith("$addr:") }
+                    gattQueues.remove(addr)?.close(CancellationException("device $addr disconnected"))
                     gatt.close()
                     nativeOnConnectionStateChanged(addr, false, status)
                 }
@@ -323,11 +324,9 @@ object BleCentralManager {
                     mtuMap[addr] = mtu
                     nativeOnMtuChanged(addr, mtu)
                 }
-                // Release the global semaphore held since onConnectionStateChange.
-                mtuHoldDevices.remove(addr)
-                releaseGatt()
-                // NOW notify Rust — MTU is negotiated, GATT is ready for operations.
-                nativeOnConnectionStateChanged(addr, true, 0)
+                val nonce = pendingNonces.remove("$addr:mtu") ?: return
+                gattQueues[addr]?.completeCurrent<Int>(nonce, mtu)
+                // Do NOT call nativeOnConnectionStateChanged here; the coroutine in the CONNECTED branch does it.
             }
 
             override fun onServicesDiscovered(
@@ -335,11 +334,10 @@ object BleCentralManager {
                 status: Int,
             ) {
                 val addr = gatt.device.address
-                // Release the GATT semaphore (acquired in discoverServices).
-                releaseGatt()
+                val nonce = pendingNonces.remove("$addr:services") ?: return
+                gattQueues[addr]?.completeCurrent<Unit>(nonce, Unit)
                 if (status == BluetoothGatt.GATT_SUCCESS) {
-                    val json = servicesToJson(gatt.services)
-                    nativeOnServicesDiscovered(addr, json)
+                    nativeOnServicesDiscovered(addr, servicesToJson(gatt.services))
                 } else {
                     nativeOnServicesDiscovered(addr, "[]")
                 }
@@ -351,14 +349,11 @@ object BleCentralManager {
                 value: ByteArray,
                 status: Int,
             ) {
-                // Release the GATT semaphore (acquired in readCharacteristic).
-                releaseGatt()
-                nativeOnCharacteristicRead(
-                    gatt.device.address,
-                    characteristic.uuid.toString(),
-                    value,
-                    status,
-                )
+                val addr = gatt.device.address
+                val charUuid = characteristic.uuid.toString()
+                val nonce = pendingNonces.remove("$addr:read:$charUuid") ?: return
+                gattQueues[addr]?.completeCurrent<Unit>(nonce, Unit)
+                nativeOnCharacteristicRead(addr, charUuid, value, status)
             }
 
             override fun onCharacteristicWrite(
@@ -366,14 +361,18 @@ object BleCentralManager {
                 characteristic: BluetoothGattCharacteristic,
                 status: Int,
             ) {
-                // Only release the semaphore for write-with-response. For
-                // write-without-response it was already released in writeCharacteristic().
-                if (pendingWriteResponse.remove(gatt.device.address)) {
-                    releaseGatt()
+                val addr = gatt.device.address
+                if (noResponseHandled.remove(addr) != null) {
+                    // Kick lambda already completed the queue and fired the
+                    // native callback for this no-response write.
+                    return
                 }
+                val charUuid = characteristic.uuid.toString()
+                val nonce = pendingNonces.remove("$addr:write:$charUuid") ?: return
+                gattQueues[addr]?.completeCurrent<Unit>(nonce, Unit)
                 nativeOnCharacteristicWrite(
-                    gatt.device.address,
-                    characteristic.uuid.toString(),
+                    addr,
+                    charUuid,
                     status,
                 )
             }
@@ -383,8 +382,10 @@ object BleCentralManager {
                 descriptor: BluetoothGattDescriptor,
                 status: Int,
             ) {
-                // Release the GATT semaphore (acquired in subscribeCharacteristic).
-                releaseGatt()
+                val addr = gatt.device.address
+                val charUuid = descriptor.characteristic.uuid.toString()
+                val nonce = pendingNonces.remove("$addr:cccd:$charUuid") ?: return
+                gattQueues[addr]?.completeCurrent<Unit>(nonce, Unit)
             }
 
             override fun onCharacteristicChanged(
@@ -392,7 +393,7 @@ object BleCentralManager {
                 characteristic: BluetoothGattCharacteristic,
                 value: ByteArray,
             ) {
-                // Notifications don't hold the GATT semaphore — they are passive.
+                // Notifications are passive; don't touch the queue.
                 nativeOnCharacteristicChanged(
                     gatt.device.address,
                     characteristic.uuid.toString(),
@@ -461,17 +462,33 @@ object BleCentralManager {
         }
     }
 
-    // ── GATT operations (serialized via global semaphore) ──
+    // ── GATT operations (serialized via per-device queue) ──
 
     @JvmStatic
     fun discoverServices(deviceAddr: String): Int {
         val gatt = gattConnections[deviceAddr] ?: return STATUS_NOT_CONNECTED
-        if (!acquireGatt(10000)) return STATUS_GATT_BUSY
-        if (!gatt.discoverServices()) {
-            releaseGatt()
-            return STATUS_GATT_FAILED
+        val q = queueFor(deviceAddr)
+        scope.launch {
+            val result =
+                q.enqueue<Unit>(
+                    name = "discover-services",
+                    timeoutMs = 10000L,
+                    kick = {
+                        val nonce = q.currentNonce() ?: return@enqueue false
+                        val key = "$deviceAddr:services"
+                        pendingNonces[key] = nonce
+                        val started = gatt.discoverServices()
+                        if (!started) {
+                            pendingNonces.remove(key)
+                        }
+                        started
+                    },
+                )
+            if (result.isFailure) {
+                Log.w(TAG, "discoverServices queue failed for $deviceAddr: ${result.exceptionOrNull()?.message}")
+                nativeOnServicesDiscovered(deviceAddr, "[]")
+            }
         }
-        // onServicesDiscovered will release the semaphore.
         return STATUS_SUCCESS
     }
 
@@ -482,12 +499,28 @@ object BleCentralManager {
     ): Int {
         val gatt = gattConnections[deviceAddr] ?: return STATUS_NOT_CONNECTED
         val char = findCharacteristic(gatt, charUuid) ?: return STATUS_CHAR_NOT_FOUND
-        if (!acquireGatt()) return STATUS_GATT_BUSY
-        if (!gatt.readCharacteristic(char)) {
-            releaseGatt()
-            return STATUS_GATT_FAILED
+        val q = queueFor(deviceAddr)
+        scope.launch {
+            val result =
+                q.enqueue<Unit>(
+                    name = "read-$charUuid",
+                    timeoutMs = 5000L,
+                    kick = {
+                        val nonce = q.currentNonce() ?: return@enqueue false
+                        val key = "$deviceAddr:read:$charUuid"
+                        pendingNonces[key] = nonce
+                        val started = gatt.readCharacteristic(char)
+                        if (!started) {
+                            pendingNonces.remove(key)
+                        }
+                        started
+                    },
+                )
+            if (result.isFailure) {
+                Log.w(TAG, "read $charUuid queue failed: ${result.exceptionOrNull()?.message}")
+                nativeOnCharacteristicRead(deviceAddr, charUuid, byteArrayOf(), BluetoothGatt.GATT_FAILURE)
+            }
         }
-        // onCharacteristicRead will release the semaphore.
         return STATUS_SUCCESS
     }
 
@@ -500,16 +533,43 @@ object BleCentralManager {
     ): Int {
         val gatt = gattConnections[deviceAddr] ?: return STATUS_NOT_CONNECTED
         val char = findCharacteristic(gatt, charUuid) ?: return STATUS_CHAR_NOT_FOUND
-        if (!acquireGatt()) return STATUS_GATT_BUSY
-        val result = gatt.writeCharacteristic(char, value, writeType)
-        if (result != BluetoothStatusCodes.SUCCESS) {
-            releaseGatt()
-            return STATUS_GATT_FAILED
-        }
-        if (writeType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) {
-            releaseGatt()
-        } else {
-            pendingWriteResponse.add(deviceAddr)
+        val q = queueFor(deviceAddr)
+        scope.launch {
+            val result =
+                q.enqueue<Int>(
+                    name = "write-$charUuid",
+                    timeoutMs = 5000L,
+                    kick = {
+                        val nonce = q.currentNonce() ?: return@enqueue false
+                        val nonceKey = "$deviceAddr:write:$charUuid"
+                        if (writeType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) {
+                            // Mark before the framework can fire onCharacteristicWrite.
+                            noResponseHandled[deviceAddr] = true
+                        } else {
+                            pendingNonces[nonceKey] = nonce
+                        }
+                        val ret = gatt.writeCharacteristic(char, value, writeType)
+                        if (ret != BluetoothStatusCodes.SUCCESS) {
+                            noResponseHandled.remove(deviceAddr)
+                            pendingNonces.remove(nonceKey)
+                            return@enqueue false
+                        }
+                        if (writeType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) {
+                            // Don't wait for a callback the platform may not deliver.
+                            q.completeCurrent<Int>(nonce, BluetoothGatt.GATT_SUCCESS)
+                            noResponseHandled.remove(deviceAddr)
+                        }
+                        true
+                    },
+                )
+            if (result.isFailure) {
+                Log.w(TAG, "write $charUuid queue failed: ${result.exceptionOrNull()?.message}")
+                nativeOnCharacteristicWrite(deviceAddr, charUuid, BluetoothGatt.GATT_FAILURE)
+            } else if (writeType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) {
+                nativeOnCharacteristicWrite(deviceAddr, charUuid, BluetoothGatt.GATT_SUCCESS)
+            }
+            // For write-with-response, onCharacteristicWrite fires the native
+            // callback after calling completeCurrent — don't duplicate here.
         }
         return STATUS_SUCCESS
     }
@@ -527,17 +587,31 @@ object BleCentralManager {
         // Write to CCCD to enable notifications on the remote device.
         val cccdUuid = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
         val descriptor = char.getDescriptor(cccdUuid) ?: return STATUS_CHAR_NOT_FOUND
-        if (!acquireGatt()) return STATUS_GATT_BUSY
-        val result =
-            gatt.writeDescriptor(
-                descriptor,
-                BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE,
-            )
-        if (result != BluetoothStatusCodes.SUCCESS) {
-            releaseGatt()
-            return STATUS_GATT_FAILED
+        val q = queueFor(deviceAddr)
+        scope.launch {
+            val result =
+                q.enqueue<Unit>(
+                    name = "subscribe-cccd-$charUuid",
+                    timeoutMs = 5000L,
+                    kick = {
+                        val nonce = q.currentNonce() ?: return@enqueue false
+                        val key = "$deviceAddr:cccd:$charUuid"
+                        pendingNonces[key] = nonce
+                        val ret =
+                            gatt.writeDescriptor(
+                                descriptor,
+                                BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE,
+                            )
+                        if (ret != BluetoothStatusCodes.SUCCESS) {
+                            pendingNonces.remove(key)
+                        }
+                        ret == BluetoothStatusCodes.SUCCESS
+                    },
+                )
+            if (result.isFailure) {
+                Log.w(TAG, "subscribe $charUuid queue failed: ${result.exceptionOrNull()?.message}")
+            }
         }
-        // onDescriptorWrite will release the semaphore.
         return STATUS_SUCCESS
     }
 
@@ -550,24 +624,37 @@ object BleCentralManager {
         val char = findCharacteristic(gatt, charUuid) ?: return STATUS_CHAR_NOT_FOUND
 
         // Always disable local notification state first, even if the CCCD
-        // write below fails (GATT busy). The remote side will eventually
-        // notice via timeout.
+        // write below fails. The remote side will eventually notice via timeout.
         gatt.setCharacteristicNotification(char, false)
 
         val cccdUuid = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
         val descriptor = char.getDescriptor(cccdUuid)
         if (descriptor != null) {
-            if (!acquireGatt()) return STATUS_GATT_BUSY
-            val result =
-                gatt.writeDescriptor(
-                    descriptor,
-                    BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE,
-                )
-            if (result != BluetoothStatusCodes.SUCCESS) {
-                releaseGatt()
-                return STATUS_GATT_FAILED
+            val q = queueFor(deviceAddr)
+            scope.launch {
+                val result =
+                    q.enqueue<Unit>(
+                        name = "unsubscribe-cccd-$charUuid",
+                        timeoutMs = 5000L,
+                        kick = {
+                            val nonce = q.currentNonce() ?: return@enqueue false
+                            val key = "$deviceAddr:cccd:$charUuid"
+                            pendingNonces[key] = nonce
+                            val ret =
+                                gatt.writeDescriptor(
+                                    descriptor,
+                                    BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE,
+                                )
+                            if (ret != BluetoothStatusCodes.SUCCESS) {
+                                pendingNonces.remove(key)
+                            }
+                            ret == BluetoothStatusCodes.SUCCESS
+                        },
+                    )
+                if (result.isFailure) {
+                    Log.w(TAG, "unsubscribe $charUuid queue failed: ${result.exceptionOrNull()?.message}")
+                }
             }
-            // onDescriptorWrite will release.
         }
         return STATUS_SUCCESS
     }

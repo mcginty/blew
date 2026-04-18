@@ -16,7 +16,9 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use dispatch2::{DispatchQueue, DispatchQueueAttr};
 use futures_core::Stream;
@@ -24,6 +26,9 @@ use objc2::define_class;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, ProtocolObject};
 use objc2::{AnyThread, DefinedClass};
+#[cfg(target_os = "ios")]
+use objc2_core_bluetooth::CBPeripheralManagerOptionRestoreIdentifierKey;
+use objc2_core_bluetooth::CBPeripheralManagerRestoredStateServicesKey;
 use objc2_core_bluetooth::{
     CBATTError, CBATTRequest, CBAdvertisementDataLocalNameKey, CBAdvertisementDataServiceUUIDsKey,
     CBAttributePermissions, CBCentral, CBCharacteristic, CBCharacteristicProperties,
@@ -33,8 +38,8 @@ use objc2_core_bluetooth::{
 };
 use objc2_foundation::{NSArray, NSData, NSDictionary, NSError, NSObjectProtocol, NSString};
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, oneshot, watch};
-use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use uuid::Uuid;
 
 use tracing::{debug, trace, warn};
@@ -44,12 +49,16 @@ use crate::gatt::props::{AttributePermissions, CharacteristicProperties};
 use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, types::Psm};
 use crate::peripheral::backend::{self, PeripheralBackend};
-use crate::peripheral::types::{AdvertisingConfig, PeripheralEvent, ReadResponder, WriteResponder};
+use crate::peripheral::types::{
+    AdvertisingConfig, PeripheralConfig, PeripheralRequest, PeripheralStateEvent, ReadResponder,
+    WriteResponder,
+};
 use crate::platform::apple::helpers::{
     ObjcSend, cbuuid_to_uuid, central_device_id, retain_send, uuid_to_cbuuid,
 };
 use crate::platform::apple::l2cap::bridge_l2cap_channel;
 use crate::types::DeviceId;
+use crate::util::BroadcastEventStream;
 
 fn our_props_to_cb(props: CharacteristicProperties) -> CBCharacteristicProperties {
     let mut out = CBCharacteristicProperties(0);
@@ -103,17 +112,25 @@ struct PeripheralInner {
     adv_tx: Mutex<Option<oneshot::Sender<BlewResult<()>>>>,
     /// Pending `add_service()` results.
     add_svc_tx: Mutex<HashMap<Uuid, oneshot::Sender<BlewResult<()>>>>,
-    /// Single event subscriber (most recent call to `events()` wins).
-    ///
-    /// `PeripheralEvent` is `!Clone`, so we cannot fan out to multiple subscribers.
-    event_tx: Mutex<Option<mpsc::UnboundedSender<PeripheralEvent>>>,
+    /// Inbound GATT requests. The receiver is handed out at most once via
+    /// [`PeripheralBackend::take_requests`].
+    request_tx: mpsc::UnboundedSender<PeripheralRequest>,
+    request_rx: Mutex<Option<mpsc::UnboundedReceiver<PeripheralRequest>>>,
+    /// Broadcast sender for clone-able state events (adapter power, subscription changes).
+    state_tx: broadcast::Sender<PeripheralStateEvent>,
+    /// Populated once by `willRestoreState:`; drained exactly once via
+    /// [`PeripheralBackend::take_restored`]. Buffered so callers can observe the
+    /// restored service list after construction returns — broadcast delivery
+    /// would race the callback.
+    restored: Mutex<Option<Vec<Uuid>>>,
     /// Powered state watch.
     powered_tx: watch::Sender<bool>,
     /// Result of `publishL2CAPChannelWithEncryption` -- carries the assigned PSM.
     l2cap_publish_tx: Mutex<Option<oneshot::Sender<BlewResult<Psm>>>>,
-    /// Sender for incoming L2CAP channels (set by `l2cap_listener`).
+    /// Sender for incoming L2CAP channels (set by `l2cap_listener`). Unbounded so
+    /// the GCD delegate queue is never blocked by a slow accept-stream consumer.
     #[allow(clippy::type_complexity)]
-    l2cap_channel_tx: Mutex<Option<mpsc::Sender<BlewResult<(DeviceId, L2capChannel)>>>>,
+    l2cap_channel_tx: Mutex<Option<mpsc::UnboundedSender<BlewResult<(DeviceId, L2capChannel)>>>>,
     /// Tokio runtime handle, captured at construction time so GCD callbacks
     /// (which run off the Tokio thread) can spawn tasks onto the runtime.
     runtime: Handle,
@@ -122,12 +139,17 @@ struct PeripheralInner {
 impl PeripheralInner {
     fn new() -> (Arc<Self>, watch::Receiver<bool>) {
         let (powered_tx, powered_rx) = watch::channel(false);
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (state_tx, _) = broadcast::channel(256);
         let inner = Arc::new(Self {
             chars: Default::default(),
             subscribers: Default::default(),
             adv_tx: Default::default(),
             add_svc_tx: Default::default(),
-            event_tx: Mutex::new(None),
+            request_tx,
+            request_rx: Mutex::new(Some(request_rx)),
+            state_tx,
+            restored: Mutex::new(None),
             powered_tx,
             l2cap_publish_tx: Mutex::new(None),
             l2cap_channel_tx: Mutex::new(None),
@@ -136,10 +158,12 @@ impl PeripheralInner {
         (inner, powered_rx)
     }
 
-    fn emit(&self, event: PeripheralEvent) {
-        if let Some(tx) = self.event_tx.lock().unwrap().as_ref() {
-            let _ = tx.send(event);
-        }
+    fn emit_state(&self, event: PeripheralStateEvent) {
+        let _ = self.state_tx.send(event);
+    }
+
+    fn emit_request(&self, request: PeripheralRequest) {
+        let _ = self.request_tx.send(request);
     }
 }
 
@@ -159,7 +183,52 @@ define_class!(
             debug!(powered, "peripheral adapter state changed");
             let inner = self.ivars();
             let _ = inner.powered_tx.send(powered);
-            inner.emit(PeripheralEvent::AdapterStateChanged { powered });
+            inner.emit_state(PeripheralStateEvent::AdapterStateChanged { powered });
+        }
+
+        #[unsafe(method(peripheralManager:willRestoreState:))]
+        unsafe fn peripheralManager_willRestoreState(
+            &self,
+            _peripheral: &CBPeripheralManager,
+            dict: &NSDictionary<NSString, AnyObject>,
+        ) {
+            let inner = self.ivars();
+            let key = unsafe { CBPeripheralManagerRestoredStateServicesKey };
+            let Some(obj) = dict.objectForKey(key) else {
+                *inner.restored.lock() = Some(Vec::new());
+                return;
+            };
+            // SAFETY: CoreBluetooth guarantees this key's value is NSArray<CBMutableService>.
+            let services: Retained<NSArray<CBMutableService>> = Retained::cast_unchecked(obj);
+            let mut restored_uuids = Vec::new();
+            {
+                let mut chars_lock = inner.chars.lock();
+                for service in services.to_vec() {
+                    let svc_uuid_ret = service.UUID();
+                    let Some(svc_uuid) = cbuuid_to_uuid(&svc_uuid_ret) else {
+                        continue;
+                    };
+                    if let Some(chars) = unsafe { service.characteristics() } {
+                        for ch in chars.to_vec() {
+                            let ch_uuid_ret = ch.UUID();
+                            let Some(ch_uuid) = cbuuid_to_uuid(&ch_uuid_ret) else {
+                                continue;
+                            };
+                            // SAFETY: services we publish are always built from CBMutableCharacteristic,
+                            // so the runtime class matches.
+                            let mutable: &CBMutableCharacteristic =
+                                unsafe { &*(&raw const *ch).cast() };
+                            chars_lock.insert(ch_uuid, unsafe { retain_send(mutable) });
+                        }
+                    }
+                    restored_uuids.push(svc_uuid);
+                }
+            }
+            debug!(
+                count = restored_uuids.len(),
+                "OS-level state restoration recovered peripheral services"
+            );
+            *inner.restored.lock() = Some(restored_uuids);
         }
 
         #[unsafe(method(peripheralManagerDidStartAdvertising:error:))]
@@ -169,7 +238,7 @@ define_class!(
             error: Option<&NSError>,
         ) {
             let inner = self.ivars();
-            if let Some(tx) = inner.adv_tx.lock().unwrap().take() {
+            if let Some(tx) = inner.adv_tx.lock().take() {
                 let result = error.map_or_else(
                     || {
                         debug!("advertising started");
@@ -196,7 +265,7 @@ define_class!(
             let Some(svc_uuid) = cbuuid_to_uuid(&svc_uuid_ret) else {
                 return;
             };
-            if let Some(tx) = inner.add_svc_tx.lock().unwrap().remove(&svc_uuid) {
+            if let Some(tx) = inner.add_svc_tx.lock().remove(&svc_uuid) {
                 let result = error.map_or_else(
                     || {
                         debug!(service_uuid = %svc_uuid, "GATT service added");
@@ -226,11 +295,11 @@ define_class!(
             let client_id = central_device_id(central);
             trace!(client_id = %client_id, %char_uuid, "client subscribed to characteristic");
             {
-                let mut subs = inner.subscribers.lock().unwrap();
+                let mut subs = inner.subscribers.lock();
                 let entry = subs.entry(char_uuid).or_default();
                 entry.insert(client_id.clone(), unsafe { retain_send(central) });
             }
-            inner.emit(PeripheralEvent::SubscriptionChanged {
+            inner.emit_state(PeripheralStateEvent::SubscriptionChanged {
                 client_id,
                 char_uuid,
                 subscribed: true,
@@ -252,7 +321,7 @@ define_class!(
             let client_id = central_device_id(central);
             trace!(client_id = %client_id, %char_uuid, "client unsubscribed from characteristic");
             {
-                let mut subs = inner.subscribers.lock().unwrap();
+                let mut subs = inner.subscribers.lock();
                 if let Some(entry) = subs.get_mut(&char_uuid) {
                     entry.remove(&client_id);
                     if entry.is_empty() {
@@ -260,7 +329,7 @@ define_class!(
                     }
                 }
             }
-            inner.emit(PeripheralEvent::SubscriptionChanged {
+            inner.emit_state(PeripheralStateEvent::SubscriptionChanged {
                 client_id,
                 char_uuid,
                 subscribed: false,
@@ -295,7 +364,7 @@ define_class!(
             let (tx, rx) = oneshot::channel::<Result<Vec<u8>, ()>>();
             let responder = ReadResponder::new(tx);
 
-            inner.emit(PeripheralEvent::ReadRequest {
+            inner.emit_request(PeripheralRequest::Read {
                 client_id,
                 service_uuid,
                 char_uuid,
@@ -362,7 +431,7 @@ define_class!(
             let (tx, rx) = oneshot::channel::<bool>();
             let responder = WriteResponder::new(tx);
 
-            inner.emit(PeripheralEvent::WriteRequest {
+            inner.emit_request(PeripheralRequest::Write {
                 client_id,
                 service_uuid,
                 char_uuid,
@@ -395,7 +464,7 @@ define_class!(
             error: Option<&NSError>,
         ) {
             let inner = self.ivars();
-            if let Some(tx) = inner.l2cap_publish_tx.lock().unwrap().take() {
+            if let Some(tx) = inner.l2cap_publish_tx.lock().take() {
                 let result = if let Some(e) = error {
                     warn!(error = %e.localizedDescription(), "L2CAP channel publish failed");
                     Err(BlewError::Internal(e.localizedDescription().to_string()))
@@ -416,12 +485,12 @@ define_class!(
             error: Option<&NSError>,
         ) {
             let inner = self.ivars();
-            let tx = inner.l2cap_channel_tx.lock().unwrap().clone();
+            let tx = inner.l2cap_channel_tx.lock().clone();
             let Some(tx) = tx else { return };
 
             if let Some(e) = error {
                 warn!(error = %e.localizedDescription(), "incoming L2CAP channel failed");
-                let _ = tx.blocking_send(Err(BlewError::Internal(
+                let _ = tx.send(Err(BlewError::Internal(
                     e.localizedDescription().to_string(),
                 )));
                 return;
@@ -443,7 +512,7 @@ define_class!(
             };
 
             let l2cap = bridge_l2cap_channel(ch, &inner.runtime);
-            let _ = tx.blocking_send(Ok((device_id, l2cap)));
+            let _ = tx.send(Ok((device_id, l2cap)));
         }
     }
 );
@@ -467,20 +536,39 @@ unsafe impl Sync for PeripheralHandle {}
 
 pub struct ApplePeripheral(Arc<PeripheralHandle>);
 
-impl backend::private::Sealed for ApplePeripheral {}
-
-impl PeripheralBackend for ApplePeripheral {
-    type EventStream = UnboundedReceiverStream<PeripheralEvent>;
-
-    async fn new() -> BlewResult<Self>
-    where
-        Self: Sized,
-    {
+impl ApplePeripheral {
+    pub async fn with_config(
+        #[cfg_attr(not(target_os = "ios"), allow(unused))] config: PeripheralConfig,
+    ) -> BlewResult<Self> {
         let (inner, mut powered_rx) = PeripheralInner::new();
         let delegate = PeripheralDelegate::new(Arc::clone(&inner));
 
         let queue = DispatchQueue::new("blew.peripheral", DispatchQueueAttr::SERIAL);
 
+        // State restoration (CBPeripheralManagerOptionRestoreIdentifierKey) is iOS-only;
+        // passing it on macOS causes CoreBluetooth to throw an NSException.
+        #[cfg(target_os = "ios")]
+        let manager = ObjcSend(unsafe {
+            if let Some(ref id) = config.restore_identifier {
+                let key: &NSString = CBPeripheralManagerOptionRestoreIdentifierKey;
+                let value = NSString::from_str(id);
+                let v_any: &AnyObject = &value;
+                let options = NSDictionary::from_slices(&[key], &[v_any]);
+                CBPeripheralManager::initWithDelegate_queue_options(
+                    CBPeripheralManager::alloc(),
+                    Some(ProtocolObject::from_ref(&*delegate)),
+                    Some(&queue),
+                    Some(&options),
+                )
+            } else {
+                CBPeripheralManager::initWithDelegate_queue(
+                    CBPeripheralManager::alloc(),
+                    Some(ProtocolObject::from_ref(&*delegate)),
+                    Some(&queue),
+                )
+            }
+        });
+        #[cfg(not(target_os = "ios"))]
         let manager = ObjcSend(unsafe {
             CBPeripheralManager::initWithDelegate_queue(
                 CBPeripheralManager::alloc(),
@@ -521,6 +609,20 @@ impl PeripheralBackend for ApplePeripheral {
             inner,
         });
         Ok(ApplePeripheral(handle))
+    }
+}
+
+impl backend::private::Sealed for ApplePeripheral {}
+
+impl PeripheralBackend for ApplePeripheral {
+    type StateEvents = BroadcastEventStream<PeripheralStateEvent>;
+    type Requests = UnboundedReceiverStream<PeripheralRequest>;
+
+    async fn new() -> BlewResult<Self>
+    where
+        Self: Sized,
+    {
+        Self::with_config(PeripheralConfig::default()).await
     }
 
     fn is_powered(&self) -> impl Future<Output = BlewResult<bool>> + Send {
@@ -582,12 +684,12 @@ impl PeripheralBackend for ApplePeripheral {
                 unsafe { cb_service.setCharacteristics(Some(&char_array)) };
 
                 {
-                    let mut lock = handle.inner.chars.lock().unwrap();
+                    let mut lock = handle.inner.chars.lock();
                     lock.extend(char_map);
                 }
                 let (tx, rx) = oneshot::channel();
                 {
-                    let mut lock = handle.inner.add_svc_tx.lock().unwrap();
+                    let mut lock = handle.inner.add_svc_tx.lock();
                     lock.insert(service.uuid, tx);
                 }
 
@@ -633,7 +735,7 @@ impl PeripheralBackend for ApplePeripheral {
                 let adv_data = NSDictionary::from_slices(&[key_name, key_uuids], &[ln_any, ua_any]);
 
                 let (tx, rx) = oneshot::channel();
-                *handle.inner.adv_tx.lock().unwrap() = Some(tx);
+                *handle.inner.adv_tx.lock() = Some(tx);
                 unsafe { handle.manager.startAdvertising(Some(&adv_data)) };
                 rx
             };
@@ -664,7 +766,7 @@ impl PeripheralBackend for ApplePeripheral {
         async move {
             trace!(device = %device_id, %char_uuid, len = value.len(), "notifying characteristic");
             let cb_char = {
-                let lock = handle.inner.chars.lock().unwrap();
+                let lock = handle.inner.chars.lock();
                 lock.get(&char_uuid).map(|c| unsafe { retain_send(&**c) })
             };
 
@@ -673,7 +775,7 @@ impl PeripheralBackend for ApplePeripheral {
             };
 
             let cb_central = {
-                let lock = handle.inner.subscribers.lock().unwrap();
+                let lock = handle.inner.subscribers.lock();
                 lock.get(&char_uuid)
                     .and_then(|m| m.get(&device_id))
                     .map(|c| unsafe { retain_send(&**c) })
@@ -711,24 +813,41 @@ impl PeripheralBackend for ApplePeripheral {
         let handle = Arc::clone(&self.0);
         async move {
             debug!("publishing L2CAP CoC channel");
-            let (ch_tx, ch_rx) = mpsc::channel::<BlewResult<(DeviceId, L2capChannel)>>(16);
+            let (ch_tx, ch_rx) = mpsc::unbounded_channel::<BlewResult<(DeviceId, L2capChannel)>>();
             let (pub_tx, pub_rx) = oneshot::channel::<BlewResult<Psm>>();
             {
-                *handle.inner.l2cap_channel_tx.lock().unwrap() = Some(ch_tx);
-                *handle.inner.l2cap_publish_tx.lock().unwrap() = Some(pub_tx);
+                *handle.inner.l2cap_channel_tx.lock() = Some(ch_tx);
+                *handle.inner.l2cap_publish_tx.lock() = Some(pub_tx);
                 unsafe { handle.manager.publishL2CAPChannelWithEncryption(false) };
             }
             let psm = pub_rx.await.unwrap_or(Err(BlewError::Internal(
                 "l2cap_publish channel dropped".into(),
             )))?;
             debug!(psm = psm.0, "L2CAP listener ready");
-            Ok((psm, ReceiverStream::new(ch_rx)))
+            Ok((psm, UnboundedReceiverStream::new(ch_rx)))
         }
     }
 
-    fn events(&self) -> Self::EventStream {
-        let (tx, rx) = mpsc::unbounded_channel();
-        *self.0.inner.event_tx.lock().unwrap() = Some(tx);
-        UnboundedReceiverStream::new(rx)
+    fn state_events(&self) -> Self::StateEvents {
+        BroadcastEventStream::new(self.0.inner.state_tx.subscribe())
+    }
+
+    fn take_requests(&self) -> Option<Self::Requests> {
+        self.0
+            .inner
+            .request_rx
+            .lock()
+            .take()
+            .map(UnboundedReceiverStream::new)
+    }
+}
+
+impl ApplePeripheral {
+    /// Consume the preserved-services payload captured from
+    /// `peripheralManager:willRestoreState:` during `with_config`. Returns
+    /// `None` after the first call.
+    #[must_use]
+    pub fn take_restored(&self) -> Option<Vec<Uuid>> {
+        self.0.inner.restored.lock().take()
     }
 }

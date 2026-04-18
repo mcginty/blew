@@ -31,25 +31,33 @@ run = "cargo clippy --workspace --fix"
 
 [tasks.test]
 description = "Run all tests"
-run = "cargo nextest run --workspace"
+run = "cargo nextest run --workspace --features testing"
+
+[tasks."test:all"]
+description = "Run all tests"
+run = "cargo nextest run --workspace --features testing --run-ignored all"
 
 [tasks.fmt]
 description = "Format all Rust and Kotlin code"
 run = """
 cargo fmt --all
-ktlint --format 'crates/tauri-plugin-blew/android/**/*.kt'
+ktlint --format 'crates/blew/android/**/*.kt'
 """
 
 [tasks."fmt:check"]
 description = "Check formatting without modifying files"
 run = """
 cargo fmt --all -- --check
-ktlint 'crates/tauri-plugin-blew/android/**/*.kt'
+ktlint 'crates/blew/android/**/*.kt'
 """
 
 [tasks.deny]
 description = "Check dependencies for license and vulnerability issues"
 run = "cargo deny check"
+
+[tasks.verify]
+description = "Pre-commit gate: fmt + lint + test + deny"
+depends = ["fmt", "lint", "test", "deny"]
 
 # --- CI ---------------------------------------------------------------
 
