@@ -4,7 +4,7 @@ use jni::objects::{JObject, JObjectArray};
 use jni::{jni_sig, jni_str};
 use parking_lot::Mutex;
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -64,7 +64,7 @@ impl PeripheralBackend for AndroidPeripheral {
                 return Err(BlewError::PermissionDenied);
             }
             let (request_tx, request_rx) = mpsc::unbounded_channel();
-            let (state_tx, _) = broadcast::channel(64);
+            let (state_tx, _) = broadcast::channel(256);
             *STATE.lock() = Some(PeripheralState {
                 request_tx,
                 request_rx: Mutex::new(Some(request_rx)),
@@ -270,7 +270,7 @@ impl PeripheralBackend for AndroidPeripheral {
             let (psm_tx, psm_rx) = oneshot::channel();
             super::l2cap_state::set_pending_server(psm_tx);
 
-            let (accept_tx, accept_rx) = mpsc::channel(16);
+            let (accept_tx, accept_rx) = mpsc::unbounded_channel();
             super::l2cap_state::set_accept_tx(accept_tx);
 
             jvm()
@@ -289,7 +289,7 @@ impl PeripheralBackend for AndroidPeripheral {
                 .await
                 .map_err(|_| BlewError::Internal("L2CAP server open cancelled".into()))??;
 
-            Ok((psm, ReceiverStream::new(accept_rx)))
+            Ok((psm, UnboundedReceiverStream::new(accept_rx)))
         }
     }
 

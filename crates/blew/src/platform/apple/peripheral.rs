@@ -39,7 +39,7 @@ use objc2_core_bluetooth::{
 use objc2_foundation::{NSArray, NSData, NSDictionary, NSError, NSObjectProtocol, NSString};
 use tokio::runtime::Handle;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
-use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use uuid::Uuid;
 
 use tracing::{debug, trace, warn};
@@ -127,9 +127,10 @@ struct PeripheralInner {
     powered_tx: watch::Sender<bool>,
     /// Result of `publishL2CAPChannelWithEncryption` -- carries the assigned PSM.
     l2cap_publish_tx: Mutex<Option<oneshot::Sender<BlewResult<Psm>>>>,
-    /// Sender for incoming L2CAP channels (set by `l2cap_listener`).
+    /// Sender for incoming L2CAP channels (set by `l2cap_listener`). Unbounded so
+    /// the GCD delegate queue is never blocked by a slow accept-stream consumer.
     #[allow(clippy::type_complexity)]
-    l2cap_channel_tx: Mutex<Option<mpsc::Sender<BlewResult<(DeviceId, L2capChannel)>>>>,
+    l2cap_channel_tx: Mutex<Option<mpsc::UnboundedSender<BlewResult<(DeviceId, L2capChannel)>>>>,
     /// Tokio runtime handle, captured at construction time so GCD callbacks
     /// (which run off the Tokio thread) can spawn tasks onto the runtime.
     runtime: Handle,
@@ -139,7 +140,7 @@ impl PeripheralInner {
     fn new() -> (Arc<Self>, watch::Receiver<bool>) {
         let (powered_tx, powered_rx) = watch::channel(false);
         let (request_tx, request_rx) = mpsc::unbounded_channel();
-        let (state_tx, _) = broadcast::channel(64);
+        let (state_tx, _) = broadcast::channel(256);
         let inner = Arc::new(Self {
             chars: Default::default(),
             subscribers: Default::default(),
@@ -489,7 +490,7 @@ define_class!(
 
             if let Some(e) = error {
                 warn!(error = %e.localizedDescription(), "incoming L2CAP channel failed");
-                let _ = tx.blocking_send(Err(BlewError::Internal(
+                let _ = tx.send(Err(BlewError::Internal(
                     e.localizedDescription().to_string(),
                 )));
                 return;
@@ -511,7 +512,7 @@ define_class!(
             };
 
             let l2cap = bridge_l2cap_channel(ch, &inner.runtime);
-            let _ = tx.blocking_send(Ok((device_id, l2cap)));
+            let _ = tx.send(Ok((device_id, l2cap)));
         }
     }
 );
@@ -812,7 +813,7 @@ impl PeripheralBackend for ApplePeripheral {
         let handle = Arc::clone(&self.0);
         async move {
             debug!("publishing L2CAP CoC channel");
-            let (ch_tx, ch_rx) = mpsc::channel::<BlewResult<(DeviceId, L2capChannel)>>(16);
+            let (ch_tx, ch_rx) = mpsc::unbounded_channel::<BlewResult<(DeviceId, L2capChannel)>>();
             let (pub_tx, pub_rx) = oneshot::channel::<BlewResult<Psm>>();
             {
                 *handle.inner.l2cap_channel_tx.lock() = Some(ch_tx);
@@ -823,7 +824,7 @@ impl PeripheralBackend for ApplePeripheral {
                 "l2cap_publish channel dropped".into(),
             )))?;
             debug!(psm = psm.0, "L2CAP listener ready");
-            Ok((psm, ReceiverStream::new(ch_rx)))
+            Ok((psm, UnboundedReceiverStream::new(ch_rx)))
         }
     }
 

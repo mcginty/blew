@@ -30,7 +30,7 @@ const L2CAP_READ_BUF_SIZE: usize = 4096;
 struct L2capState {
     pending_server: Mutex<Option<oneshot::Sender<BlewResult<Psm>>>>,
     pending_open: Mutex<HashMap<String, oneshot::Sender<BlewResult<L2capChannel>>>>,
-    accept_tx: Mutex<Option<mpsc::Sender<BlewResult<(DeviceId, L2capChannel)>>>>,
+    accept_tx: Mutex<Option<mpsc::UnboundedSender<BlewResult<(DeviceId, L2capChannel)>>>>,
     data_tx: Mutex<HashMap<i32, mpsc::UnboundedSender<Vec<u8>>>>,
 }
 
@@ -67,7 +67,7 @@ pub(crate) fn complete_server_open(result: BlewResult<Psm>) {
     }
 }
 
-pub(crate) fn set_accept_tx(tx: mpsc::Sender<BlewResult<(DeviceId, L2capChannel)>>) {
+pub(crate) fn set_accept_tx(tx: mpsc::UnboundedSender<BlewResult<(DeviceId, L2capChannel)>>) {
     *state().accept_tx.lock() = Some(tx);
 }
 
@@ -151,8 +151,11 @@ pub(crate) fn on_channel_opened(device_addr: &str, socket_id: i32, from_server: 
         if let Some(s) = STATE.get() {
             if let Some(tx) = s.accept_tx.lock().as_ref() {
                 let device_id = DeviceId(device_addr.to_string());
-                if tx.try_send(Ok((device_id, channel))).is_err() {
-                    tracing::warn!(socket_id, "L2CAP accept buffer full, dropping channel");
+                if tx.send(Ok((device_id, channel))).is_err() {
+                    tracing::warn!(
+                        socket_id,
+                        "L2CAP accept receiver dropped, discarding channel"
+                    );
                 }
             }
         }

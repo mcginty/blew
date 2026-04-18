@@ -118,7 +118,7 @@ impl MockLink {
 
         let (central_event_tx, central_event_rx) = mpsc::unbounded_channel();
         let (periph_request_tx, periph_request_rx) = mpsc::unbounded_channel();
-        let (periph_state_tx, _) = broadcast::channel(64);
+        let (periph_state_tx, _) = broadcast::channel(256);
 
         let _ = central_event_tx.send(CentralEvent::AdapterStateChanged { powered: true });
 
@@ -198,7 +198,7 @@ impl MockCentral {
     fn new_standalone(powered: bool) -> crate::central::Central<Self> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (periph_request_tx, _periph_request_rx) = mpsc::unbounded_channel();
-        let (periph_state_tx, _) = broadcast::channel(64);
+        let (periph_state_tx, _) = broadcast::channel(256);
         let link = Arc::new(Mutex::new(LinkState::new()));
         crate::central::Central::from_backend(Self {
             link,
@@ -631,7 +631,7 @@ impl MockPeripheral {
     fn new_standalone(powered: bool) -> crate::peripheral::Peripheral<Self> {
         let (central_event_tx, _central_event_rx) = mpsc::unbounded_channel::<CentralEvent>();
         let (request_tx, request_rx) = mpsc::unbounded_channel();
-        let (state_tx, _) = broadcast::channel(64);
+        let (state_tx, _) = broadcast::channel(256);
         crate::peripheral::Peripheral::from_backend(Self {
             link: Self::make_link(),
             request_rx: Arc::new(Mutex::new(Some(request_rx))),

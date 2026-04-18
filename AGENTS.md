@@ -91,7 +91,7 @@ crates/blew/android/                  # Co-located Kotlin/Gradle module for the 
 └── AndroidManifest.xml               # Runtime permission declarations (merged into host app)
 ├── testing.rs                    # In-memory mock backends (feature = "testing")
 └── util/
-    ├── event_fanout.rs           # EventFanout<E: Clone> — mpsc fan-out for CentralEvent
+    ├── event_stream.rs           # EventStream<T,S> + BroadcastEventStream<T> (lag-swallowing)
     └── request_map.rs            # RequestMap<V> — thread-safe pending request/response coupling
 ```
 
@@ -218,7 +218,7 @@ rx.await?; // safe to await now
 
 **Global state:** Module-level `OnceLock` statics store event channels and pending operation maps. Only one Bluetooth adapter exists on Android so singletons are correct.
 
-- `AndroidCentral`: uses `EventFanout<CentralEvent>` (central events are `Clone`) + `KeyedRequestMap<oneshot::Sender>` for async request/response coupling. A per-device Kotlin coroutine queue serializes GATT ops (replacing the old adapter-wide semaphore) so a slow peer can't block others.
+- `AndroidCentral`: uses a `tokio::sync::broadcast` channel (central events are `Clone`; wrapped in `BroadcastEventStream` so slow-subscriber lag is swallowed) + `KeyedRequestMap<oneshot::Sender>` for async request/response coupling. A per-device Kotlin coroutine queue serializes GATT ops (replacing the old adapter-wide semaphore) so a slow peer can't block others.
 - `AndroidPeripheral`: state events fan out through `tokio::sync::broadcast` (`PeripheralStateEvent` is `Clone`). GATT reads/writes are delivered as `PeripheralRequest` over an `mpsc::UnboundedSender`, handed out once via `take_requests()`. For each request, a tokio task awaits the responder's oneshot then calls Kotlin `respondToRead`/`respondToWrite` via JNI. All Rust-side synchronization uses `parking_lot::Mutex`.
 
 **JNI data marshalling:** Complex data (GATT services, UUID lists) passed as flat arrays or JSON strings to avoid complex JNI type construction. Service characteristics use parallel arrays (uuids, properties, permissions, values).

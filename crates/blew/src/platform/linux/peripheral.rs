@@ -232,7 +232,7 @@ impl PeripheralBackend for LinuxPeripheral {
             .map_err(|_| BlewError::AdapterNotFound)?;
         debug!(adapter = %adapter.name(), "BLE adapter initialized");
         let (request_tx, request_rx) = mpsc::unbounded_channel();
-        let (state_tx, _) = broadcast::channel(64);
+        let (state_tx, _) = broadcast::channel(256);
         let state_tx_clone = state_tx.clone();
         let adapter_clone = adapter.clone();
         let adapter_task = tokio::spawn(async move {
