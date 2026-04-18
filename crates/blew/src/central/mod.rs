@@ -171,28 +171,6 @@ impl<B: CentralBackend> Central<B> {
         EventStream::new(self.backend.events())
     }
 
-    /// Consume the OS-level state-restoration payload, if any.
-    ///
-    /// On iOS, when `Central::with_config` was called with a `restore_identifier` and the
-    /// OS is relaunching the app, the `CBCentralManager` delegate's `willRestoreState:`
-    /// callback fires during initialisation. `with_config` captures that payload and
-    /// buffers the preserved peripherals here; this method hands them to the caller
-    /// exactly once.
-    ///
-    /// Returns:
-    /// - `Some(devices)` — this launch is an OS-level restoration and `devices` lists
-    ///   the peripherals the OS reconnected on the app's behalf. Your app should
-    ///   rehydrate its own state from these before issuing new scans/connects.
-    /// - `None` — not a restoration launch, or the restored state has already been
-    ///   taken, or the platform is not iOS.
-    ///
-    /// See the crate-level [`State restoration`](crate#state-restoration) docs for why
-    /// this is a `take_*` style API (the event fires before subscribers can attach).
-    #[must_use]
-    pub fn take_restored(&self) -> Option<Vec<BleDevice>> {
-        self.backend.take_restored()
-    }
-
     /// Clear the Android GATT service cache for `device_id`.
     ///
     /// Android-only. On other platforms this returns
@@ -223,5 +201,29 @@ impl<B: CentralBackend> Central<B> {
                 Ok(Some(_)) => {}
             }
         }
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+impl Central {
+    /// Consume the OS-level state-restoration payload, if any.
+    ///
+    /// On iOS, when [`Central::with_config`] was called with a `restore_identifier` and the
+    /// OS is relaunching the app, the `CBCentralManager` delegate's `willRestoreState:`
+    /// callback fires during initialisation. `with_config` captures that payload and
+    /// buffers the preserved peripherals here; this method hands them to the caller
+    /// exactly once.
+    ///
+    /// Returns:
+    /// - `Some(devices)` — this launch is an OS-level restoration and `devices` lists
+    ///   the peripherals the OS reconnected on the app's behalf. Your app should
+    ///   rehydrate its own state from these before issuing new scans/connects.
+    /// - `None` — not a restoration launch, or the restored state has already been taken.
+    ///
+    /// See the crate-level [`State restoration`](crate#state-restoration) docs for why
+    /// this is a `take_*` style API (the event fires before subscribers can attach).
+    #[must_use]
+    pub fn take_restored(&self) -> Option<Vec<BleDevice>> {
+        self.backend.take_restored()
     }
 }

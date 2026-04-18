@@ -5,7 +5,7 @@
 //! - CoreBluetooth method calls are dispatched from Tokio tasks directly;
 //!   CoreBluetooth is thread-safe on macOS 10.15+ / iOS 13+.
 //! - `oneshot` channels carry operation results from CB callbacks to async callers.
-//! - `EventFanout` fans `CentralEvent` (which is `Clone`) to all subscribers.
+//! - A `tokio::sync::broadcast` channel fans `CentralEvent` (which is `Clone`) to all subscribers.
 
 #![allow(
     non_snake_case,
@@ -39,8 +39,7 @@ use objc2_foundation::{
     NSArray, NSData, NSDictionary, NSError, NSNumber, NSObjectProtocol, NSString,
 };
 use tokio::runtime::Handle;
-use tokio::sync::{oneshot, watch};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::{broadcast, oneshot, watch};
 use uuid::Uuid;
 
 use tracing::{debug, trace, warn};
@@ -56,7 +55,7 @@ use crate::platform::apple::helpers::{
 };
 use crate::platform::apple::l2cap::bridge_l2cap_channel;
 use crate::types::{BleDevice, DeviceId};
-use crate::util::event_fanout::{EventFanout, EventFanoutTx};
+use crate::util::BroadcastEventStream;
 use crate::util::request_map::KeyedRequestMap;
 
 fn cb_props_to_ours(props: CBCharacteristicProperties) -> CharacteristicProperties {
@@ -102,10 +101,9 @@ struct CentralInner {
     notify_states: KeyedRequestMap<(DeviceId, Uuid), oneshot::Sender<BlewResult<()>>>,
     /// Pending `open_l2cap_channel` results, keyed by device ID.
     l2cap_pendings: KeyedRequestMap<DeviceId, oneshot::Sender<BlewResult<L2capChannel>>>,
-    event_tx: EventFanoutTx<CentralEvent>,
-    event_fanout: EventFanout<CentralEvent>,
+    event_tx: broadcast::Sender<CentralEvent>,
     /// Populated once by `willRestoreState:`; drained exactly once via
-    /// [`CentralBackend::take_restored`]. Buffered so callers can observe the
+    /// [`AppleCentral::take_restored`]. Buffered so callers can observe the
     /// restored peripheral list after construction returns — broadcast
     /// delivery would race the callback.
     restored: Mutex<Option<Vec<BleDevice>>>,
@@ -117,7 +115,7 @@ struct CentralInner {
 
 impl CentralInner {
     fn new() -> (Arc<Self>, watch::Receiver<bool>) {
-        let (event_tx, event_fanout) = EventFanout::new(128);
+        let (event_tx, _) = broadcast::channel(256);
         let (powered_tx, powered_rx) = watch::channel(false);
         let inner = Arc::new(Self {
             peripherals: Default::default(),
@@ -129,7 +127,6 @@ impl CentralInner {
             notify_states: Default::default(),
             l2cap_pendings: Default::default(),
             event_tx,
-            event_fanout,
             restored: Mutex::new(None),
             powered_tx,
             runtime: Handle::current(),
@@ -138,7 +135,7 @@ impl CentralInner {
     }
 
     fn emit(&self, event: CentralEvent) {
-        self.event_tx.send(event);
+        let _ = self.event_tx.send(event);
     }
 }
 
@@ -567,7 +564,7 @@ pub struct AppleCentral(Arc<CentralHandle>);
 impl backend::private::Sealed for AppleCentral {}
 
 impl CentralBackend for AppleCentral {
-    type EventStream = ReceiverStream<CentralEvent>;
+    type EventStream = BroadcastEventStream<CentralEvent>;
 
     async fn new() -> BlewResult<Self>
     where
@@ -897,16 +894,19 @@ impl CentralBackend for AppleCentral {
     }
 
     fn events(&self) -> Self::EventStream {
-        let rx = self.0.inner.event_fanout.subscribe(128);
-        ReceiverStream::new(rx)
-    }
-
-    fn take_restored(&self) -> Option<Vec<BleDevice>> {
-        self.0.inner.restored.lock().take()
+        BroadcastEventStream::new(self.0.inner.event_tx.subscribe())
     }
 }
 
 impl AppleCentral {
+    /// Consume the preserved-peripherals payload captured from
+    /// `centralManager:willRestoreState:` during `with_config`. Returns `None`
+    /// after the first call.
+    #[must_use]
+    pub fn take_restored(&self) -> Option<Vec<BleDevice>> {
+        self.0.inner.restored.lock().take()
+    }
+
     pub async fn with_config(
         #[cfg_attr(not(target_os = "ios"), allow(unused))] config: CentralConfig,
     ) -> BlewResult<Self> {

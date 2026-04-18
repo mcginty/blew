@@ -35,7 +35,9 @@
 //!
 //! **iOS only.** On macOS, Linux, and Android the restoration configuration is inert —
 //! `Central::with_config` / `Peripheral::with_config` accept the same types but behave
-//! identically to `new()` there, so applications can call them unconditionally.
+//! identically to `new()` there, so applications can call them unconditionally. The
+//! `take_restored()` drain methods are only exposed on Apple targets; non-Apple code
+//! does not need to call them.
 //!
 //! State restoration lets iOS relaunch your app in the background when BLE events arrive
 //! after it has been suspended or jetsam-killed. When it works, the system hands back the
@@ -70,10 +72,9 @@
 //! advertising) — otherwise the app's state can diverge from the OS's in ways that look
 //! like random disconnects.
 //!
-//! Typical shape:
+//! Typical shape (iOS):
 //!
-//! ```no_run
-//! # async fn example() -> blew::error::BlewResult<()> {
+//! ```ignore
 //! use blew::central::{Central, CentralConfig};
 //!
 //! let central: Central = Central::with_config(CentralConfig {
@@ -86,7 +87,6 @@
 //!     // kicking off any new scans or connects.
 //!     for _dev in devices { /* ... */ }
 //! }
-//! # Ok(()) }
 //! ```
 //!
 //! ## What is *not* restored

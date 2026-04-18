@@ -839,8 +839,14 @@ impl PeripheralBackend for ApplePeripheral {
             .take()
             .map(UnboundedReceiverStream::new)
     }
+}
 
-    fn take_restored(&self) -> Option<Vec<Uuid>> {
+impl ApplePeripheral {
+    /// Consume the preserved-services payload captured from
+    /// `peripheralManager:willRestoreState:` during `with_config`. Returns
+    /// `None` after the first call.
+    #[must_use]
+    pub fn take_restored(&self) -> Option<Vec<Uuid>> {
         self.0.inner.restored.lock().take()
     }
 }

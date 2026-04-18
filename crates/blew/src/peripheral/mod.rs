@@ -122,32 +122,6 @@ impl<B: PeripheralBackend> Peripheral<B> {
         self.backend.take_requests().map(EventStream::new)
     }
 
-    /// Consume the OS-level state-restoration payload, if any.
-    ///
-    /// On iOS, when `Peripheral::with_config` was called with a `restore_identifier` and
-    /// the OS is relaunching the app, the `CBPeripheralManager` delegate's
-    /// `willRestoreState:` callback fires during initialisation. `with_config` captures
-    /// that payload and buffers the preserved service UUIDs here; this method hands
-    /// them to the caller exactly once.
-    ///
-    /// Returns:
-    /// - `Some(uuids)` — this launch is an OS-level restoration and `uuids` lists the
-    ///   services the OS re-registered on the manager. The app does **not** need to
-    ///   re-call [`add_service`](Self::add_service) for these. If advertising was active
-    ///   at termination it resumes automatically.
-    /// - `None` — not a restoration launch, or the restored state has already been
-    ///   taken, or the platform is not iOS.
-    ///
-    /// **L2CAP channels are never restored.** If the previous session had one open, the
-    /// peripheral must re-publish via [`l2cap_listener`](Self::l2cap_listener).
-    ///
-    /// See the crate-level [`State restoration`](crate#state-restoration) docs for why
-    /// this is a `take_*` style API (the event fires before subscribers can attach).
-    #[must_use]
-    pub fn take_restored(&self) -> Option<Vec<Uuid>> {
-        self.backend.take_restored()
-    }
-
     /// Wait until the adapter is powered on, or return `BlewError::Timeout`.
     pub async fn wait_ready(&self, timeout: std::time::Duration) -> BlewResult<()> {
         let mut events = self.state_events();
@@ -170,6 +144,34 @@ impl<B: PeripheralBackend> Peripheral<B> {
                 Ok(Some(_)) => {}
             }
         }
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+impl Peripheral {
+    /// Consume the OS-level state-restoration payload, if any.
+    ///
+    /// On iOS, when [`Peripheral::with_config`] was called with a `restore_identifier` and
+    /// the OS is relaunching the app, the `CBPeripheralManager` delegate's
+    /// `willRestoreState:` callback fires during initialisation. `with_config` captures
+    /// that payload and buffers the preserved service UUIDs here; this method hands
+    /// them to the caller exactly once.
+    ///
+    /// Returns:
+    /// - `Some(uuids)` — this launch is an OS-level restoration and `uuids` lists the
+    ///   services the OS re-registered on the manager. The app does **not** need to
+    ///   re-call [`add_service`](Self::add_service) for these. If advertising was active
+    ///   at termination it resumes automatically.
+    /// - `None` — not a restoration launch, or the restored state has already been taken.
+    ///
+    /// **L2CAP channels are never restored.** If the previous session had one open, the
+    /// peripheral must re-publish via [`l2cap_listener`](Self::l2cap_listener).
+    ///
+    /// See the crate-level [`State restoration`](crate#state-restoration) docs for why
+    /// this is a `take_*` style API (the event fires before subscribers can attach).
+    #[must_use]
+    pub fn take_restored(&self) -> Option<Vec<Uuid>> {
+        self.backend.take_restored()
     }
 }
 

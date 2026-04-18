@@ -5,8 +5,7 @@ use std::sync::OnceLock;
 use jni::objects::{JObject, JObjectArray};
 use jni::{jni_sig, jni_str};
 use parking_lot::Mutex;
-use tokio::sync::oneshot;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::{broadcast, oneshot};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -17,14 +16,13 @@ use crate::gatt::props::CharacteristicProperties;
 use crate::gatt::service::{GattCharacteristic, GattService};
 use crate::l2cap::{L2capChannel, types::Psm};
 use crate::types::{BleDevice, DeviceId};
-use crate::util::event_fanout::{EventFanout, EventFanoutTx};
+use crate::util::BroadcastEventStream;
 use crate::util::request_map::RequestMap;
 
 use super::jni_globals::{central_class, jvm};
 
 struct CentralState {
-    event_fanout_tx: EventFanoutTx<CentralEvent>,
-    event_fanout: Mutex<EventFanout<CentralEvent>>,
+    event_tx: broadcast::Sender<CentralEvent>,
     pending_ops: RequestMap<oneshot::Sender<BlewResult<Vec<u8>>>>,
     pending_connects: RequestMap<oneshot::Sender<BlewResult<()>>>,
     connect_keys: Mutex<HashMap<String, u64>>,
@@ -42,10 +40,9 @@ fn state() -> &'static CentralState {
 }
 
 fn init_statics() {
-    let (tx, fanout) = EventFanout::new(64);
+    let (event_tx, _) = broadcast::channel(256);
     let _ = STATE.set(CentralState {
-        event_fanout_tx: tx,
-        event_fanout: Mutex::new(fanout),
+        event_tx,
         pending_ops: RequestMap::new(),
         pending_connects: RequestMap::new(),
         connect_keys: Mutex::new(HashMap::new()),
@@ -60,7 +57,7 @@ fn init_statics() {
 
 pub(crate) fn send_event(event: CentralEvent) {
     if let Some(s) = STATE.get() {
-        s.event_fanout_tx.send(event);
+        let _ = s.event_tx.send(event);
     }
 }
 
@@ -216,7 +213,7 @@ impl AndroidCentral {
 impl backend::private::Sealed for AndroidCentral {}
 
 impl CentralBackend for AndroidCentral {
-    type EventStream = ReceiverStream<CentralEvent>;
+    type EventStream = BroadcastEventStream<CentralEvent>;
 
     fn new() -> impl Future<Output = BlewResult<Self>> + Send
     where
@@ -603,12 +600,7 @@ impl CentralBackend for AndroidCentral {
     }
 
     fn events(&self) -> Self::EventStream {
-        let rx = state().event_fanout.lock().subscribe(256);
-        ReceiverStream::new(rx)
-    }
-
-    fn take_restored(&self) -> Option<Vec<BleDevice>> {
-        None
+        BroadcastEventStream::new(state().event_tx.subscribe())
     }
 }
 

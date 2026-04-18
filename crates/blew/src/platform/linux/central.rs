@@ -6,7 +6,7 @@ use crate::gatt::service::{GattCharacteristic, GattService};
 use crate::l2cap::{L2capChannel, types::Psm};
 use crate::platform::linux::l2cap::bridge_l2cap;
 use crate::types::{BleDevice, DeviceId};
-use crate::util::event_fanout::{EventFanout, EventFanoutTx};
+use crate::util::BroadcastEventStream;
 use bluer::gatt::CharacteristicFlags;
 use bluer::{Adapter, AdapterEvent, Session};
 use bytes::Bytes;
@@ -15,8 +15,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use tokio::sync::broadcast;
 use tokio_stream::StreamExt as _;
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
@@ -27,8 +27,7 @@ struct CentralInner {
     adapter: Adapter,
     discovered: Mutex<HashMap<DeviceId, BleDevice>>,
     mtu_cache: Mutex<HashMap<DeviceId, u16>>,
-    event_tx: EventFanoutTx<CentralEvent>,
-    event_fanout: EventFanout<CentralEvent>,
+    event_tx: broadcast::Sender<CentralEvent>,
     scan_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     notify_tasks: Mutex<HashMap<(DeviceId, Uuid), tokio::task::JoinHandle<()>>>,
     adapter_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -141,7 +140,7 @@ fn flags_to_props(flags: &CharacteristicFlags) -> CharacteristicProperties {
 }
 
 impl CentralBackend for LinuxCentral {
-    type EventStream = ReceiverStream<CentralEvent>;
+    type EventStream = BroadcastEventStream<CentralEvent>;
 
     async fn new() -> BlewResult<Self>
     where
@@ -164,14 +163,13 @@ impl CentralBackend for LinuxCentral {
         }
 
         check_bluez_config();
-        let (event_tx, event_fanout) = EventFanout::new(64);
+        let (event_tx, _) = broadcast::channel(256);
         let inner = Arc::new(CentralInner {
             _session: session,
             adapter,
             discovered: Mutex::new(HashMap::new()),
             mtu_cache: Mutex::new(HashMap::new()),
             event_tx,
-            event_fanout,
             scan_task: Mutex::new(None),
             notify_tasks: Mutex::new(HashMap::new()),
             adapter_task: Mutex::new(None),
@@ -188,7 +186,7 @@ impl CentralBackend for LinuxCentral {
                     event
                 {
                     debug!(powered, "central adapter state changed");
-                    inner_clone
+                    let _ = inner_clone
                         .event_tx
                         .send(CentralEvent::AdapterStateChanged { powered });
                 }
@@ -288,7 +286,7 @@ impl CentralBackend for LinuxCentral {
                                 .discovered
                                 .lock()
                                 .insert(device_id, ble_device.clone());
-                            handle
+                            let _ = handle
                                 .event_tx
                                 .send(CentralEvent::DeviceDiscovered(ble_device));
                         }
@@ -303,7 +301,7 @@ impl CentralBackend for LinuxCentral {
                             } else {
                                 DisconnectCause::AdapterOff
                             };
-                            handle
+                            let _ = handle
                                 .event_tx
                                 .send(CentralEvent::DeviceDisconnected { device_id, cause });
                         }
@@ -356,7 +354,7 @@ impl CentralBackend for LinuxCentral {
             }
             debug!(device_id = %device_id, "device connected");
             handle.clear_mtu(&device_id);
-            handle
+            let _ = handle
                 .event_tx
                 .send(CentralEvent::DeviceConnected { device_id });
             Ok(())
@@ -381,7 +379,7 @@ impl CentralBackend for LinuxCentral {
             debug!(device_id = %device_id, "device disconnected");
             handle.clear_mtu(&device_id);
             handle.drain_notify_tasks(&device_id);
-            handle.event_tx.send(CentralEvent::DeviceDisconnected {
+            let _ = handle.event_tx.send(CentralEvent::DeviceDisconnected {
                 device_id,
                 cause: DisconnectCause::LocalClose,
             });
@@ -541,7 +539,7 @@ impl CentralBackend for LinuxCentral {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             trace!(device_id = %did, %char_uuid, len = n, "characteristic notification");
-                            h.event_tx.send(CentralEvent::CharacteristicNotification {
+                            let _ = h.event_tx.send(CentralEvent::CharacteristicNotification {
                                 device_id: did.clone(),
                                 char_uuid,
                                 value: Bytes::copy_from_slice(&buf[..n]),
@@ -643,11 +641,7 @@ impl CentralBackend for LinuxCentral {
     }
 
     fn events(&self) -> Self::EventStream {
-        ReceiverStream::new(self.0.event_fanout.subscribe(64))
-    }
-
-    fn take_restored(&self) -> Option<Vec<BleDevice>> {
-        None
+        BroadcastEventStream::new(self.0.event_tx.subscribe())
     }
 }
 

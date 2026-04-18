@@ -578,7 +578,9 @@ impl CentralBackend for MockCentral {
             .expect("events() called more than once on MockCentral");
         tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
     }
+}
 
+impl MockCentral {
     fn take_restored(&self) -> Option<Vec<BleDevice>> {
         self.restored.lock().take()
     }
@@ -763,7 +765,9 @@ impl PeripheralBackend for MockPeripheral {
             .take()
             .map(tokio_stream::wrappers::UnboundedReceiverStream::new)
     }
+}
 
+impl MockPeripheral {
     fn take_restored(&self) -> Option<Vec<Uuid>> {
         self.restored.lock().take()
     }
@@ -788,6 +792,13 @@ impl crate::central::Central<MockCentral> {
     pub fn mock_emit_adapter_state(&self, powered: bool) {
         self.backend.mock_emit_adapter_state(powered);
     }
+
+    /// Consume the seeded restored-peripherals payload. See
+    /// [`MockCentral::mock_set_restored`].
+    #[must_use]
+    pub fn take_restored(&self) -> Option<Vec<BleDevice>> {
+        self.backend.take_restored()
+    }
 }
 
 impl<B: PeripheralBackend> crate::peripheral::Peripheral<B> {
@@ -809,6 +820,13 @@ impl crate::peripheral::Peripheral<MockPeripheral> {
     /// Emit an `AdapterStateChanged` event and update the powered flag.
     pub fn mock_emit_adapter_state(&self, powered: bool) {
         self.backend.mock_emit_adapter_state(powered);
+    }
+
+    /// Consume the seeded restored-services payload. See
+    /// [`MockPeripheral::mock_set_restored`].
+    #[must_use]
+    pub fn take_restored(&self) -> Option<Vec<Uuid>> {
+        self.backend.take_restored()
     }
 }
 #[cfg(test)]

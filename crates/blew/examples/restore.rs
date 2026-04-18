@@ -1,13 +1,13 @@
 //! iOS state-restoration pattern.
 //!
 //! Demonstrates the correct launch sequence for apps that want the OS to hand back
-//! preserved BLE state when it relaunches them in the background. Only the iOS backend
-//! participates; on other platforms `take_restored()` always returns `None` and the
-//! example behaves like a normal advertiser.
+//! preserved BLE state when it relaunches them in the background. Only Apple targets
+//! expose `take_restored()`, so this example is Apple-only; other platforms get a
+//! no-op stub.
 //!
 //! On iOS this would run synchronously from
-//! `application:didFinishLaunchingWithOptions:`. On a host without backgrounding it's
-//! equivalent to a plain peripheral startup.
+//! `application:didFinishLaunchingWithOptions:`. On macOS, which shares the API but
+//! not the backgrounding semantics, it's equivalent to a plain peripheral startup.
 //!
 //! Prerequisites for real state restoration on iOS:
 //!
@@ -23,21 +23,26 @@
 //!
 //! See the crate-level `State restoration` rustdoc for the full contract.
 
-use blew::central::{Central, CentralConfig};
-use blew::gatt::props::{AttributePermissions, CharacteristicProperties};
-use blew::gatt::service::{GattCharacteristic, GattService};
-use blew::peripheral::{AdvertisingConfig, Peripheral, PeripheralConfig};
-use uuid::Uuid;
+#[cfg(not(target_vendor = "apple"))]
+fn main() {
+    println!("restore.rs is Apple-only; target_vendor != \"apple\" on this build.");
+}
 
-const SVC_UUID: Uuid = Uuid::from_u128(0x12345678_1234_1234_1234_123456789abc);
-const CHAR_UUID: Uuid = Uuid::from_u128(0x12345678_1234_1234_1234_123456789abd);
-
-// The restore identifier must be stable across launches; the OS matches on it.
-const CENTRAL_RESTORE_ID: &str = "org.example.blew.central.restore";
-const PERIPHERAL_RESTORE_ID: &str = "org.example.blew.peripheral.restore";
-
+#[cfg(target_vendor = "apple")]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use blew::central::{Central, CentralConfig};
+    use blew::gatt::props::{AttributePermissions, CharacteristicProperties};
+    use blew::gatt::service::{GattCharacteristic, GattService};
+    use blew::peripheral::{AdvertisingConfig, Peripheral, PeripheralConfig};
+    use uuid::Uuid;
+
+    // The restore identifier must be stable across launches; the OS matches on it.
+    const CENTRAL_RESTORE_ID: &str = "org.example.blew.central.restore";
+    const PERIPHERAL_RESTORE_ID: &str = "org.example.blew.peripheral.restore";
+    const SVC_UUID: Uuid = Uuid::from_u128(0x12345678_1234_1234_1234_123456789abc);
+    const CHAR_UUID: Uuid = Uuid::from_u128(0x12345678_1234_1234_1234_123456789abd);
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();

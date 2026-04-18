@@ -334,7 +334,6 @@ pub(crate) fn bridge_l2cap_channel(channel: &CBL2CAPChannel, runtime: &Handle) -
                 break;
             }
         }
-        let _ = reactor_for_io.send(ReactorCmd::Close { id: channel_id });
         trace!(id = channel_id, "apple L2CAP outbound async bridge exited");
     });
 

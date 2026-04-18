@@ -310,10 +310,6 @@ impl PeripheralBackend for AndroidPeripheral {
         };
         rx.map(UnboundedReceiverStream::new)
     }
-
-    fn take_restored(&self) -> Option<Vec<Uuid>> {
-        None
-    }
 }
 
 fn jni_err(e: jni::errors::Error) -> BlewError {
