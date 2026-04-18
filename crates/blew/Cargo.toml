@@ -13,7 +13,12 @@ include = [
     "Cargo.toml",
     "LICENSE",
     "README.md",
-    "android/**/*",
+    "android/.editorconfig",
+    "android/.gitignore",
+    "android/build.gradle.kts",
+    "android/settings.gradle",
+    "android/src/main/AndroidManifest.xml",
+    "android/src/main/java/**/*.kt",
 ]
 
 [features]
