@@ -20,6 +20,10 @@ All notable changes to `blew` are documented here. Format follows
 - Two-host integration examples: `integration_central`, `integration_peripheral`
   (GATT + L2CAP speedtest with live progress), and `restore.rs` (iOS launch sequence).
 - Typed error variants: `StreamClosed`, `DisconnectedDuringOperation`, `DiscoveryFailed`.
+- Expanded README guidance for Linux central to Apple peripherals, explaining why
+  BlueZ/CoreBluetooth pairing prompts happen and documenting the recommended
+  `main.conf` workarounds (`DisablePlugins=battery,deviceinfo`, `[GATT] Cache=no`,
+  `JustWorksRepairing=always` for re-pairing).
 
 ### Changed
 
