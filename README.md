@@ -42,6 +42,52 @@ necessary Kotlin/JNI glue to enable Android functionality.
 - **Linux/BlueZ:** negotiated ATT MTU is not plumbed through the API yet; `Central::mtu` returns
   a conservative default of 247. Writes larger than 244 bytes may be rejected by peers with
   smaller negotiated MTUs.
+- **Linux → macOS/iOS pairing popups.** When a Linux (BlueZ) central connects to a macOS or iOS
+  peripheral, `bluetoothd`'s built-in plugins auto-read a handful of well-known characteristics
+  (`Battery Level` 0x2A19, `Device Information` 0x180A, HID-over-GATT reports, …) immediately
+  after service discovery. Apple marks most of those as encryption-required, so SMP is triggered
+  and both sides show a pairing dialog — even when your app never touches them. The reverse
+  direction (macOS central → Linux peripheral) is unaffected, because CoreBluetooth does not
+  eagerly probe unknown characteristics.
+
+  `blew` already disables its adapter's `Pairable` flag and opens L2CAP sockets at
+  `SecurityLevel::Low` so it never *initiates* SMP from user code, and logs a warning at startup
+  (`BlueZ config may trigger Apple pairing popups: …`) if your `bluetoothd` configuration will
+  let the plugins do it anyway. To silence the popups completely, edit `/etc/bluetooth/main.conf`
+  and add:
+
+  ```ini
+  [General]
+  # battery (bas) + deviceinfo (dis) auto-read encrypted Apple characteristics on connect.
+  # hog/input do the same for HID-over-GATT peripherals (Magic Keyboard, etc.).
+  DisablePlugins = battery,deviceinfo,hog,input
+
+  [GATT]
+  # Default is "always": BlueZ caches characteristic values (including encrypted ones) during
+  # discovery. "no" means it only reads what the app asks for.
+  Cache = no
+  ```
+
+  Then `sudo systemctl restart bluetooth`. Equivalent one-liner via `systemctl edit`:
+
+  ```ini
+  [Service]
+  ExecStart=
+  ExecStart=/usr/lib/bluetooth/bluetoothd -P battery,deviceinfo,hog,input
+  ```
+
+  (`-P` takes a glob list and is the same list of plugin names used in `DisablePlugins`.)
+
+  App-level hygiene that matters even with the config above: do **not** `read_characteristic` /
+  `write_characteristic` / `subscribe_characteristic` against Apple system services
+  (`0x180F` Battery, `0x180A` Device Info, `0x1805` Current Time, ANCS, Continuity, …) unless
+  you genuinely want bonding — those reads will always provoke SMP. Stick to your own service
+  UUIDs; L2CAP CoC carries its own security level and does not trigger pairing on its own.
+
+  If your workflow requires bonding (e.g. accessing `0x180F` intentionally), add
+  `JustWorksRepairing = always` under `[General]` and register a `NoInputNoOutput` agent so
+  BlueZ accepts the Just-Works exchange without a Linux-side prompt. The macOS prompt is not
+  suppressible from the Linux side — that's a platform decision CoreBluetooth makes.
 - **Android:** BLE permissions (`BLUETOOTH_SCAN`/`CONNECT`/`ADVERTISE` on API 31+, plus
   `ACCESS_FINE_LOCATION` on older versions) must be granted at runtime — `Central::new` /
   `Peripheral::new` return `BlewError::PermissionDenied` if not. For non-Tauri apps,

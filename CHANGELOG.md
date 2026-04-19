@@ -7,6 +7,10 @@ All notable changes to `blew` are documented here. Format follows
 
 ### Added
 
+- README platform note documenting the Linux → macOS/iOS pairing-dialog
+  asymmetry and the exact `bluetoothd` configuration (`DisablePlugins =
+  battery,deviceinfo,hog,input`, `[GATT] Cache = no`) that suppresses it.
+  Complements the runtime `check_bluez_config()` warning.
 - iOS state restoration for both roles. `Central::with_config` and
   `Peripheral::with_config` accept a `restore_identifier`; after construction,
   `take_restored()` drains the peripherals/services preserved by `willRestoreState:`.
