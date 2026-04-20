@@ -18,51 +18,74 @@ class BlewPlugin(
     companion object {
         private const val TAG = "BlewPlugin"
         private const val PERMISSION_REQUEST_CODE = 42_001
+
+        @Volatile
+        private var hostActivity: Activity? = null
+
+        @JvmStatic
+        fun requestBlePermissions() {
+            val activity =
+                hostActivity ?: run {
+                    Log.w(TAG, "requestBlePermissions called before plugin load")
+                    return
+                }
+            activity.runOnUiThread { requestOnActivity(activity) }
+        }
+
+        private fun requestOnActivity(activity: Activity) {
+            val needed = mutableListOf<String>()
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                if (!hasPermission(activity, Manifest.permission.BLUETOOTH_SCAN)) {
+                    needed.add(Manifest.permission.BLUETOOTH_SCAN)
+                }
+                if (!hasPermission(activity, Manifest.permission.BLUETOOTH_CONNECT)) {
+                    needed.add(Manifest.permission.BLUETOOTH_CONNECT)
+                }
+                if (!hasPermission(activity, Manifest.permission.BLUETOOTH_ADVERTISE)) {
+                    needed.add(Manifest.permission.BLUETOOTH_ADVERTISE)
+                }
+            } else {
+                if (!hasPermission(activity, Manifest.permission.ACCESS_FINE_LOCATION)) {
+                    needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
+                }
+            }
+
+            if (needed.isNotEmpty()) {
+                Log.d(TAG, "requesting BLE permissions: $needed")
+                ActivityCompat.requestPermissions(
+                    activity,
+                    needed.toTypedArray(),
+                    PERMISSION_REQUEST_CODE,
+                )
+            } else {
+                Log.d(TAG, "all BLE permissions already granted")
+            }
+        }
+
+        private fun hasPermission(
+            activity: Activity,
+            permission: String,
+        ): Boolean =
+            ContextCompat.checkSelfPermission(activity, permission) ==
+                PackageManager.PERMISSION_GRANTED
     }
 
     override fun load(webView: WebView) {
         super.load(webView)
 
+        hostActivity = activity
         val ctx = activity.applicationContext
         BleCentralManager.init(ctx)
         BlePeripheralManager.init(ctx)
 
-        requestBlePermissions()
+        if (BlewPluginNative.autoRequestPermissionsEnabled()) {
+            requestOnActivity(activity)
+        }
         Log.d(TAG, "blew plugin loaded")
     }
+}
 
-    private fun requestBlePermissions() {
-        val needed = mutableListOf<String>()
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            if (!hasPermission(Manifest.permission.BLUETOOTH_SCAN)) {
-                needed.add(Manifest.permission.BLUETOOTH_SCAN)
-            }
-            if (!hasPermission(Manifest.permission.BLUETOOTH_CONNECT)) {
-                needed.add(Manifest.permission.BLUETOOTH_CONNECT)
-            }
-            if (!hasPermission(Manifest.permission.BLUETOOTH_ADVERTISE)) {
-                needed.add(Manifest.permission.BLUETOOTH_ADVERTISE)
-            }
-        } else {
-            if (!hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)) {
-                needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
-            }
-        }
-
-        if (needed.isNotEmpty()) {
-            Log.d(TAG, "requesting BLE permissions: $needed")
-            ActivityCompat.requestPermissions(
-                activity,
-                needed.toTypedArray(),
-                PERMISSION_REQUEST_CODE,
-            )
-        } else {
-            Log.d(TAG, "all BLE permissions already granted")
-        }
-    }
-
-    private fun hasPermission(permission: String): Boolean =
-        ContextCompat.checkSelfPermission(activity, permission) ==
-            PackageManager.PERMISSION_GRANTED
+internal object BlewPluginNative {
+    @JvmStatic external fun autoRequestPermissionsEnabled(): Boolean
 }

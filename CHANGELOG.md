@@ -22,6 +22,13 @@ All notable changes to `blew` are documented here. Format follows
 - Typed error variants: `StreamClosed`, `DisconnectedDuringOperation`, `DiscoveryFailed`.
 - Moved the long platform notes and bare Android setup guide out of the top-level
   README into `docs/platform-notes.md` and `docs/android-without-tauri.md`.
+- `tauri-plugin-blew`: `BlewPluginConfig` + `init_with_config()` to opt out of
+  auto-requesting Android BLE permissions at plugin load, and
+  `request_ble_permissions()` to trigger the runtime dialog on demand (e.g.
+  after an in-app explanation modal). Default behavior (`init()`) is unchanged.
+- `blew::platform::android::request_ble_permissions()` — fire-and-forget helper
+  that invokes the Tauri plugin's static method over JNI to show the Android
+  runtime-permissions dialog. Requires the Tauri plugin to have loaded.
 
 ### Changed
 

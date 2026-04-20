@@ -49,3 +49,51 @@ pub fn are_ble_permissions_granted() -> bool {
         });
     result.unwrap_or(false)
 }
+
+/// Trigger the Android BLE runtime permissions dialog.
+///
+/// Fire-and-forget: the OS dialog is shown asynchronously on the host
+/// activity's UI thread. Callers should poll [`are_ble_permissions_granted`]
+/// to learn the result.
+///
+/// Requires the `org.jakebot.blew.BlewPlugin` class to be loaded (i.e. the
+/// Tauri plugin has been registered and its `load()` has run). If the class
+/// is unavailable or the host activity hasn't been captured yet, this is a
+/// no-op and a warning is logged.
+pub fn request_ble_permissions() {
+    use jni::objects::{JObject, JValue};
+    use jni::{jni_sig, jni_str};
+    let result: Result<(), jni::errors::Error> = jni_globals::jvm().attach_current_thread(|env| {
+        let activity =
+            unsafe { JObject::from_raw(env, ndk_context::android_context().context().cast()) };
+        let class_loader = env
+            .call_method(
+                &activity,
+                jni_str!("getClassLoader"),
+                jni_sig!("()Ljava/lang/ClassLoader;"),
+                &[],
+            )?
+            .l()?;
+        let class_name = env.new_string("org.jakebot.blew.BlewPlugin")?;
+        let class_obj = env
+            .call_method(
+                &class_loader,
+                jni_str!("loadClass"),
+                jni_sig!("(Ljava/lang/String;)Ljava/lang/Class;"),
+                &[JValue::Object(&class_name)],
+            )?
+            .l()?;
+        let class = unsafe { jni::objects::JClass::from_raw(env, class_obj.as_raw()) };
+        env.call_static_method(
+            &class,
+            jni_str!("requestBlePermissions"),
+            jni_sig!("()V"),
+            &[],
+        )?;
+        drop(activity);
+        Ok(())
+    });
+    if let Err(e) = result {
+        tracing::warn!("request_ble_permissions failed: {e}");
+    }
+}
