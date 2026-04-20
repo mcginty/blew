@@ -3,6 +3,20 @@
 All notable changes to `blew` are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- `tauri-plugin-blew` no longer fails to locate the Android Kotlin sources when
+  consumed from crates.io. Previously `build.rs` resolved `../blew/android`
+  relative to its own manifest, which works in the workspace but points to a
+  non-existent sibling in the published tarball (Gradle then reported
+  "No variants exist"). `blew` now emits its Android directory via the
+  `links = "blew"` metadata channel, and `tauri-plugin-blew` reads it as
+  `DEP_BLEW_ANDROID_DIR` at build time.
+
+---
+
 ## [0.2.0] — unreleased
 
 ### Added
