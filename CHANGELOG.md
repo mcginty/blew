@@ -14,6 +14,11 @@ All notable changes to `blew` are documented here. Format follows
   "No variants exist"). `blew` now emits its Android directory via the
   `links = "blew"` metadata channel, and `tauri-plugin-blew` reads it as
   `DEP_BLEW_ANDROID_DIR` at build time.
+- Android Gradle module now declares `kotlinx-coroutines-android` as an
+  `implementation` dependency. The Kotlin sources (`BleCentralManager`,
+  `GattOperationQueue`) import `kotlinx.coroutines.*` but the coroutine
+  runtime was previously only pulled in transitively via the host app, which
+  failed for consumers that didn't already depend on it.
 
 ---
 
