@@ -18,7 +18,7 @@ tauri = "2"
 tracing = "0.1"
 
 [target.'cfg(target_os = "android")'.dependencies]
-blew = { path = "../blew", version = "0.2.0-alpha.3" }
+blew = { path = "../blew", version = "0.2.0-alpha.4" }
 jni = "0.22"
 ndk-context = "0.1"
 tokio = { version = "1", features = ["sync"] }
