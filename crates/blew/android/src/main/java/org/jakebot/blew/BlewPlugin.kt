@@ -22,6 +22,11 @@ class BlewPlugin(
         @Volatile
         private var hostActivity: Activity? = null
 
+        // Snapshot of the aggregate BLE-permission state as of the last check.
+        // `null` means no snapshot recorded yet (initial state).
+        @Volatile
+        private var lastPermissionsGranted: Boolean? = null
+
         @JvmStatic
         fun requestBlePermissions() {
             val activity =
@@ -69,6 +74,15 @@ class BlewPlugin(
         ): Boolean =
             ContextCompat.checkSelfPermission(activity, permission) ==
                 PackageManager.PERMISSION_GRANTED
+
+        private fun computeAggregateGranted(activity: Activity): Boolean =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                hasPermission(activity, Manifest.permission.BLUETOOTH_SCAN) &&
+                    hasPermission(activity, Manifest.permission.BLUETOOTH_CONNECT) &&
+                    hasPermission(activity, Manifest.permission.BLUETOOTH_ADVERTISE)
+            } else {
+                hasPermission(activity, Manifest.permission.ACCESS_FINE_LOCATION)
+            }
     }
 
     override fun load(webView: WebView) {
@@ -79,13 +93,28 @@ class BlewPlugin(
         BleCentralManager.init(ctx)
         BlePeripheralManager.init(ctx)
 
+        lastPermissionsGranted = computeAggregateGranted(activity)
+
         if (BlewPluginNative.autoRequestPermissionsEnabled()) {
             requestOnActivity(activity)
         }
         Log.d(TAG, "blew plugin loaded")
     }
+
+    override fun onResume() {
+        super.onResume()
+        val current = computeAggregateGranted(activity)
+        val previous = lastPermissionsGranted
+        if (previous != current) {
+            lastPermissionsGranted = current
+            Log.d(TAG, "permissions changed: granted=$current")
+            BlewPluginNative.onPermissionsChanged(current)
+        }
+    }
 }
 
 internal object BlewPluginNative {
     @JvmStatic external fun autoRequestPermissionsEnabled(): Boolean
+
+    @JvmStatic external fun onPermissionsChanged(granted: Boolean)
 }

@@ -29,6 +29,11 @@ All notable changes to `blew` are documented here. Format follows
 - `blew::platform::android::request_ble_permissions()` — fire-and-forget helper
   that invokes the Tauri plugin's static method over JNI to show the Android
   runtime-permissions dialog. Requires the Tauri plugin to have loaded.
+- `tauri-plugin-blew::permission_events()` + `BlePermissionStatus` — broadcast
+  stream emitted whenever the aggregate Android BLE-permission state flips
+  between granted and denied. Detected in `BlewPlugin.onResume`, so it covers
+  both in-app dialog responses and out-of-app toggles (e.g. the user disabling
+  a permission in system Settings while the app is backgrounded).
 
 ### Changed
 
