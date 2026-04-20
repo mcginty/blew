@@ -5,8 +5,9 @@
 
 # `blew` (and `tauri-plugin-blew`)
 
-🔥 Warning 🔥 This library is in alpha state and is subject to change without
-backwards-compatibility until otherwise noted.
+🔥 **Warning:** 🔥 This library is experimental. A best effort will be made to resolve
+bugs and follow semantic versioning, but there are no guarantees. Do not rely on it
+until it has been sufficiently field-tested.
 
 `blew` is a BLE (Bluetooth Low Energy) Rust library focused on enabling
 peer-to-peer applications, and was built as the backend for
