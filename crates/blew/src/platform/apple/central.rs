@@ -92,6 +92,7 @@ struct CentralInner {
     peripherals: Mutex<HashMap<DeviceId, ObjcSend<CBPeripheral>>>,
     discovered: Mutex<HashMap<DeviceId, BleDevice>>,
     connects: KeyedRequestMap<DeviceId, oneshot::Sender<BlewResult<()>>>,
+    connect_timeout: Mutex<Option<std::time::Duration>>,
     // `discoveries` keeps a mutable `DiscoveryState` per device (services
     // accumulate across multiple didDiscoverCharacteristicsForService
     // callbacks), so it needs `get_mut` and can't use KeyedRequestMap.
@@ -121,6 +122,7 @@ impl CentralInner {
             peripherals: Default::default(),
             discovered: Default::default(),
             connects: Default::default(),
+            connect_timeout: Mutex::new(None),
             discoveries: Default::default(),
             reads: Default::default(),
             writes: Default::default(),
@@ -622,6 +624,7 @@ impl CentralBackend for AppleCentral {
             debug!(device_id = %device_id, "connecting to device");
             // All ObjC ops in a synchronous block to avoid holding !Send types across .await.
             let id_for_err = device_id.clone();
+            let peripheral_to_cancel;
             let rx = {
                 let peripheral = handle
                     .inner
@@ -634,19 +637,48 @@ impl CentralBackend for AppleCentral {
                 };
 
                 let (tx, rx) = oneshot::channel();
-                let evicted = handle.inner.connects.insert(device_id, tx);
-                if evicted.is_some() {
-                    warn!(device_id = %id_for_err, "concurrent connect evicted pending waiter");
+                if handle
+                    .inner
+                    .connects
+                    .try_insert(device_id.clone(), tx)
+                    .is_err()
+                {
+                    return Err(BlewError::ConnectInFlight(device_id));
                 }
 
                 unsafe {
                     peripheral.setDelegate(Some(ProtocolObject::from_ref(&*handle.delegate)));
                     handle.manager.connectPeripheral_options(&peripheral, None);
                 }
+                peripheral_to_cancel = peripheral;
                 rx
             };
-            rx.await
-                .unwrap_or(Err(BlewError::DisconnectedDuringOperation(id_for_err)))
+
+            let timeout = *handle.inner.connect_timeout.lock();
+            let result = match timeout {
+                Some(dur) => match tokio::time::timeout(dur, rx).await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(_)) => Err(BlewError::DisconnectedDuringOperation(id_for_err.clone())),
+                    Err(_) => {
+                        handle.inner.connects.take(&id_for_err);
+                        unsafe {
+                            handle
+                                .manager
+                                .cancelPeripheralConnection(&peripheral_to_cancel);
+                        }
+                        handle.inner.emit(CentralEvent::DeviceDisconnected {
+                            device_id: id_for_err.clone(),
+                            cause: DisconnectCause::Timeout,
+                        });
+                        Err(BlewError::ConnectTimedOut(id_for_err))
+                    }
+                },
+                None => rx
+                    .await
+                    .unwrap_or(Err(BlewError::DisconnectedDuringOperation(id_for_err))),
+            };
+            drop(peripheral_to_cancel);
+            result
         }
     }
 
@@ -907,10 +939,9 @@ impl AppleCentral {
         self.0.inner.restored.lock().take()
     }
 
-    pub async fn with_config(
-        #[cfg_attr(not(target_os = "ios"), allow(unused))] config: CentralConfig,
-    ) -> BlewResult<Self> {
+    pub async fn with_config(config: CentralConfig) -> BlewResult<Self> {
         let (inner, mut powered_rx) = CentralInner::new();
+        *inner.connect_timeout.lock() = config.connect_timeout;
         let delegate = CentralDelegate::new(Arc::clone(&inner));
         let queue = DispatchQueue::new("blew.central", DispatchQueueAttr::SERIAL);
 

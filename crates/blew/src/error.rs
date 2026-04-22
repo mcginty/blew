@@ -40,6 +40,12 @@ pub enum BlewError {
     #[error("operation timed out")]
     Timeout,
 
+    #[error("connect to {0} timed out")]
+    ConnectTimedOut(DeviceId),
+
+    #[error("connect to {0} already in flight")]
+    ConnectInFlight(DeviceId),
+
     #[error("GATT busy on device {0} (another operation in flight)")]
     GattBusy(DeviceId),
 

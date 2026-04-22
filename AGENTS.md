@@ -273,6 +273,32 @@ rx.await?; // safe to await now
 
 **Auto MTU negotiation:** `BleCentralManager.kt` calls `requestMtu(512)` automatically after connecting.
 
+**Connect reliability invariants (all three backends, Android load-bearing):**
+
+- `CentralConfig::connect_timeout: Option<Duration>` bounds `connect()`. The
+  `Default` is 15s. On elapse every backend returns `BlewError::ConnectTimedOut`
+  and emits `CentralEvent::DeviceDisconnected { cause: Timeout }`. `None`
+  restores pre-0.3 unbounded behavior. `BlewError::Timeout` is now reserved
+  for adapter-readiness waits (`wait_ready` / `wait_powered`) and is **not**
+  used by the connect path. Keep it that way — splitting the two lets callers
+  match precisely.
+- Overlapping `connect()` on the same device is rejected with
+  `BlewError::ConnectInFlight(DeviceId)` on Apple and Android (built on
+  `KeyedRequestMap::try_insert`). Linux relies on bluer's own state machine.
+  Do not reintroduce "latest wins" eviction — it silently orphans the first
+  caller's oneshot.
+- Android `disconnect()` **awaits** `onConnectionStateChange(DISCONNECTED)`
+  with a 2s fallback. On fallback it calls Kotlin `forceClose(addr)` which
+  synchronously removes the handle from `gattConnections`, invokes the hidden
+  `refresh()`, and calls `gatt.close()`. This prevents leaking client-IF
+  slots (Android caps at ~7). Do not revert to fire-and-forget disconnect.
+- Status-133 zombie handling lives in Kotlin: on
+  `onConnectionStateChange(DISCONNECTED, status=133)` the backend calls
+  `refresh()` **before** `close()` to flush the client-side service cache.
+  `BleCentralManager.connect()`'s stale-cleanup path does the same and then
+  `delay(300)` before the next `connectGatt()` — back-to-back `connectGatt`
+  attempts to the same address can be silently dropped by some vendor stacks.
+
 ## `crates/tauri-plugin-blew` — Tauri plugin for Android BLE setup
 
 A thin Tauri 2 integration wrapper. The Kotlin BLE classes now live in `crates/blew/android/`; this crate just points Tauri's Gradle build at that path and initializes the JNI bridge.
