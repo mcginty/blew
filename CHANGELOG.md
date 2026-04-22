@@ -5,6 +5,8 @@ All notable changes to `blew` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-04-22
+
 ### Added
 
 - `CentralConfig::connect_timeout: Option<Duration>` — deadline applied to
@@ -51,6 +53,31 @@ All notable changes to `blew` are documented here. Format follows
 - Apple `Central::connect` silently evicted any pending completion channel
   when called twice concurrently for the same device, leaving the first
   caller hanging. Now rejected with `ConnectInFlight`.
+
+---
+
+## [0.2.3] — 2026-04-20
+
+### Fixed
+
+- Pin `kotlinx-coroutines-android` to 1.7.3 in the Android module for Tauri
+  compatibility. 1.10.x conflicts with the coroutines version Tauri's own
+  Android runtime pulls in.
+
+## [0.2.2] — 2026-04-20
+
+### Fixed
+
+- Android Gradle module now declares `kotlinx-coroutines-android` as an
+  `implementation` dependency. The Kotlin sources (`BleCentralManager`,
+  `GattOperationQueue`) import `kotlinx.coroutines.*` but the coroutine
+  runtime was previously only pulled in transitively via the host app, which
+  failed for consumers that didn't already depend on it.
+
+## [0.2.1] — 2026-04-20
+
+### Fixed
+
 - `tauri-plugin-blew` no longer fails to locate the Android Kotlin sources when
   consumed from crates.io. Previously `build.rs` resolved `../blew/android`
   relative to its own manifest, which works in the workspace but points to a
@@ -58,15 +85,8 @@ All notable changes to `blew` are documented here. Format follows
   "No variants exist"). `blew` now emits its Android directory via the
   `links = "blew"` metadata channel, and `tauri-plugin-blew` reads it as
   `DEP_BLEW_ANDROID_DIR` at build time.
-- Android Gradle module now declares `kotlinx-coroutines-android` as an
-  `implementation` dependency. The Kotlin sources (`BleCentralManager`,
-  `GattOperationQueue`) import `kotlinx.coroutines.*` but the coroutine
-  runtime was previously only pulled in transitively via the host app, which
-  failed for consumers that didn't already depend on it.
 
----
-
-## [0.2.0] — unreleased
+## [0.2.0] — 2026-04-20
 
 ### Added
 
@@ -221,7 +241,7 @@ These were `pub use`'d from `util` but are removed. If you reached into them
 
 ---
 
-## Upgrade guide — 0.2.x → Unreleased
+## Upgrade guide — 0.2.x → 0.3.0
 
 **If you were constructing `CentralConfig` as a struct literal**, it gains a
 new field:
