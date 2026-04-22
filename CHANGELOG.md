@@ -5,8 +5,52 @@ All notable changes to `blew` are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- `CentralConfig::connect_timeout: Option<Duration>` — deadline applied to
+  `Central::connect()`. `Default` sets it to 15s; `None` restores pre-0.3
+  unbounded-wait behavior. Applied uniformly across Apple, Linux, and Android
+  backends; emits `CentralEvent::DeviceDisconnected { cause: Timeout }` when
+  it fires.
+- `BlewError::ConnectTimedOut(DeviceId)` — returned from `Central::connect`
+  when the new deadline elapses. Distinct from `BlewError::Timeout`, which
+  remains reserved for adapter-readiness waits (`wait_ready` / `wait_powered`).
+- `BlewError::ConnectInFlight(DeviceId)` — returned when `Central::connect`
+  is called for a device that already has a connect in flight. Previously the
+  second caller silently stole the first caller's completion.
+
+### Changed
+
+- **Android `Central::disconnect` now awaits the `onConnectionStateChange`
+  callback** (with a 2-second fallback) instead of returning `Ok` immediately
+  after dispatching the JNI call. This prevents zombie `BluetoothGatt`
+  handles when the callback never arrives — the fallback path calls a new
+  Kotlin `forceClose(addr)` that flushes the service cache (`refresh()`) and
+  closes the GATT handle synchronously, freeing the client-IF slot.
+- **Android post-133 cleanup.** `onConnectionStateChange(DISCONNECTED,
+  status=133)` now calls the hidden `BluetoothGatt.refresh()` before
+  `close()` to flush the client-side service cache. The `connect()`
+  stale-cleanup path also calls `refresh()` on the old handle and waits
+  ~300ms before issuing the fresh `connectGatt()`, matching the canonical
+  Android BLE back-off recommendation.
+- Linux `Central::connect` deadline is now config-driven (via
+  `CentralConfig::connect_timeout`) and returns `BlewError::ConnectTimedOut`
+  on elapse. Previously it was hardcoded to 30s and returned the generic
+  `BlewError::Timeout`.
+
 ### Fixed
 
+- `Central::connect()` could hang indefinitely on Android if
+  `onConnectionStateChange` never fired (e.g. radio busy, adapter thrash,
+  status-133 zombie). The new `connect_timeout` default now bounds this;
+  callers that need the old behavior can opt in with
+  `CentralConfig { connect_timeout: None, .. }`.
+- Overlapping `Central::connect()` calls for the same device no longer
+  silently orphan the first caller's completion channel. Android, Apple:
+  the second caller receives `BlewError::ConnectInFlight` immediately.
+- Apple `Central::connect` silently evicted any pending completion channel
+  when called twice concurrently for the same device, leaving the first
+  caller hanging. Now rejected with `ConnectInFlight`.
 - `tauri-plugin-blew` no longer fails to locate the Android Kotlin sources when
   consumed from crates.io. Previously `build.rs` resolved `../blew/android`
   relative to its own manifest, which works in the workspace but points to a
@@ -174,6 +218,61 @@ match err {
 These were `pub use`'d from `util` but are removed. If you reached into them
 (unlikely — they were primarily a backend implementation detail), switch to
 `tokio::sync::broadcast` + `BroadcastEventStream` from `util::event_stream`.
+
+---
+
+## Upgrade guide — 0.2.x → Unreleased
+
+**If you were constructing `CentralConfig` as a struct literal**, it gains a
+new field:
+
+```rust
+// Before
+let config = CentralConfig { restore_identifier: Some("...".into()) };
+
+// After — either spread the default or set the new field explicitly
+let config = CentralConfig {
+    restore_identifier: Some("...".into()),
+    ..CentralConfig::default()
+};
+```
+
+**If you were matching on `BlewError::Timeout` for a connect failure on
+Linux**, the variant narrowed to `BlewError::ConnectTimedOut(DeviceId)`:
+
+```rust
+// Before — Linux connect timeout returned the generic variant
+match central.connect(&id).await {
+    Err(BlewError::Timeout) => /* ... */,
+    _ => /* ... */,
+}
+
+// After
+match central.connect(&id).await {
+    Err(BlewError::ConnectTimedOut(_)) => /* ... */,
+    _ => /* ... */,
+}
+```
+
+`BlewError::Timeout` is still used by `Central::wait_ready`,
+`Peripheral::wait_ready`, and `wait_powered`.
+
+**If you relied on unbounded connect waits**, set
+`CentralConfig.connect_timeout = None` when constructing the central:
+
+```rust
+let central: Central = Central::with_config(CentralConfig {
+    connect_timeout: None,
+    ..CentralConfig::default()
+}).await?;
+```
+
+**If overlapping `connect()` calls were previously "works by luck"**: the
+second caller now receives `BlewError::ConnectInFlight(DeviceId)` immediately
+on Apple and Android. If you need shared-completion fan-out semantics,
+implement them at your layer (e.g. wrap the shared future in
+`futures::future::Shared`). Linux still permits concurrent connects via
+bluer's own state machine.
 
 ---
 

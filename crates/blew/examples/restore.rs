@@ -51,6 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let central: Central = Central::with_config(CentralConfig {
         restore_identifier: Some(CENTRAL_RESTORE_ID.into()),
+        ..CentralConfig::default()
     })
     .await?;
 

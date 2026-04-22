@@ -16,6 +16,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -309,6 +310,14 @@ object BleCentralManager {
                     noResponseHandled.remove(addr)
                     pendingNonces.keys.removeIf { it.startsWith("$addr:") }
                     gattQueues.remove(addr)?.close(CancellationException("device $addr disconnected"))
+                    // Status 133 is the Android BLE zombie signal. Flush the
+                    // client-side service cache before close() so the next
+                    // connectGatt() on this address starts with a clean slate.
+                    if (status == 133) {
+                        if (refreshGatt(gatt)) {
+                            Log.d(TAG, "flushed GATT cache for $addr after status=133")
+                        }
+                    }
                     gatt.close()
                     nativeOnConnectionStateChanged(addr, false, status)
                 }
@@ -413,16 +422,34 @@ object BleCentralManager {
             }
 
         // Close any stale GATT connection to avoid leaking clientIf slots.
-        // Android has a limit of ~7 concurrent GATT clients.
-        gattConnections.remove(deviceAddr)?.let { oldGatt ->
-            oldGatt.disconnect()
-            oldGatt.close()
+        // Android has a limit of ~7 concurrent GATT clients. If we had a stale
+        // handle, flush its service cache and give the stack ~300ms to release
+        // the client-IF before the next connectGatt — back-to-back attempts on
+        // the same address can be silently dropped on some vendors.
+        val stale = gattConnections.remove(deviceAddr)
+        if (stale != null) {
+            refreshGatt(stale)
+            stale.disconnect()
+            stale.close()
             Log.d(TAG, "closed stale GATT for $deviceAddr")
+            scope.launch {
+                delay(300)
+                openGatt(ctx, deviceAddr)
+            }
+            return
         }
 
+        openGatt(ctx, deviceAddr)
+    }
+
+    private fun openGatt(
+        ctx: Context,
+        deviceAddr: String,
+    ) {
         val device =
             adapter?.getRemoteDevice(deviceAddr) ?: run {
                 Log.e(TAG, "could not get remote device $deviceAddr")
+                nativeOnConnectionStateChanged(deviceAddr, false, 0)
                 return
             }
         // TRANSPORT_LE ensures we connect over BLE, not classic Bluetooth.
@@ -444,6 +471,46 @@ object BleCentralManager {
     }
 
     /**
+     * Synchronously tear down the GATT handle for [deviceAddr] without waiting
+     * for [BluetoothGattCallback.onConnectionStateChange]. Called from Rust
+     * when the normal disconnect callback path cannot be trusted (connect
+     * timeout, disconnect whose callback never arrived, status-133 zombie).
+     *
+     * Flushes the client-side service cache with `refresh()` before closing
+     * so the next connectGatt() starts clean. Emits a synthetic
+     * [nativeOnConnectionStateChanged]`(addr, false, 0)` so any Rust-side
+     * state waiting on the disconnect callback unblocks.
+     */
+    @JvmStatic
+    fun forceClose(deviceAddr: String) {
+        val gatt = gattConnections.remove(deviceAddr)
+        mtuMap.remove(deviceAddr)
+        noResponseHandled.remove(deviceAddr)
+        pendingNonces.keys.removeIf { it.startsWith("$deviceAddr:") }
+        gattQueues.remove(deviceAddr)?.close(CancellationException("device $deviceAddr force-closed"))
+        if (gatt != null) {
+            refreshGatt(gatt)
+            try {
+                gatt.disconnect()
+            } catch (e: Exception) {
+                Log.w(TAG, "forceClose: disconnect threw for $deviceAddr: ${e.message}")
+            }
+            gatt.close()
+            Log.d(TAG, "forceClose: tore down GATT for $deviceAddr")
+        }
+        nativeOnConnectionStateChanged(deviceAddr, false, 0)
+    }
+
+    private fun refreshGatt(gatt: BluetoothGatt): Boolean =
+        try {
+            val method = gatt.javaClass.getMethod("refresh")
+            method.invoke(gatt) as Boolean
+        } catch (e: Exception) {
+            Log.w(TAG, "refresh failed: ${e.message}")
+            false
+        }
+
+    /**
      * Clear the GATT service cache for [deviceAddr] by invoking the hidden
      * `BluetoothGatt.refresh()` method via reflection. Returns false if no
      * active GATT handle exists or the reflective call throws. Used to
@@ -453,13 +520,7 @@ object BleCentralManager {
     @JvmStatic
     fun refresh(deviceAddr: String): Boolean {
         val gatt = gattConnections[deviceAddr] ?: return false
-        return try {
-            val method = gatt.javaClass.getMethod("refresh")
-            method.invoke(gatt) as Boolean
-        } catch (e: Exception) {
-            Log.w(TAG, "refresh failed for $deviceAddr: ${e.message}")
-            false
-        }
+        return refreshGatt(gatt)
     }
 
     // ── GATT operations (serialized via per-device queue) ──

@@ -26,6 +26,21 @@ impl<K: Eq + Hash, V> KeyedRequestMap<K, V> {
         self.inner.lock().insert(key, value)
     }
 
+    /// Insert `value` at `key` only if the slot is empty. Returns `Ok(())` on
+    /// success, or `Err(value)` (handing the value back uninserted) if a value
+    /// was already present. Atomic — no TOCTOU between a caller's `contains`
+    /// check and `insert`.
+    pub fn try_insert(&self, key: K, value: V) -> Result<(), V> {
+        use std::collections::hash_map::Entry;
+        match self.inner.lock().entry(key) {
+            Entry::Vacant(slot) => {
+                slot.insert(value);
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(value),
+        }
+    }
+
     /// Remove and return the value at `key`, if present.
     pub fn take(&self, key: &K) -> Option<V> {
         self.inner.lock().remove(key)
@@ -96,6 +111,16 @@ mod tests {
         assert_eq!(map.insert("a".into(), 1), None);
         assert_eq!(map.take(&"a".into()), Some(1));
         assert_eq!(map.take(&"a".into()), None);
+    }
+
+    #[test]
+    fn keyed_try_insert_respects_existing() {
+        let map = KeyedRequestMap::<String, u32>::new();
+        assert_eq!(map.try_insert("a".into(), 1), Ok(()));
+        assert_eq!(map.try_insert("a".into(), 2), Err(2));
+        assert_eq!(map.take(&"a".into()), Some(1));
+        assert_eq!(map.try_insert("a".into(), 3), Ok(()));
+        assert_eq!(map.take(&"a".into()), Some(3));
     }
 
     use proptest::collection::vec;

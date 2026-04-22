@@ -1,36 +1,43 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use jni::objects::{JObject, JObjectArray};
 use jni::{jni_sig, jni_str};
 use parking_lot::Mutex;
 use tokio::sync::{broadcast, oneshot};
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::central::backend::{self, CentralBackend};
-use crate::central::types::{CentralConfig, CentralEvent, ScanFilter, WriteType};
+use crate::central::types::{CentralConfig, CentralEvent, DisconnectCause, ScanFilter, WriteType};
 use crate::error::{BlewError, BlewResult};
 use crate::gatt::props::CharacteristicProperties;
 use crate::gatt::service::{GattCharacteristic, GattService};
 use crate::l2cap::{L2capChannel, types::Psm};
 use crate::types::{BleDevice, DeviceId};
 use crate::util::BroadcastEventStream;
-use crate::util::request_map::RequestMap;
+use crate::util::request_map::KeyedRequestMap;
 
 use super::jni_globals::{central_class, jvm};
 
+/// How long [`AndroidCentral::disconnect`] waits for the Kotlin-side
+/// `onConnectionStateChange(DISCONNECTED)` callback before force-closing the
+/// GATT handle. Short — we only need enough time for a well-behaved stack to
+/// dispatch the callback; a dead callback is exactly the case we're guarding
+/// against.
+const DISCONNECT_CALLBACK_TIMEOUT: Duration = Duration::from_secs(2);
+
 struct CentralState {
     event_tx: broadcast::Sender<CentralEvent>,
-    pending_ops: RequestMap<oneshot::Sender<BlewResult<Vec<u8>>>>,
-    pending_connects: RequestMap<oneshot::Sender<BlewResult<()>>>,
-    connect_keys: Mutex<HashMap<String, u64>>,
-    pending_discover: RequestMap<oneshot::Sender<BlewResult<Vec<GattService>>>>,
-    discover_keys: Mutex<HashMap<String, u64>>,
+    pending_ops: KeyedRequestMap<String, oneshot::Sender<BlewResult<Vec<u8>>>>,
+    pending_connects: KeyedRequestMap<String, oneshot::Sender<BlewResult<()>>>,
+    pending_disconnects: KeyedRequestMap<String, oneshot::Sender<()>>,
+    pending_discover: KeyedRequestMap<String, oneshot::Sender<BlewResult<Vec<GattService>>>>,
     discovered: Mutex<Vec<BleDevice>>,
     mtu_cache: Mutex<HashMap<String, u16>>,
-    pending_op_keys: Mutex<HashMap<String, u64>>,
+    connect_timeout: Mutex<Option<Duration>>,
 }
 
 static STATE: OnceLock<CentralState> = OnceLock::new();
@@ -39,19 +46,28 @@ fn state() -> &'static CentralState {
     STATE.get().expect("AndroidCentral not initialized")
 }
 
-fn init_statics() {
+fn init_statics(connect_timeout: Option<Duration>) {
     let (event_tx, _) = broadcast::channel(256);
-    let _ = STATE.set(CentralState {
-        event_tx,
-        pending_ops: RequestMap::new(),
-        pending_connects: RequestMap::new(),
-        connect_keys: Mutex::new(HashMap::new()),
-        pending_discover: RequestMap::new(),
-        discover_keys: Mutex::new(HashMap::new()),
-        discovered: Mutex::new(Vec::new()),
-        mtu_cache: Mutex::new(HashMap::new()),
-        pending_op_keys: Mutex::new(HashMap::new()),
-    });
+    let first_init = STATE
+        .set(CentralState {
+            event_tx,
+            pending_ops: KeyedRequestMap::new(),
+            pending_connects: KeyedRequestMap::new(),
+            pending_disconnects: KeyedRequestMap::new(),
+            pending_discover: KeyedRequestMap::new(),
+            discovered: Mutex::new(Vec::new()),
+            mtu_cache: Mutex::new(HashMap::new()),
+            connect_timeout: Mutex::new(connect_timeout),
+        })
+        .is_ok();
+    if !first_init {
+        // OnceLock is already populated (AndroidCentral initialised more than
+        // once in the process). Update the timeout since the existing
+        // callbacks/maps are still valid for the new instance.
+        if let Some(s) = STATE.get() {
+            *s.connect_timeout.lock() = connect_timeout;
+        }
+    }
     super::l2cap_state::init_statics();
 }
 
@@ -73,32 +89,34 @@ pub(crate) fn update_discovered(device: BleDevice) {
 }
 
 pub(crate) fn complete_connect(addr: &str, result: BlewResult<()>) {
-    if let Some(s) = STATE.get() {
-        if let Some(id) = s.connect_keys.lock().remove(addr) {
-            if let Some(tx) = s.pending_connects.take(id) {
-                let _ = tx.send(result);
-            }
-        }
+    if let Some(s) = STATE.get()
+        && let Some(tx) = s.pending_connects.take(&addr.to_owned())
+    {
+        let _ = tx.send(result);
+    }
+}
+
+pub(crate) fn complete_disconnect(addr: &str) {
+    if let Some(s) = STATE.get()
+        && let Some(tx) = s.pending_disconnects.take(&addr.to_owned())
+    {
+        let _ = tx.send(());
     }
 }
 
 pub(crate) fn complete_discover_services(addr: &str, result: BlewResult<Vec<GattService>>) {
-    if let Some(s) = STATE.get() {
-        if let Some(id) = s.discover_keys.lock().remove(addr) {
-            if let Some(tx) = s.pending_discover.take(id) {
-                let _ = tx.send(result);
-            }
-        }
+    if let Some(s) = STATE.get()
+        && let Some(tx) = s.pending_discover.take(&addr.to_owned())
+    {
+        let _ = tx.send(result);
     }
 }
 
 pub(crate) fn complete_pending(key: &str, result: BlewResult<Vec<u8>>) {
-    if let Some(s) = STATE.get() {
-        if let Some(id) = s.pending_op_keys.lock().remove(key) {
-            if let Some(tx) = s.pending_ops.take(id) {
-                let _ = tx.send(result);
-            }
-        }
+    if let Some(s) = STATE.get()
+        && let Some(tx) = s.pending_ops.take(&key.to_owned())
+    {
+        let _ = tx.send(result);
     }
 }
 
@@ -172,8 +190,13 @@ fn gatt_status_to_error(status: i32, device_id: &DeviceId, char_uuid: Uuid) -> B
 pub struct AndroidCentral;
 
 impl AndroidCentral {
-    pub async fn with_config(_config: CentralConfig) -> crate::error::BlewResult<Self> {
-        Self::new().await
+    pub async fn with_config(config: CentralConfig) -> crate::error::BlewResult<Self> {
+        if !super::are_ble_permissions_granted() {
+            return Err(BlewError::PermissionDenied);
+        }
+        init_statics(config.connect_timeout);
+        debug!(connect_timeout = ?config.connect_timeout, "AndroidCentral initialized");
+        Ok(AndroidCentral)
     }
 
     /// Clear the GATT cache for `device_id` by calling the hidden
@@ -219,14 +242,7 @@ impl CentralBackend for AndroidCentral {
     where
         Self: Sized,
     {
-        async {
-            if !super::are_ble_permissions_granted() {
-                return Err(BlewError::PermissionDenied);
-            }
-            init_statics();
-            debug!("AndroidCentral initialized");
-            Ok(AndroidCentral)
-        }
+        async { Self::with_config(CentralConfig::default()).await }
     }
 
     fn is_powered(&self) -> impl Future<Output = BlewResult<bool>> + Send {
@@ -305,48 +321,87 @@ impl CentralBackend for AndroidCentral {
 
     fn connect(&self, device_id: &DeviceId) -> impl Future<Output = BlewResult<()>> + Send {
         let addr = device_id.as_str().to_owned();
-        let id_for_err = device_id.clone();
+        let did = device_id.clone();
         async move {
+            let s = state();
             let (tx, rx) = oneshot::channel();
 
-            let s = state();
-            let id = s.pending_connects.insert(tx);
-            s.connect_keys.lock().insert(addr.clone(), id);
+            if s.pending_connects.try_insert(addr.clone(), tx).is_err() {
+                return Err(BlewError::ConnectInFlight(did));
+            }
 
-            jvm()
-                .attach_current_thread(|env| {
-                    let j_addr = env.new_string(&addr)?;
-                    env.call_static_method(
-                        central_class(),
-                        jni_str!("connect"),
-                        jni_sig!("(Ljava/lang/String;)V"),
-                        &[(&j_addr).into()],
-                    )?;
-                    Ok(())
-                })
-                .map_err(jni_err)?;
+            if let Err(err) = jvm().attach_current_thread(|env| {
+                let j_addr = env.new_string(&addr)?;
+                env.call_static_method(
+                    central_class(),
+                    jni_str!("connect"),
+                    jni_sig!("(Ljava/lang/String;)V"),
+                    &[(&j_addr).into()],
+                )?;
+                Ok(())
+            }) {
+                s.pending_connects.take(&addr);
+                return Err(jni_err(err));
+            }
 
-            rx.await
-                .map_err(|_| BlewError::DisconnectedDuringOperation(id_for_err))?
+            let timeout = *s.connect_timeout.lock();
+            match timeout {
+                Some(dur) => match tokio::time::timeout(dur, rx).await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(_)) => Err(BlewError::DisconnectedDuringOperation(did)),
+                    Err(_) => {
+                        s.pending_connects.take(&addr);
+                        force_close_gatt(&addr);
+                        let _ = s.event_tx.send(CentralEvent::DeviceDisconnected {
+                            device_id: did.clone(),
+                            cause: DisconnectCause::Timeout,
+                        });
+                        Err(BlewError::ConnectTimedOut(did))
+                    }
+                },
+                None => rx
+                    .await
+                    .map_err(|_| BlewError::DisconnectedDuringOperation(did))?,
+            }
         }
     }
 
     fn disconnect(&self, device_id: &DeviceId) -> impl Future<Output = BlewResult<()>> + Send {
         let addr = device_id.as_str().to_owned();
         async move {
-            jvm()
-                .attach_current_thread(|env| {
-                    let j_addr = env.new_string(&addr)?;
-                    env.call_static_method(
-                        central_class(),
-                        jni_str!("disconnect"),
-                        jni_sig!("(Ljava/lang/String;)V"),
-                        &[(&j_addr).into()],
-                    )?;
+            let s = state();
+            let (tx, rx) = oneshot::channel();
+            let awaits_callback = s.pending_disconnects.try_insert(addr.clone(), tx).is_ok();
+
+            if let Err(err) = jvm().attach_current_thread(|env| {
+                let j_addr = env.new_string(&addr)?;
+                env.call_static_method(
+                    central_class(),
+                    jni_str!("disconnect"),
+                    jni_sig!("(Ljava/lang/String;)V"),
+                    &[(&j_addr).into()],
+                )?;
+                Ok(())
+            }) {
+                if awaits_callback {
+                    s.pending_disconnects.take(&addr);
+                }
+                return Err(jni_err(err));
+            }
+
+            if !awaits_callback {
+                return Ok(());
+            }
+
+            match tokio::time::timeout(DISCONNECT_CALLBACK_TIMEOUT, rx).await {
+                Ok(_) => Ok(()),
+                Err(_) => {
+                    warn!(device = %addr, "disconnect callback did not fire; force-closing GATT");
+                    s.pending_disconnects.take(&addr);
+                    force_close_gatt(&addr);
                     Ok(())
-                })
-                .map_err(jni_err)?;
-            Ok(())
+                }
+            }
         }
     }
 
@@ -360,8 +415,9 @@ impl CentralBackend for AndroidCentral {
             let (tx, rx) = oneshot::channel();
 
             let s = state();
-            let id = s.pending_discover.insert(tx);
-            s.discover_keys.lock().insert(addr.clone(), id);
+            if let Some(evicted) = s.pending_discover.insert(addr.clone(), tx) {
+                let _ = evicted.send(Err(BlewError::GattBusy(did.clone())));
+            }
 
             let status = jvm()
                 .attach_current_thread(|env| {
@@ -377,9 +433,7 @@ impl CentralBackend for AndroidCentral {
                 .map_err(jni_err)?;
 
             if status != STATUS_SUCCESS {
-                // Clean up the pending oneshot since the callback won't fire.
-                s.discover_keys.lock().remove(&addr);
-                s.pending_discover.take(id);
+                s.pending_discover.take(&addr);
                 return Err(gatt_status_to_error(status, &did, Uuid::nil()));
             }
 
@@ -400,8 +454,9 @@ impl CentralBackend for AndroidCentral {
             let key = format!("{addr}:read:{char_uuid}");
 
             let s = state();
-            let id = s.pending_ops.insert(tx);
-            s.pending_op_keys.lock().insert(key.clone(), id);
+            if let Some(evicted) = s.pending_ops.insert(key.clone(), tx) {
+                let _ = evicted.send(Err(BlewError::GattBusy(did.clone())));
+            }
 
             let status = jvm()
                 .attach_current_thread(|env| {
@@ -419,8 +474,7 @@ impl CentralBackend for AndroidCentral {
                 .map_err(jni_err)?;
 
             if status != STATUS_SUCCESS {
-                s.pending_op_keys.lock().remove(&key);
-                s.pending_ops.take(id);
+                s.pending_ops.take(&key);
                 return Err(gatt_status_to_error(status, &did, char_uuid));
             }
 
@@ -447,14 +501,15 @@ impl CentralBackend for AndroidCentral {
             let s = state();
 
             // For write-without-response, don't wait for a callback.
-            let (rx, pending_key, pending_id) = if write_type == WriteType::WithResponse {
+            let (rx, pending_key) = if write_type == WriteType::WithResponse {
                 let (tx, rx) = oneshot::channel();
                 let key = format!("{addr}:write:{char_uuid}");
-                let id = s.pending_ops.insert(tx);
-                s.pending_op_keys.lock().insert(key.clone(), id);
-                (Some(rx), Some(key), Some(id))
+                if let Some(evicted) = s.pending_ops.insert(key.clone(), tx) {
+                    let _ = evicted.send(Err(BlewError::GattBusy(did.clone())));
+                }
+                (Some(rx), Some(key))
             } else {
-                (None, None, None)
+                (None, None)
             };
 
             let status = jvm()
@@ -480,9 +535,8 @@ impl CentralBackend for AndroidCentral {
                 .map_err(jni_err)?;
 
             if status != STATUS_SUCCESS {
-                if let (Some(key), Some(id)) = (pending_key, pending_id) {
-                    s.pending_op_keys.lock().remove(&key);
-                    s.pending_ops.take(id);
+                if let Some(key) = pending_key {
+                    s.pending_ops.take(&key);
                 }
                 return Err(gatt_status_to_error(status, &did, char_uuid));
             }
@@ -606,4 +660,25 @@ impl CentralBackend for AndroidCentral {
 
 fn jni_err(e: jni::errors::Error) -> BlewError {
     BlewError::Internal(format!("JNI error: {e}"))
+}
+
+/// Synchronously release the Kotlin-side GATT handle for `addr`. Used when
+/// the normal disconnect callback path can't be trusted — connect timeout,
+/// the status-133 zombie scenario, or a disconnect whose callback never
+/// arrives. The Kotlin `forceClose` calls `refresh()` + `gatt.close()` and
+/// removes the entry from `gattConnections`, freeing the client-IF slot.
+fn force_close_gatt(addr: &str) {
+    let result: Result<(), jni::errors::Error> = jvm().attach_current_thread(|env| {
+        let j_addr = env.new_string(addr)?;
+        env.call_static_method(
+            central_class(),
+            jni_str!("forceClose"),
+            jni_sig!("(Ljava/lang/String;)V"),
+            &[(&j_addr).into()],
+        )?;
+        Ok(())
+    });
+    if let Err(e) = result {
+        warn!(device = %addr, error = %e, "force_close_gatt JNI call failed");
+    }
 }

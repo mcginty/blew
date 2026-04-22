@@ -1,14 +1,34 @@
 use crate::types::{BleDevice, DeviceId};
 use bytes::Bytes;
+use std::time::Duration;
 use uuid::Uuid;
 
+/// Default deadline for [`Central::connect`](crate::central::Central::connect).
+/// Covers ACL link-up, optional SMP re-bond, service discovery, and the
+/// per-backend post-connect steps (Android's MTU negotiation in particular).
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Configuration for initialising the central role.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CentralConfig {
     /// On Apple platforms, passed as `CBCentralManagerOptionRestoreIdentifierKey` to
     /// `initWithDelegate:queue:options:`, enabling state restoration for the app's
     /// background BLE central session. Ignored on all other platforms.
     pub restore_identifier: Option<String>,
+    /// Deadline applied to [`Central::connect`](crate::central::Central::connect).
+    /// `None` disables the deadline (pre-0.3 behaviour); `Some(d)` returns
+    /// [`BlewError::ConnectTimedOut`](crate::error::BlewError::ConnectTimedOut)
+    /// if the connection has not completed within `d`.
+    pub connect_timeout: Option<Duration>,
+}
+
+impl Default for CentralConfig {
+    fn default() -> Self {
+        Self {
+            restore_identifier: None,
+            connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
+        }
+    }
 }
 
 /// Reason a peripheral disconnected. Used by [`CentralEvent::DeviceDisconnected`].

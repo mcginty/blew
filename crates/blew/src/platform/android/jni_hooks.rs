@@ -370,6 +370,8 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnConnect
                     &addr,
                     Err(crate::error::BlewError::NotConnected(device_id.clone())),
                 );
+                // Release any caller awaiting disconnect() completion.
+                super::central::complete_disconnect(&addr);
                 let cause = match gatt_status {
                     0 => DisconnectCause::LocalClose, // GATT_SUCCESS + local disconnect
                     8 => DisconnectCause::LinkLoss,   // GATT_CONN_TIMEOUT

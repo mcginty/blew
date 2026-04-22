@@ -20,8 +20,6 @@ use tokio_stream::StreamExt as _;
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
-const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
 struct CentralInner {
     _session: Session,
     adapter: Adapter,
@@ -31,13 +29,55 @@ struct CentralInner {
     scan_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     notify_tasks: Mutex<HashMap<(DeviceId, Uuid), tokio::task::JoinHandle<()>>>,
     adapter_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    connect_timeout: Mutex<Option<std::time::Duration>>,
+    pending_connects: crate::util::request_map::KeyedRequestMap<DeviceId, ()>,
 }
 
 pub struct LinuxCentral(Arc<CentralInner>);
 
+async fn connect_inner(handle: Arc<CentralInner>, device_id: DeviceId) -> BlewResult<()> {
+    let addr = CentralInner::parse_addr(&device_id)?;
+    let device = handle
+        .adapter
+        .device(addr)
+        .map_err(|e| BlewError::Central {
+            source: Box::new(e),
+        })?;
+    let timeout = *handle.connect_timeout.lock();
+    let connect_fut = device.connect();
+    let result = match timeout {
+        Some(dur) => tokio::time::timeout(dur, connect_fut).await,
+        None => Ok(connect_fut.await),
+    };
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return Err(BlewError::Central {
+                source: Box::new(e),
+            });
+        }
+        Err(_) => {
+            let _ = device.disconnect().await;
+            let _ = handle.event_tx.send(CentralEvent::DeviceDisconnected {
+                device_id: device_id.clone(),
+                cause: DisconnectCause::Timeout,
+            });
+            return Err(BlewError::ConnectTimedOut(device_id));
+        }
+    }
+    debug!(device_id = %device_id, "device connected");
+    handle.clear_mtu(&device_id);
+    let _ = handle
+        .event_tx
+        .send(CentralEvent::DeviceConnected { device_id });
+    Ok(())
+}
+
 impl LinuxCentral {
-    pub async fn with_config(_config: CentralConfig) -> crate::error::BlewResult<Self> {
-        Self::new().await
+    pub async fn with_config(config: CentralConfig) -> crate::error::BlewResult<Self> {
+        let this = Self::new().await?;
+        *this.0.connect_timeout.lock() = config.connect_timeout;
+        Ok(this)
     }
 }
 
@@ -167,6 +207,8 @@ impl CentralBackend for LinuxCentral {
         let inner = Arc::new(CentralInner {
             _session: session,
             adapter,
+            connect_timeout: Mutex::new(None),
+            pending_connects: crate::util::request_map::KeyedRequestMap::new(),
             discovered: Mutex::new(HashMap::new()),
             mtu_cache: Mutex::new(HashMap::new()),
             event_tx,
@@ -336,28 +378,16 @@ impl CentralBackend for LinuxCentral {
         let device_id = device_id.clone();
         async move {
             debug!(device_id = %device_id, "connecting to device");
-            let addr = CentralInner::parse_addr(&device_id)?;
-            let device = handle
-                .adapter
-                .device(addr)
-                .map_err(|e| BlewError::Central {
-                    source: Box::new(e),
-                })?;
-            match tokio::time::timeout(CONNECT_TIMEOUT, device.connect()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    return Err(BlewError::Central {
-                        source: Box::new(e),
-                    });
-                }
-                Err(_) => return Err(BlewError::Timeout),
+            if handle
+                .pending_connects
+                .try_insert(device_id.clone(), ())
+                .is_err()
+            {
+                return Err(BlewError::ConnectInFlight(device_id));
             }
-            debug!(device_id = %device_id, "device connected");
-            handle.clear_mtu(&device_id);
-            let _ = handle
-                .event_tx
-                .send(CentralEvent::DeviceConnected { device_id });
-            Ok(())
+            let result = connect_inner(Arc::clone(&handle), device_id.clone()).await;
+            handle.pending_connects.take(&device_id);
+            result
         }
     }
 
