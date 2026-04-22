@@ -85,7 +85,7 @@ impl PeripheralBackend for AndroidPeripheral {
                         jni_sig!("()Z"),
                         &[],
                     )?;
-                    Ok(result.z()?)
+                    result.z()
                 })
                 .map_err(jni_err)
         }
@@ -104,11 +104,11 @@ impl PeripheralBackend for AndroidPeripheral {
                     let byte_array_class = env.find_class(jni_str!("[B"))?;
 
                     let char_uuids: JObjectArray =
-                        env.new_object_array(n as i32, &string_class, &JObject::null())?;
+                        env.new_object_array(n as i32, &string_class, JObject::null())?;
                     let char_values: JObjectArray =
-                        env.new_object_array(n as i32, &byte_array_class, &JObject::null())?;
-                    let mut props_arr = vec![0i32; n];
-                    let mut perms_arr = vec![0i32; n];
+                        env.new_object_array(n as i32, &byte_array_class, JObject::null())?;
+                    let mut props_arr = vec![0_i32; n];
+                    let mut perms_arr = vec![0_i32; n];
 
                     for (i, ch) in service.characteristics.iter().enumerate() {
                         let uuid_str = env.new_string(ch.uuid.to_string())?;
@@ -163,7 +163,7 @@ impl PeripheralBackend for AndroidPeripheral {
                     let uuids: JObjectArray = env.new_object_array(
                         config.service_uuids.len() as i32,
                         &string_class,
-                        &JObject::null(),
+                        JObject::null(),
                     )?;
                     for (i, uuid) in config.service_uuids.iter().enumerate() {
                         let s = env.new_string(uuid.to_string())?;
@@ -214,7 +214,7 @@ impl PeripheralBackend for AndroidPeripheral {
             // Retry loop: Kotlin returns 1 ("busy") when the previous
             // notification hasn't completed yet (onNotificationSent pending).
             // We retry with async sleep so we don't block the tokio thread.
-            for attempt in 0..50u32 {
+            for attempt in 0..50_u32 {
                 let status: i32 = jvm()
                     .attach_current_thread(|env| {
                         let addr_str = env.new_string(&device_addr)?;
@@ -318,7 +318,7 @@ fn jni_err(e: jni::errors::Error) -> BlewError {
 
 /// Convert blew CharacteristicProperties to Android BluetoothGattCharacteristic property bits.
 fn blew_props_to_android(props: CharacteristicProperties) -> i32 {
-    let mut out = 0i32;
+    let mut out = 0_i32;
     if props.contains(CharacteristicProperties::BROADCAST) {
         out |= 0x01; // PROPERTY_BROADCAST
     }
@@ -343,7 +343,7 @@ fn blew_props_to_android(props: CharacteristicProperties) -> i32 {
 /// Convert blew AttributePermissions to Android permission bits.
 fn blew_perms_to_android(perms: crate::gatt::props::AttributePermissions) -> i32 {
     use crate::gatt::props::AttributePermissions;
-    let mut out = 0i32;
+    let mut out = 0_i32;
     if perms.contains(AttributePermissions::READ) {
         out |= 0x01; // PERMISSION_READ
     }

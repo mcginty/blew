@@ -255,7 +255,7 @@ impl CentralBackend for AndroidCentral {
                         jni_sig!("()Z"),
                         &[],
                     )?;
-                    Ok(result.z()?)
+                    result.z()
                 })
                 .map_err(jni_err)
         }
@@ -270,7 +270,7 @@ impl CentralBackend for AndroidCentral {
                     let uuids: JObjectArray = env.new_object_array(
                         filter.services.len() as i32,
                         &string_class,
-                        &JObject::null(),
+                        JObject::null(),
                     )?;
                     for (i, uuid) in filter.services.iter().enumerate() {
                         let s = env.new_string(uuid.to_string())?;
@@ -393,14 +393,13 @@ impl CentralBackend for AndroidCentral {
                 return Ok(());
             }
 
-            match tokio::time::timeout(DISCONNECT_CALLBACK_TIMEOUT, rx).await {
-                Ok(_) => Ok(()),
-                Err(_) => {
-                    warn!(device = %addr, "disconnect callback did not fire; force-closing GATT");
-                    s.pending_disconnects.take(&addr);
-                    force_close_gatt(&addr);
-                    Ok(())
-                }
+            if let Ok(_) = tokio::time::timeout(DISCONNECT_CALLBACK_TIMEOUT, rx).await {
+                Ok(())
+            } else {
+                warn!(device = %addr, "disconnect callback did not fire; force-closing GATT");
+                s.pending_disconnects.take(&addr);
+                force_close_gatt(&addr);
+                Ok(())
             }
         }
     }
@@ -428,7 +427,7 @@ impl CentralBackend for AndroidCentral {
                         jni_sig!("(Ljava/lang/String;)I"),
                         &[(&j_addr).into()],
                     )?;
-                    Ok(result.i()?)
+                    result.i()
                 })
                 .map_err(jni_err)?;
 
@@ -469,7 +468,7 @@ impl CentralBackend for AndroidCentral {
                         &[(&j_addr).into(), (&j_uuid).into()],
                     )?;
 
-                    Ok(result.i()?)
+                    result.i()
                 })
                 .map_err(jni_err)?;
 
@@ -530,7 +529,7 @@ impl CentralBackend for AndroidCentral {
                         ],
                     )?;
 
-                    Ok(result.i()?)
+                    result.i()
                 })
                 .map_err(jni_err)?;
 
@@ -570,7 +569,7 @@ impl CentralBackend for AndroidCentral {
                         &[(&j_addr).into(), (&j_uuid).into()],
                     )?;
 
-                    Ok(result.i()?)
+                    result.i()
                 })
                 .map_err(jni_err)?;
 
@@ -602,7 +601,7 @@ impl CentralBackend for AndroidCentral {
                         &[(&j_addr).into(), (&j_uuid).into()],
                     )?;
 
-                    Ok(result.i()?)
+                    result.i()
                 })
                 .map_err(jni_err)?;
 
@@ -642,7 +641,7 @@ impl CentralBackend for AndroidCentral {
                         central_class(),
                         jni_str!("openL2capChannel"),
                         jni_sig!("(Ljava/lang/String;I)V"),
-                        &[(&j_addr).into(), (psm.value() as i32).into()],
+                        &[(&j_addr).into(), i32::from(psm.value()).into()],
                     )?;
                     Ok(())
                 })

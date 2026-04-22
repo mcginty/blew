@@ -60,10 +60,10 @@ pub(crate) fn set_pending_server(tx: oneshot::Sender<BlewResult<Psm>>) {
 }
 
 pub(crate) fn complete_server_open(result: BlewResult<Psm>) {
-    if let Some(s) = STATE.get() {
-        if let Some(tx) = s.pending_server.lock().take() {
-            let _ = tx.send(result);
-        }
+    if let Some(s) = STATE.get()
+        && let Some(tx) = s.pending_server.lock().take()
+    {
+        let _ = tx.send(result);
     }
 }
 
@@ -113,7 +113,7 @@ pub(crate) fn on_channel_opened(device_addr: &str, socket_id: i32, from_server: 
 
     let is_server = from_server;
     handle.spawn(async move {
-        let mut buf = vec![0u8; L2CAP_READ_BUF_SIZE];
+        let mut buf = vec![0_u8; L2CAP_READ_BUF_SIZE];
         loop {
             match bridge_reader.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
@@ -148,29 +148,29 @@ pub(crate) fn on_channel_opened(device_addr: &str, socket_id: i32, from_server: 
     });
 
     if from_server {
-        if let Some(s) = STATE.get() {
-            if let Some(tx) = s.accept_tx.lock().as_ref() {
-                let device_id = DeviceId(device_addr.to_string());
-                if tx.send(Ok((device_id, channel))).is_err() {
-                    tracing::warn!(
-                        socket_id,
-                        "L2CAP accept receiver dropped, discarding channel"
-                    );
-                }
+        if let Some(s) = STATE.get()
+            && let Some(tx) = s.accept_tx.lock().as_ref()
+        {
+            let device_id = DeviceId(device_addr.to_string());
+            if tx.send(Ok((device_id, channel))).is_err() {
+                tracing::warn!(
+                    socket_id,
+                    "L2CAP accept receiver dropped, discarding channel"
+                );
             }
         }
-    } else if let Some(s) = STATE.get() {
-        if let Some(tx) = s.pending_open.lock().remove(device_addr) {
-            let _ = tx.send(Ok(channel));
-        }
+    } else if let Some(s) = STATE.get()
+        && let Some(tx) = s.pending_open.lock().remove(device_addr)
+    {
+        let _ = tx.send(Ok(channel));
     }
 }
 
 pub(crate) fn on_channel_data(socket_id: i32, data: &[u8]) {
-    if let Some(s) = STATE.get() {
-        if let Some(tx) = s.data_tx.lock().get(&socket_id) {
-            let _ = tx.send(data.to_vec());
-        }
+    if let Some(s) = STATE.get()
+        && let Some(tx) = s.data_tx.lock().get(&socket_id)
+    {
+        let _ = tx.send(data.to_vec());
     }
 }
 
@@ -181,11 +181,11 @@ pub(crate) fn on_channel_closed(socket_id: i32) {
 }
 
 pub(crate) fn on_channel_error(device_addr: &str, error: String) {
-    if let Some(s) = STATE.get() {
-        if let Some(tx) = s.pending_open.lock().remove(device_addr) {
-            let _ = tx.send(Err(BlewError::L2cap {
-                source: error.into(),
-            }));
-        }
+    if let Some(s) = STATE.get()
+        && let Some(tx) = s.pending_open.lock().remove(device_addr)
+    {
+        let _ = tx.send(Err(BlewError::L2cap {
+            source: error.into(),
+        }));
     }
 }

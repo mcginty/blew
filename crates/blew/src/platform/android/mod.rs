@@ -11,6 +11,7 @@ pub use peripheral::AndroidPeripheral;
 /// Check whether the app is running on an Android emulator.
 ///
 /// Checks `Build.FINGERPRINT` for known emulator markers ("generic", "emulator", "sdk").
+#[must_use]
 pub fn is_emulator() -> bool {
     use jni::{jni_sig, jni_str};
     let result: Result<bool, jni::errors::Error> =
@@ -35,6 +36,7 @@ pub fn is_emulator() -> bool {
 ///
 /// Returns `true` when all required permissions are in place, `false` otherwise.
 /// This is Android-specific; other platforms always return `true`.
+#[must_use]
 pub fn are_ble_permissions_granted() -> bool {
     use jni::{jni_sig, jni_str};
     let result: Result<bool, jni::errors::Error> =
@@ -45,7 +47,7 @@ pub fn are_ble_permissions_granted() -> bool {
                 jni_sig!("()Z"),
                 &[],
             )?;
-            Ok(result.z()?)
+            result.z()
         });
     result.unwrap_or(false)
 }
