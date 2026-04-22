@@ -38,8 +38,9 @@ pub fn init_jvm(vm: JavaVM) {
         let _ = CLASS_CENTRAL.set(central_ref);
         let _ = CLASS_PERIPHERAL.set(peripheral_ref);
 
-        // Don't let JNI try to delete the activity reference -- we don't own it.
-        std::mem::forget(activity);
+        // `activity` is a borrowed local ref from ndk_context; `JObject` has no
+        // Drop impl, so letting it fall out of scope is a no-op.
+        let _ = activity;
 
         Ok::<_, jni::errors::Error>(())
     })

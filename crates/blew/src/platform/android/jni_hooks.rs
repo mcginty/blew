@@ -3,6 +3,27 @@
 //! Each `#[unsafe(no_mangle)] extern "C"` function matches a Kotlin `external fun` declaration.
 //! These run on Android Binder threads and must not block -- they push events into
 //! tokio channels and return immediately.
+//!
+//! # Safety
+//!
+//! All functions in this module are `unsafe extern "C"` JNI entry points. They
+//! may only be called by the JVM from the Kotlin `external fun` bindings in
+//! `BleCentralManager` / `BlePeripheralManager`: `env` must be a valid JNIEnv
+//! for the current thread, `JString`/`JByteArray` parameters must be valid
+//! JNI handles, and `jint`/`jboolean` parameters are plain integer values.
+//! Every function wraps its body in [`guard`] so panics cannot unwind across
+//! the FFI boundary.
+
+// JNI boundary: JNIEnv pointers (`jint`, `jboolean`, `usize → jint` array
+// sizes) are fixed-width C types. Narrowing casts on the boundary are
+// intentional and well-understood for the values we pass (ATT offsets,
+// MTU, PSM, array lengths).
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::missing_safety_doc
+)]
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -68,7 +89,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnRead
             let Ok(svc_uuid) = svc.parse::<Uuid>() else {
                 return Ok::<_, jni::errors::Error>(());
             };
-            let Ok(chr_uuid) = chr.parse::<Uuid>() else {
+            let Ok(char_id) = chr.parse::<Uuid>() else {
                 return Ok::<_, jni::errors::Error>(());
             };
 
@@ -78,7 +99,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnRead
             let event = PeripheralRequest::Read {
                 client_id: DeviceId::from(addr.as_str()),
                 service_uuid: svc_uuid,
-                char_uuid: chr_uuid,
+                char_uuid: char_id,
                 offset: offset as u16,
                 responder,
             };
@@ -154,7 +175,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnWrit
             let Ok(svc_uuid) = svc.parse::<Uuid>() else {
                 return Ok::<_, jni::errors::Error>(());
             };
-            let Ok(chr_uuid) = chr.parse::<Uuid>() else {
+            let Ok(char_id) = chr.parse::<Uuid>() else {
                 return Ok::<_, jni::errors::Error>(());
             };
             let data = jbytes_to_vec(env, &value);
@@ -176,7 +197,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnWrit
             let event = PeripheralRequest::Write {
                 client_id: DeviceId::from(addr.as_str()),
                 service_uuid: svc_uuid,
-                char_uuid: chr_uuid,
+                char_uuid: char_id,
                 value: data,
                 responder,
             };
@@ -224,15 +245,15 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnSubs
             let Some(chr) = jstring_to_string(env, &char_uuid) else {
                 return Ok::<_, jni::errors::Error>(());
             };
-            let Ok(chr_uuid) = chr.parse::<Uuid>() else {
+            let Ok(char_id) = chr.parse::<Uuid>() else {
                 return Ok::<_, jni::errors::Error>(());
             };
 
-            trace!(addr, %chr_uuid, subscribed = subscribed == JNI_TRUE, "subscription changed");
+            trace!(addr, %char_id, subscribed = subscribed == JNI_TRUE, "subscription changed");
 
             super::peripheral::send_state_event(PeripheralStateEvent::SubscriptionChanged {
                 client_id: DeviceId::from(addr.as_str()),
-                char_uuid: chr_uuid,
+                char_uuid: char_id,
                 subscribed: subscribed == JNI_TRUE,
             });
 
@@ -373,11 +394,11 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnConnect
                 // Release any caller awaiting disconnect() completion.
                 super::central::complete_disconnect(&addr);
                 let cause = match gatt_status {
-                    0 => DisconnectCause::LocalClose, // GATT_SUCCESS + local disconnect
-                    8 => DisconnectCause::LinkLoss,   // GATT_CONN_TIMEOUT
+                    // 0 = GATT_SUCCESS + local disconnect; 22 = GATT_CONN_TERMINATE_LOCAL_HOST.
+                    0 | 22 => DisconnectCause::LocalClose,
+                    8 => DisconnectCause::LinkLoss, // GATT_CONN_TIMEOUT
                     19 => DisconnectCause::RemoteClose, // GATT_CONN_TERMINATE_PEER_USER
-                    22 => DisconnectCause::LocalClose, // GATT_CONN_TERMINATE_LOCAL_HOST
-                    133 => DisconnectCause::Gatt133,  // the infamous
+                    133 => DisconnectCause::Gatt133, // the infamous
                     other => DisconnectCause::Unknown(other),
                 };
                 super::central::send_event(CentralEvent::DeviceDisconnected {
@@ -505,14 +526,14 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnCharact
             let Some(chr) = jstring_to_string(env, &char_uuid) else {
                 return Ok::<_, jni::errors::Error>(());
             };
-            let Ok(chr_uuid) = chr.parse::<Uuid>() else {
+            let Ok(char_id) = chr.parse::<Uuid>() else {
                 return Ok::<_, jni::errors::Error>(());
             };
             let data = jbytes_to_vec(env, &value);
 
             super::central::send_event(CentralEvent::CharacteristicNotification {
                 device_id: DeviceId::from(addr.as_str()),
-                char_uuid: chr_uuid,
+                char_uuid: char_id,
                 value: data.into(),
             });
 

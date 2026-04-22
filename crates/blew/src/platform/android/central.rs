@@ -144,10 +144,11 @@ pub(crate) fn parse_services_json(json: &str) -> Vec<GattService> {
                 .iter()
                 .filter_map(|ch| {
                     let chr_uuid: Uuid = ch.get("uuid")?.as_str()?.parse().ok()?;
-                    let props = ch.get("properties")?.as_i64().unwrap_or(0);
+                    let props =
+                        u16::try_from(ch.get("properties")?.as_i64().unwrap_or(0)).unwrap_or(0);
                     Some(GattCharacteristic {
                         uuid: chr_uuid,
-                        properties: CharacteristicProperties::from_bits_truncate(props as u16),
+                        properties: CharacteristicProperties::from_bits_truncate(props),
                         permissions: crate::gatt::props::AttributePermissions::empty(),
                         value: vec![],
                         descriptors: vec![],
@@ -190,6 +191,9 @@ fn gatt_status_to_error(status: i32, device_id: &DeviceId, char_uuid: Uuid) -> B
 pub struct AndroidCentral;
 
 impl AndroidCentral {
+    // No awaits in the body (all JNI work is synchronous), but the public API
+    // mirrors the Apple/Linux async initializers for cross-platform parity.
+    #[allow(clippy::unused_async)]
     pub async fn with_config(config: CentralConfig) -> crate::error::BlewResult<Self> {
         if !super::are_ble_permissions_granted() {
             return Err(BlewError::PermissionDenied);
@@ -222,7 +226,7 @@ impl AndroidCentral {
                     )?;
                     result.z()
                 })
-                .map_err(jni_err)?;
+                .map_err(|e| jni_err(&e))?;
 
             if ok {
                 Ok(())
@@ -238,85 +242,76 @@ impl backend::private::Sealed for AndroidCentral {}
 impl CentralBackend for AndroidCentral {
     type EventStream = BroadcastEventStream<CentralEvent>;
 
-    fn new() -> impl Future<Output = BlewResult<Self>> + Send
+    async fn new() -> BlewResult<Self>
     where
         Self: Sized,
     {
-        async { Self::with_config(CentralConfig::default()).await }
+        Self::with_config(CentralConfig::default()).await
     }
 
-    fn is_powered(&self) -> impl Future<Output = BlewResult<bool>> + Send {
-        async {
-            jvm()
-                .attach_current_thread(|env| {
-                    let result = env.call_static_method(
-                        central_class(),
-                        jni_str!("isPowered"),
-                        jni_sig!("()Z"),
-                        &[],
-                    )?;
-                    result.z()
-                })
-                .map_err(jni_err)
-        }
+    async fn is_powered(&self) -> BlewResult<bool> {
+        jvm()
+            .attach_current_thread(|env| {
+                let result = env.call_static_method(
+                    central_class(),
+                    jni_str!("isPowered"),
+                    jni_sig!("()Z"),
+                    &[],
+                )?;
+                result.z()
+            })
+            .map_err(|e| jni_err(&e))
     }
 
-    fn start_scan(&self, filter: ScanFilter) -> impl Future<Output = BlewResult<()>> + Send {
-        async move {
-            let low_power = filter.mode == crate::central::types::ScanMode::LowPower;
-            jvm()
-                .attach_current_thread(|env| {
-                    let string_class = env.find_class(jni_str!("java/lang/String"))?;
-                    let uuids: JObjectArray = env.new_object_array(
-                        filter.services.len() as i32,
-                        &string_class,
-                        JObject::null(),
-                    )?;
-                    for (i, uuid) in filter.services.iter().enumerate() {
-                        let s = env.new_string(uuid.to_string())?;
-                        uuids.set_element(env, i, &s)?;
-                    }
+    async fn start_scan(&self, filter: ScanFilter) -> BlewResult<()> {
+        let low_power = filter.mode == crate::central::types::ScanMode::LowPower;
+        let service_count = i32::try_from(filter.services.len())
+            .map_err(|_| BlewError::Internal("scan filter has too many services".into()))?;
+        jvm()
+            .attach_current_thread(|env| {
+                let string_class = env.find_class(jni_str!("java/lang/String"))?;
+                let uuids: JObjectArray =
+                    env.new_object_array(service_count, &string_class, JObject::null())?;
+                for (i, uuid) in filter.services.iter().enumerate() {
+                    let s = env.new_string(uuid.to_string())?;
+                    uuids.set_element(env, i, &s)?;
+                }
 
-                    env.call_static_method(
-                        central_class(),
-                        jni_str!("startScan"),
-                        jni_sig!("([Ljava/lang/String;Z)V"),
-                        &[(&uuids).into(), low_power.into()],
-                    )?;
+                env.call_static_method(
+                    central_class(),
+                    jni_str!("startScan"),
+                    jni_sig!("([Ljava/lang/String;Z)V"),
+                    &[(&uuids).into(), low_power.into()],
+                )?;
 
-                    Ok(())
-                })
-                .map_err(jni_err)?;
+                Ok(())
+            })
+            .map_err(|e| jni_err(&e))?;
 
-            Ok(())
-        }
+        Ok(())
     }
 
-    fn stop_scan(&self) -> impl Future<Output = BlewResult<()>> + Send {
-        async {
-            jvm()
-                .attach_current_thread(|env| {
-                    env.call_static_method(
-                        central_class(),
-                        jni_str!("stopScan"),
-                        jni_sig!("()V"),
-                        &[],
-                    )?;
-                    Ok(())
-                })
-                .map_err(jni_err)?;
-            Ok(())
-        }
+    async fn stop_scan(&self) -> BlewResult<()> {
+        jvm()
+            .attach_current_thread(|env| {
+                env.call_static_method(
+                    central_class(),
+                    jni_str!("stopScan"),
+                    jni_sig!("()V"),
+                    &[],
+                )?;
+                Ok(())
+            })
+            .map_err(|e| jni_err(&e))?;
+        Ok(())
     }
 
-    fn discovered_devices(&self) -> impl Future<Output = BlewResult<Vec<BleDevice>>> + Send {
-        async {
-            let list = STATE
-                .get()
-                .map(|s| s.discovered.lock().clone())
-                .unwrap_or_default();
-            Ok(list)
-        }
+    async fn discovered_devices(&self) -> BlewResult<Vec<BleDevice>> {
+        let list = STATE
+            .get()
+            .map(|s| s.discovered.lock().clone())
+            .unwrap_or_default();
+        Ok(list)
     }
 
     fn connect(&self, device_id: &DeviceId) -> impl Future<Output = BlewResult<()>> + Send {
@@ -341,7 +336,7 @@ impl CentralBackend for AndroidCentral {
                 Ok(())
             }) {
                 s.pending_connects.take(&addr);
-                return Err(jni_err(err));
+                return Err(jni_err(&err));
             }
 
             let timeout = *s.connect_timeout.lock();
@@ -386,21 +381,22 @@ impl CentralBackend for AndroidCentral {
                 if awaits_callback {
                     s.pending_disconnects.take(&addr);
                 }
-                return Err(jni_err(err));
+                return Err(jni_err(&err));
             }
 
             if !awaits_callback {
                 return Ok(());
             }
 
-            if let Ok(_) = tokio::time::timeout(DISCONNECT_CALLBACK_TIMEOUT, rx).await {
-                Ok(())
-            } else {
+            if tokio::time::timeout(DISCONNECT_CALLBACK_TIMEOUT, rx)
+                .await
+                .is_err()
+            {
                 warn!(device = %addr, "disconnect callback did not fire; force-closing GATT");
                 s.pending_disconnects.take(&addr);
                 force_close_gatt(&addr);
-                Ok(())
             }
+            Ok(())
         }
     }
 
@@ -429,7 +425,7 @@ impl CentralBackend for AndroidCentral {
                     )?;
                     result.i()
                 })
-                .map_err(jni_err)?;
+                .map_err(|e| jni_err(&e))?;
 
             if status != STATUS_SUCCESS {
                 s.pending_discover.take(&addr);
@@ -470,7 +466,7 @@ impl CentralBackend for AndroidCentral {
 
                     result.i()
                 })
-                .map_err(jni_err)?;
+                .map_err(|e| jni_err(&e))?;
 
             if status != STATUS_SUCCESS {
                 s.pending_ops.take(&key);
@@ -531,7 +527,7 @@ impl CentralBackend for AndroidCentral {
 
                     result.i()
                 })
-                .map_err(jni_err)?;
+                .map_err(|e| jni_err(&e))?;
 
             if status != STATUS_SUCCESS {
                 if let Some(key) = pending_key {
@@ -571,7 +567,7 @@ impl CentralBackend for AndroidCentral {
 
                     result.i()
                 })
-                .map_err(jni_err)?;
+                .map_err(|e| jni_err(&e))?;
 
             if status != STATUS_SUCCESS {
                 return Err(gatt_status_to_error(status, &did, char_uuid));
@@ -603,7 +599,7 @@ impl CentralBackend for AndroidCentral {
 
                     result.i()
                 })
-                .map_err(jni_err)?;
+                .map_err(|e| jni_err(&e))?;
 
             if status != STATUS_SUCCESS {
                 return Err(gatt_status_to_error(status, &did, char_uuid));
@@ -645,7 +641,7 @@ impl CentralBackend for AndroidCentral {
                     )?;
                     Ok(())
                 })
-                .map_err(jni_err)?;
+                .map_err(|e| jni_err(&e))?;
 
             rx.await
                 .map_err(|_| BlewError::DisconnectedDuringOperation(id_for_err))?
@@ -657,7 +653,7 @@ impl CentralBackend for AndroidCentral {
     }
 }
 
-fn jni_err(e: jni::errors::Error) -> BlewError {
+fn jni_err(e: &jni::errors::Error) -> BlewError {
     BlewError::Internal(format!("JNI error: {e}"))
 }
 

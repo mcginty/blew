@@ -92,7 +92,6 @@ pub fn request_ble_permissions() {
             jni_sig!("()V"),
             &[],
         )?;
-        drop(activity);
         Ok(())
     });
     if let Err(e) = result {

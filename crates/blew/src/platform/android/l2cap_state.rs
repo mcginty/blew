@@ -27,10 +27,12 @@ use super::jni_globals::{central_class, jvm, peripheral_class};
 const DUPLEX_BUF_SIZE: usize = 65536;
 const L2CAP_READ_BUF_SIZE: usize = 4096;
 
+type AcceptSender = mpsc::UnboundedSender<BlewResult<(DeviceId, L2capChannel)>>;
+
 struct L2capState {
     pending_server: Mutex<Option<oneshot::Sender<BlewResult<Psm>>>>,
     pending_open: Mutex<HashMap<String, oneshot::Sender<BlewResult<L2capChannel>>>>,
-    accept_tx: Mutex<Option<mpsc::UnboundedSender<BlewResult<(DeviceId, L2capChannel)>>>>,
+    accept_tx: Mutex<Option<AcceptSender>>,
     data_tx: Mutex<HashMap<i32, mpsc::UnboundedSender<Vec<u8>>>>,
 }
 
@@ -67,7 +69,7 @@ pub(crate) fn complete_server_open(result: BlewResult<Psm>) {
     }
 }
 
-pub(crate) fn set_accept_tx(tx: mpsc::UnboundedSender<BlewResult<(DeviceId, L2capChannel)>>) {
+pub(crate) fn set_accept_tx(tx: AcceptSender) {
     *state().accept_tx.lock() = Some(tx);
 }
 
