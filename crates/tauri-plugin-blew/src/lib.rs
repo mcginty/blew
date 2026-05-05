@@ -136,8 +136,8 @@ pub fn init_with_config<R: Runtime>(config: BlewPluginConfig) -> TauriPlugin<R> 
         .setup(|_app, api| {
             #[cfg(target_os = "android")]
             {
-                let ctx = ndk_context::android_context();
-                let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) };
+                let vm_ptr = install_android_context()?;
+                let vm = unsafe { jni::JavaVM::from_raw(vm_ptr.cast()) };
                 blew::platform::android::init_jvm(vm);
                 api.register_android_plugin(PLUGIN_IDENTIFIER, "BlewPlugin")?;
             }
@@ -145,6 +145,40 @@ pub fn init_with_config<R: Runtime>(config: BlewPluginConfig) -> TauriPlugin<R> 
             Ok(())
         })
         .build()
+}
+
+// Tauri 2.11 (tao 0.35) no longer calls `ndk_context::initialize_android_context`,
+// so we install it ourselves before init_jvm runs — both blew and `hickory-resolver`
+// (iroh's DNS dep on Android) read the JVM/activity through ndk_context.
+#[cfg(target_os = "android")]
+fn install_android_context() -> Result<*mut std::ffi::c_void, Box<dyn std::error::Error>> {
+    use std::ffi::c_void;
+    use std::sync::mpsc;
+    use tauri::wry::prelude::{dispatch, jni as wry_jni};
+
+    let (tx, rx) = mpsc::channel();
+    dispatch(move |env, activity, _webview| {
+        let result: Result<_, wry_jni::errors::Error> = (|| {
+            let vm = env.get_java_vm()?;
+            let activity_global = env.new_global_ref(activity)?;
+            Ok((vm, activity_global))
+        })();
+        let _ = tx.send(result);
+    });
+    let (vm, activity_global) = rx
+        .recv()
+        .map_err(|e| format!("wry JNI dispatch never returned: {e}"))?
+        .map_err(|e| format!("JNI error capturing JVM/activity: {e}"))?;
+
+    let vm_ptr = vm.get_java_vm_pointer() as *mut c_void;
+    let activity_ptr = activity_global.as_obj().as_raw() as *mut c_void;
+    unsafe {
+        ndk_context::initialize_android_context(vm_ptr, activity_ptr);
+    }
+    // ndk_context borrows the activity for the lifetime of the process; leak the
+    // global ref so the JNI ref the activity pointer refers to is never freed.
+    std::mem::forget(activity_global);
+    Ok(vm_ptr)
 }
 
 /// JNI entry point invoked from `BlewPluginNative.autoRequestPermissionsEnabled()`
