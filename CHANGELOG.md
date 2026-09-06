@@ -14,14 +14,17 @@ All notable changes to `blew` are documented here. Format follows
   Linux derive the wire format from the property the central subscribed
   through (the CCCD) and reject an unsupported kind, and the mock backend
   mirrors them, with **`BlewError::NotifyKindMismatch { char_uuid,
-  requested }`** as the typed error.
+  requested }`** as the typed error. An unknown characteristic id is still a
+  `LocalCharacteristicNotFound`, matching Apple and Android.
 
 - **Android `notify_characteristic` now resolves `NotifyKind::Indicate` only
   once the stack reports the send** via `onNotificationSent` (issue #9). For
   an indication that is after the peer's ATT confirmation — a true
   acknowledgement. A five-second backstop degrades a stack that never reports
-  to "accepted". Apple and Linux already resolve appropriately: CoreBluetooth
-  on queue acceptance and BlueZ after the peer confirms. `NativeOnNotificationSent`
+  to "accepted". A stack that rejects the send outright fails fast with an
+  error instead of looking busy. Apple and Linux already resolve
+  appropriately: CoreBluetooth on queue acceptance and BlueZ after the peer
+  confirms. `nativeOnNotificationSent`
   was added to the Android JNI bridge to carry the callback into Rust; the
   call is tagged with a monotonic seq so a busy-retry can never resolve a newer
   call with an older callback.

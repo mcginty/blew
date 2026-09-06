@@ -519,6 +519,13 @@ impl PeripheralBackend for AndroidPeripheral {
                     remove_pending_notify(&device_addr, seq);
                     return Ok(());
                 }
+                // 4 = the stack rejected the send; retrying cannot help.
+                4 => {
+                    remove_pending_notify(&device_addr, seq);
+                    return Err(BlewError::Peripheral {
+                        source: "notification rejected by the stack".into(),
+                    });
+                }
                 1 => {
                     // Busy -- previous notification still in flight for this
                     // device, so this one was never accepted and no callback

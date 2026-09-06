@@ -727,29 +727,38 @@ impl PeripheralBackend for MockPeripheral {
         value: Vec<u8>,
     ) -> impl Future<Output = BlewResult<()>> + Send {
         let mut link = self.link.lock();
-        // Mirror the real backends: an unsupported kind is a typed error, not
-        // a silent wire-format mismatch.
-        let supported = link.services.iter().any(|svc| {
-            svc.characteristics.iter().any(|ch| {
-                ch.uuid == char_uuid
-                    && match kind {
-                        NotifyKind::Notify => {
-                            ch.properties.contains(CharacteristicProperties::NOTIFY)
-                        }
-                        NotifyKind::Indicate => {
-                            ch.properties.contains(CharacteristicProperties::INDICATE)
-                        }
+        // Mirror the real backends: an unknown characteristic is a
+        // LocalCharacteristicNotFound; a known one whose properties don't
+        // support the requested kind is a typed NotifyKindMismatch.
+        let (found, kind_ok) = match link
+            .services
+            .iter()
+            .flat_map(|svc| &svc.characteristics)
+            .find(|ch| ch.uuid == char_uuid)
+        {
+            Some(ch) => {
+                let ok = match kind {
+                    NotifyKind::Notify => ch.properties.contains(CharacteristicProperties::NOTIFY),
+                    NotifyKind::Indicate => {
+                        ch.properties.contains(CharacteristicProperties::INDICATE)
                     }
-            })
-        });
+                };
+                (true, ok)
+            }
+            None => (false, false),
+        };
         let drop_notification = std::mem::take(&mut link.drop_next_notification);
         let tx = link.subscriptions.get(&char_uuid).cloned();
         drop(link);
         async move {
-            if !supported {
-                return Err(BlewError::NotifyKindMismatch {
-                    char_uuid,
-                    requested: kind,
+            if !kind_ok {
+                return Err(if found {
+                    BlewError::NotifyKindMismatch {
+                        char_uuid,
+                        requested: kind,
+                    }
+                } else {
+                    BlewError::LocalCharacteristicNotFound { char_uuid }
                 });
             }
             if !drop_notification {
@@ -2356,6 +2365,38 @@ mod tests {
                 char_uuid,
                 requested: NotifyKind::Notify,
             } if char_uuid == indicate_only
+        ));
+    }
+
+    #[tokio::test]
+    async fn contract_notify_unknown_characteristic_is_typed_error() {
+        let (_, p) = MockLink::pair();
+        let peripheral = Peripheral::from_backend(p.peripheral);
+
+        peripheral
+            .add_service(&GattService {
+                uuid: Uuid::from_u128(0x1234),
+                primary: true,
+                characteristics: vec![GattCharacteristic {
+                    uuid: Uuid::from_u128(0xAA01),
+                    properties: CharacteristicProperties::NOTIFY,
+                    permissions: AttributePermissions::READ,
+                    value: vec![],
+                    descriptors: vec![],
+                }],
+            })
+            .await
+            .unwrap();
+
+        let device_id = DeviceId::from("mock-central");
+        let unknown = Uuid::from_u128(0xBEEF);
+        let err = peripheral
+            .notify_characteristic(&device_id, unknown, NotifyKind::Notify, vec![1])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BlewError::LocalCharacteristicNotFound { char_uuid } if char_uuid == unknown
         ));
     }
 

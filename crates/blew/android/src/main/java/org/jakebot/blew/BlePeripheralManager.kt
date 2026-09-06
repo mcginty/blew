@@ -583,6 +583,7 @@ object BlePeripheralManager {
      *   1 = busy (semaphore not available — caller should retry after a short delay)
      *   2 = device not connected or not subscribed to this characteristic
      *   3 = characteristic not found
+     *   4 = stack rejected the send (do not retry)
      */
     @JvmStatic
     fun notifyCharacteristic(
@@ -601,7 +602,7 @@ object BlePeripheralManager {
         val status = sendNotification(device, char, value, confirm)
         if (status != BluetoothStatusCodes.SUCCESS) {
             releaseNotify(deviceAddr)
-            return 1
+            return 4
         }
         notifySeqByDevice[deviceAddr] = seq
         return 0

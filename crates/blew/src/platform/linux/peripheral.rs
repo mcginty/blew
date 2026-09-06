@@ -465,6 +465,7 @@ impl PeripheralBackend for LinuxPeripheral {
             handle.adv_handle.lock().take();
             handle.app_handle.lock().take();
             handle.notifiers.lock().clear();
+            handle.char_props.lock().clear();
             Ok(())
         }
     }
@@ -489,12 +490,9 @@ impl PeripheralBackend for LinuxPeripheral {
         // wire-format mismatch.
         let handle = Arc::clone(&self.0);
         async move {
-            let declared = handle
-                .char_props
-                .lock()
-                .get(&char_uuid)
-                .copied()
-                .unwrap_or_default();
+            let Some(declared) = handle.char_props.lock().get(&char_uuid).copied() else {
+                return Err(BlewError::LocalCharacteristicNotFound { char_uuid });
+            };
             let supported = match kind {
                 NotifyKind::Notify => declared.contains(CharacteristicProperties::NOTIFY),
                 NotifyKind::Indicate => declared.contains(CharacteristicProperties::INDICATE),
