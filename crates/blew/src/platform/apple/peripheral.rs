@@ -50,8 +50,8 @@ use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, types::Psm};
 use crate::peripheral::backend::{self, PeripheralBackend};
 use crate::peripheral::types::{
-    AdvertisingConfig, PeripheralConfig, PeripheralRequest, PeripheralStateEvent, ReadResponder,
-    WriteResponder,
+    AdvertisingConfig, NotifyKind, PeripheralConfig, PeripheralRequest, PeripheralStateEvent,
+    ReadResponder, WriteResponder,
 };
 use crate::platform::apple::helpers::{
     ObjcSend, cbuuid_to_uuid, central_device_id, retain_send, uuid_to_cbuuid,
@@ -269,6 +269,13 @@ impl PeripheralInner {
 
     fn emit_request(&self, request: PeripheralRequest) {
         let _ = self.request_tx.send(request);
+    }
+
+    /// The declared `CBCharacteristicProperties` of a local characteristic, if
+    /// it is registered.
+    fn char_properties(&self, char_uuid: Uuid) -> Option<CBCharacteristicProperties> {
+        let lock = self.chars.lock();
+        lock.get(&char_uuid).map(|c| unsafe { c.0.properties() })
     }
 }
 
@@ -912,12 +919,34 @@ impl PeripheralBackend for ApplePeripheral {
         &self,
         device_id: &DeviceId,
         char_uuid: Uuid,
+        kind: NotifyKind,
         value: Vec<u8>,
     ) -> impl Future<Output = BlewResult<()>> + Send {
         let handle = Arc::clone(&self.0);
         let device_id = device_id.clone();
         async move {
-            trace!(device = %device_id, %char_uuid, len = value.len(), "notifying characteristic");
+            // CoreBluetooth has no per-call notification-kind control: the ATT
+            // layer decides between notification and indication from the
+            // property the central subscribed through (the CCCD). Validate the
+            // requested kind against the declared properties so an `Indicate`
+            // on a Notify-only characteristic is a typed error here rather than
+            // a silent wire-format mismatch.
+            let required = match kind {
+                NotifyKind::Notify => CBCharacteristicProperties::Notify,
+                NotifyKind::Indicate => CBCharacteristicProperties::Indicate,
+            };
+            let props = match handle.inner.char_properties(char_uuid) {
+                Some(props) => props,
+                None => return Err(BlewError::LocalCharacteristicNotFound { char_uuid }),
+            };
+            if !props.contains(required) {
+                return Err(BlewError::NotifyKindMismatch {
+                    char_uuid,
+                    requested: kind,
+                });
+            }
+
+            trace!(device = %device_id, %char_uuid, ?kind, len = value.len(), "notifying characteristic");
             // Attempt and enqueue under one lock so a readiness callback cannot
             // slip between them and leave this notification stranded.
             let rx = {

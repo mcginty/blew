@@ -250,7 +250,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         println!("  echo: {} bytes from {client_id}", value.len());
                         if let Err(e) = peripheral
-                            .notify_characteristic(&client_id, ECHO_CHAR_UUID, value)
+                            .notify_characteristic(
+                                &client_id,
+                                ECHO_CHAR_UUID,
+                                blew::peripheral::NotifyKind::Notify,
+                                value,
+                            )
                             .await
                         {
                             eprintln!("  notify failed: {e}");

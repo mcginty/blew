@@ -1,4 +1,4 @@
-use super::types::{AdvertisingConfig, PeripheralRequest, PeripheralStateEvent};
+use super::types::{AdvertisingConfig, NotifyKind, PeripheralRequest, PeripheralStateEvent};
 use crate::error::BlewResult;
 use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, types::Psm};
@@ -45,6 +45,15 @@ pub trait PeripheralBackend: private::Sealed + Send + Sync + 'static {
 
     /// Push a characteristic value update to a single subscribed central.
     ///
+    /// `kind` selects the ATT write mechanism per call. On Android it is
+    /// honoured exactly: `NotifyKind::Indicate` is sent as an indication and
+    /// the future resolves once the stack reports the send (i.e. after the
+    /// peer's ATT confirmation). Apple and Linux derive the wire format from
+    /// the property the central subscribed through (the CCCD), so on those
+    /// platforms `kind` is validated against the characteristic's declared
+    /// properties and an unsupported request fails with
+    /// [`BlewError::NotifyKindMismatch`](crate::error::BlewError::NotifyKindMismatch).
+    ///
     /// The notification is unicast to the central identified by `device_id`
     /// when the platform's GATT server API supports per-subscriber targeting
     /// (Apple, Android). On Linux/BlueZ, BlueZ's `CharacteristicNotifier`
@@ -54,6 +63,7 @@ pub trait PeripheralBackend: private::Sealed + Send + Sync + 'static {
         &self,
         device_id: &DeviceId,
         char_uuid: Uuid,
+        kind: NotifyKind,
         value: Vec<u8>,
     ) -> impl Future<Output = BlewResult<()>> + Send;
 

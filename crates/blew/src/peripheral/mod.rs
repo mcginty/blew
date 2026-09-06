@@ -2,8 +2,8 @@ pub mod backend;
 pub mod types;
 
 pub use types::{
-    AdvertisingConfig, PeripheralConfig, PeripheralRequest, PeripheralStateEvent, ReadResponder,
-    WriteResponder,
+    AdvertisingConfig, NotifyKind, PeripheralConfig, PeripheralRequest, PeripheralStateEvent,
+    ReadResponder, WriteResponder,
 };
 
 use crate::error::{BlewError, BlewResult};
@@ -84,16 +84,18 @@ impl<B: PeripheralBackend> Peripheral<B> {
 
     /// Push a characteristic value update to a single subscribed central.
     ///
-    /// See [`PeripheralBackend::notify_characteristic`] for the per-device
-    /// semantics and the Linux-only broadcast fallback.
+    /// `kind` selects the ATT write mechanism per call. See
+    /// [`NotifyKind`] for the per-platform completion semantics and the
+    /// [`PeripheralBackend::notify_characteristic`] per-device routing.
     pub async fn notify_characteristic(
         &self,
         device_id: &DeviceId,
         char_uuid: Uuid,
+        kind: NotifyKind,
         value: Vec<u8>,
     ) -> BlewResult<()> {
         self.backend
-            .notify_characteristic(device_id, char_uuid, value)
+            .notify_characteristic(device_id, char_uuid, kind, value)
             .await
     }
 

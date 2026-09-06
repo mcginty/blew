@@ -3,6 +3,45 @@ use crate::types::DeviceId;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+/// How a characteristic value update is delivered to a subscribed central.
+///
+/// Mirrors the ATT distinction between a Handle Value Notification and a
+/// Handle Value Indication. An indication is answered by the peer's ATT layer
+/// with a confirmation — the only signal a peripheral gets that the value was
+/// actually received — which is why [`Self::Indicate`] is the right choice for
+/// delivery-critical data.
+///
+/// # Completion semantics
+///
+/// [`PeripheralBackend::notify_characteristic`] resolves at a different point
+/// on each platform:
+///
+/// - **Android**: when the stack's `onNotificationSent` reports the send. For
+///   indications that is after the peer's ATT confirmation — a true
+///   acknowledgement.
+/// - **Apple**: when CoreBluetooth accepts the value into its transmit queue.
+///   CoreBluetooth exposes no per-indication acknowledgement.
+/// - **Linux/BlueZ**: when every live notifier's `notify()` returns. BlueZ
+///   resolves an indication only after the peer confirms.
+/// - **Mock**: immediately.
+///
+/// # Per-call vs per-subscription
+///
+/// The kind is selected **per call**. Apple and Linux ignore it for the wire
+/// format: CoreBluetooth and BlueZ derive notification-vs-indication from the
+/// property the central subscribed through (the CCCD value). On those
+/// platforms, requesting a kind the characteristic does not declare yields
+/// [`BlewError::NotifyKindMismatch`](crate::error::BlewError::NotifyKindMismatch)
+/// instead of silently sending the wrong wire format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NotifyKind {
+    /// ATT Handle Value Notification: fire-and-forget, no confirmation.
+    #[default]
+    Notify,
+    /// ATT Handle Value Indication: the peer answers with a confirmation.
+    Indicate,
+}
+
 /// Configuration for initialising the peripheral role.
 ///
 /// Construct with `..Default::default()` so a new field costs you one

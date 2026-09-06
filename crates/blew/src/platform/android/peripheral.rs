@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
+
 use jni::objects::{JObject, JObjectArray};
 use jni::{jni_sig, jni_str};
 use parking_lot::Mutex;
@@ -12,7 +15,7 @@ use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, types::Psm};
 use crate::peripheral::backend::{self, PeripheralBackend};
 use crate::peripheral::types::{
-    AdvertisingConfig, PeripheralConfig, PeripheralRequest, PeripheralStateEvent,
+    AdvertisingConfig, NotifyKind, PeripheralConfig, PeripheralRequest, PeripheralStateEvent,
 };
 use crate::types::DeviceId;
 use crate::util::BroadcastEventStream;
@@ -31,11 +34,27 @@ const ADVERTISE_OK: i32 = 0;
 /// independently of the Rust slot, so this can still come back.
 const ADVERTISE_ALREADY: i32 = 2;
 
+/// How long `notify_characteristic` waits for Kotlin's `onNotificationSent`
+/// before degrading to "accepted, treated as sent". The stack normally reports
+/// well within a second; this only bounds a callback that never arrives.
+const NOTIFY_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Monotonic id tagging each notify request so a busy-retry can never resolve
+/// a newer call with an older call's `onNotificationSent` callback. Rust
+/// assigns it and echoes it back through the JNI call; Kotlin stores the value
+/// on accept and returns it from the callback.
+static NEXT_NOTIFY_SEQ: AtomicI64 = AtomicI64::new(0);
+
 struct PeripheralState {
     request_tx: mpsc::UnboundedSender<PeripheralRequest>,
     request_rx: Mutex<Option<mpsc::UnboundedReceiver<PeripheralRequest>>>,
     state_tx: broadcast::Sender<PeripheralStateEvent>,
     advertise: Mutex<AdvertiseState>,
+    /// Notification sends awaiting Kotlin's `onNotificationSent`, keyed by
+    /// (device address, notify seq). Completed (and removed) by
+    /// `nativeOnNotificationSent`; timed out and removed if the stack never
+    /// reports.
+    pending_notifies: Mutex<HashMap<(String, i64), oneshot::Sender<BlewResult<()>>>>,
 }
 
 /// Run `f` against the advertising state, if the backend is initialised.
@@ -163,6 +182,62 @@ pub(crate) fn send_state_event(event: PeripheralStateEvent) {
     }
 }
 
+fn set_pending_notify(addr: &str, seq: i64, tx: oneshot::Sender<BlewResult<()>>) {
+    if let Some(s) = STATE.lock().as_ref() {
+        s.pending_notifies
+            .lock()
+            .insert((addr.to_string(), seq), tx);
+    }
+}
+
+fn remove_pending_notify(addr: &str, seq: i64) {
+    if let Some(s) = STATE.lock().as_ref() {
+        s.pending_notifies.lock().remove(&(addr.to_string(), seq));
+    }
+}
+
+/// Resolve the waiter for one accepted notification from Kotlin's
+/// `onNotificationSent`. Unknown (stale, or already timed out) seq values are
+/// ignored.
+pub(crate) fn complete_pending_notify(addr: &str, seq: i64, result: BlewResult<()>) {
+    if let Some(s) = STATE.lock().as_ref() {
+        let tx = s.pending_notifies.lock().remove(&(addr.to_string(), seq));
+        if let Some(tx) = tx {
+            let _ = tx.send(result);
+        }
+    }
+}
+
+/// Wait for the stack's `onNotificationSent` after it has accepted a value.
+/// A missing callback is degraded to success — matching the "accepted into the
+/// transmit queue" completion Apple offers — rather than surfacing a spurious
+/// failure the caller cannot act on.
+async fn await_notify_ack(
+    device_addr: String,
+    seq: i64,
+    rx: oneshot::Receiver<BlewResult<()>>,
+) -> BlewResult<()> {
+    match tokio::time::timeout(NOTIFY_ACK_TIMEOUT, rx).await {
+        Ok(Ok(result)) => {
+            remove_pending_notify(&device_addr, seq);
+            result
+        }
+        Ok(Err(_)) => {
+            // Sender dropped without reporting (backend shut down).
+            remove_pending_notify(&device_addr, seq);
+            Ok(())
+        }
+        Err(_) => {
+            warn!(
+                device_addr,
+                seq, "notification ack timed out; treating as sent"
+            );
+            remove_pending_notify(&device_addr, seq);
+            Ok(())
+        }
+    }
+}
+
 pub struct AndroidPeripheral;
 
 impl AndroidPeripheral {
@@ -264,6 +339,7 @@ impl PeripheralBackend for AndroidPeripheral {
             request_rx: Mutex::new(Some(request_rx)),
             state_tx,
             advertise: Mutex::new(AdvertiseState::default()),
+            pending_notifies: Mutex::new(HashMap::new()),
         });
         // The L2CAP statics are shared between the two roles but were only
         // initialised from the central path. A peripheral-only app would find
@@ -393,13 +469,26 @@ impl PeripheralBackend for AndroidPeripheral {
         &self,
         device_id: &DeviceId,
         char_uuid: Uuid,
+        kind: NotifyKind,
         value: Vec<u8>,
     ) -> BlewResult<()> {
         let device_addr = device_id.as_str().to_owned();
+        let confirm = kind == NotifyKind::Indicate;
+        let seq = NEXT_NOTIFY_SEQ.fetch_add(1, Ordering::Relaxed);
+
         // Retry loop: Kotlin returns 1 ("busy") when the previous
         // notification hasn't completed yet (onNotificationSent pending).
-        // We retry with async sleep so we don't block the tokio thread.
+        // We retry with async sleep so we don't block the tokio thread. The
+        // seq stays fixed across retries, so once accepted, the callback that
+        // resolves us is unambiguously ours even if another device's (or a
+        // stale) callback races.
         for attempt in 0..50_u32 {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            // Register before the JNI call: `onNotificationSent` can fire at
+            // any moment after the stack accepts, and an unregistered waiter
+            // would be dropped (we then stall until NOTIFY_ACK_TIMEOUT).
+            set_pending_notify(&device_addr, seq, ack_tx);
+
             let status: i32 = jvm()
                 .attach_current_thread(|env| {
                     let addr_str = env.new_string(&device_addr)?;
@@ -409,27 +498,42 @@ impl PeripheralBackend for AndroidPeripheral {
                     let ret = env.call_static_method(
                         peripheral_class(),
                         jni_str!("notifyCharacteristic"),
-                        jni_sig!("(Ljava/lang/String;Ljava/lang/String;[B)I"),
-                        &[(&addr_str).into(), (&uuid_str).into(), (&j_value).into()],
+                        jni_sig!("(Ljava/lang/String;Ljava/lang/String;[BZJ)I"),
+                        &[
+                            (&addr_str).into(),
+                            (&uuid_str).into(),
+                            (&j_value).into(),
+                            confirm.into(),
+                            seq.into(),
+                        ],
                     )?;
                     ret.i()
                 })
                 .map_err(|e| jni_err(&e))?;
 
             match status {
-                // 0 = success; 2 = no subscribers (not an error).
-                0 | 2 => return Ok(()),
+                // 0 = accepted; resolve once onNotificationSent reports.
+                0 => return await_notify_ack(device_addr, seq, ack_rx).await,
+                // 2 = no subscribers (not an error).
+                2 => {
+                    remove_pending_notify(&device_addr, seq);
+                    return Ok(());
+                }
                 1 => {
-                    // Busy -- previous notification still in flight.
-                    // Yield to tokio and retry after a short delay.
+                    // Busy -- previous notification still in flight for this
+                    // device, so this one was never accepted and no callback
+                    // will arrive. Yield to tokio and retry after a short delay.
+                    remove_pending_notify(&device_addr, seq);
                     if attempt < 49 {
                         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                     }
                 }
                 3 => {
+                    remove_pending_notify(&device_addr, seq);
                     return Err(BlewError::LocalCharacteristicNotFound { char_uuid });
                 }
                 other => {
+                    remove_pending_notify(&device_addr, seq);
                     return Err(BlewError::Peripheral {
                         source: format!("notify returned unknown status {other}").into(),
                     });

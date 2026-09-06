@@ -25,11 +25,13 @@ use uuid::Uuid;
 use crate::central::backend::{self, CentralBackend};
 use crate::central::types::{CentralEvent, DisconnectCause, ScanFilter, WriteType};
 use crate::error::{BlewError, BlewResult};
+use crate::gatt::props::CharacteristicProperties;
 use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, types::Psm};
 use crate::peripheral::backend::{self as periph_backend, PeripheralBackend};
 use crate::peripheral::types::{
-    AdvertisingConfig, PeripheralRequest, PeripheralStateEvent, ReadResponder, WriteResponder,
+    AdvertisingConfig, NotifyKind, PeripheralRequest, PeripheralStateEvent, ReadResponder,
+    WriteResponder,
 };
 use crate::types::{BleDevice, DeviceId};
 use crate::util::BroadcastEventStream;
@@ -721,15 +723,44 @@ impl PeripheralBackend for MockPeripheral {
         &self,
         _device_id: &crate::types::DeviceId,
         char_uuid: Uuid,
+        kind: NotifyKind,
         value: Vec<u8>,
     ) -> impl Future<Output = BlewResult<()>> + Send {
         let mut link = self.link.lock();
-        if std::mem::take(&mut link.drop_next_notification) {
-            // Silently discard the notification, as if it were lost in transit.
-        } else if let Some(tx) = link.subscriptions.get(&char_uuid) {
-            let _ = tx.send(Bytes::from(value));
+        // Mirror the real backends: an unsupported kind is a typed error, not
+        // a silent wire-format mismatch.
+        let supported = link.services.iter().any(|svc| {
+            svc.characteristics.iter().any(|ch| {
+                ch.uuid == char_uuid
+                    && match kind {
+                        NotifyKind::Notify => {
+                            ch.properties.contains(CharacteristicProperties::NOTIFY)
+                        }
+                        NotifyKind::Indicate => {
+                            ch.properties.contains(CharacteristicProperties::INDICATE)
+                        }
+                    }
+            })
+        });
+        let drop_notification = std::mem::take(&mut link.drop_next_notification);
+        let tx = link.subscriptions.get(&char_uuid).cloned();
+        drop(link);
+        async move {
+            if !supported {
+                return Err(BlewError::NotifyKindMismatch {
+                    char_uuid,
+                    requested: kind,
+                });
+            }
+            if !drop_notification {
+                // Silently discarding the notification, as if it were lost in
+                // transit, is only armed by `drop_next_notification`.
+                if let Some(tx) = tx {
+                    let _ = tx.send(Bytes::from(value));
+                }
+            }
+            Ok(())
         }
-        async { Ok(()) }
     }
 
     fn l2cap_listener(
@@ -1137,6 +1168,7 @@ mod tests {
             .notify_characteristic(
                 &crate::types::DeviceId::from("mock-central"),
                 char_uuid,
+                NotifyKind::Notify,
                 b"notify-data".to_vec(),
             )
             .await
@@ -1483,6 +1515,7 @@ mod tests {
             .notify_characteristic(
                 &crate::types::DeviceId::from("mock-central"),
                 char_uuid,
+                NotifyKind::Notify,
                 b"too-early".to_vec(),
             )
             .await
@@ -1504,6 +1537,7 @@ mod tests {
             .notify_characteristic(
                 &crate::types::DeviceId::from("mock-central"),
                 char_uuid,
+                NotifyKind::Notify,
                 b"after-sub".to_vec(),
             )
             .await
@@ -1571,6 +1605,7 @@ mod tests {
             .notify_characteristic(
                 &crate::types::DeviceId::from("mock-central"),
                 char_uuid,
+                NotifyKind::Notify,
                 b"after-disconnect".to_vec(),
             )
             .await
@@ -1723,6 +1758,7 @@ mod tests {
                 .notify_characteristic(
                     &crate::types::DeviceId::from("mock-central"),
                     char_uuid,
+                    NotifyKind::Notify,
                     vec![i],
                 )
                 .await
@@ -2238,6 +2274,7 @@ mod tests {
             .notify_characteristic(
                 &DeviceId::from("mock-central"),
                 char_uuid,
+                NotifyKind::Notify,
                 b"dropped".to_vec(),
             )
             .await
@@ -2246,6 +2283,7 @@ mod tests {
             .notify_characteristic(
                 &DeviceId::from("mock-central"),
                 char_uuid,
+                NotifyKind::Notify,
                 b"delivered".to_vec(),
             )
             .await
@@ -2262,6 +2300,122 @@ mod tests {
             }
         };
         assert_eq!(&delivered[..], b"delivered");
+    }
+
+    #[tokio::test]
+    async fn contract_notify_kind_mismatch_is_typed_error() {
+        let (_, p) = MockLink::pair();
+        let peripheral = Peripheral::from_backend(p.peripheral);
+
+        let notify_only = Uuid::from_u128(0xAA01);
+        let indicate_only = Uuid::from_u128(0xAA02);
+        peripheral
+            .add_service(&GattService {
+                uuid: Uuid::from_u128(0x1234),
+                primary: true,
+                characteristics: vec![
+                    GattCharacteristic {
+                        uuid: notify_only,
+                        properties: CharacteristicProperties::NOTIFY,
+                        permissions: AttributePermissions::READ,
+                        value: vec![],
+                        descriptors: vec![],
+                    },
+                    GattCharacteristic {
+                        uuid: indicate_only,
+                        properties: CharacteristicProperties::INDICATE,
+                        permissions: AttributePermissions::READ,
+                        value: vec![],
+                        descriptors: vec![],
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+
+        let device_id = DeviceId::from("mock-central");
+        let err = peripheral
+            .notify_characteristic(&device_id, notify_only, NotifyKind::Indicate, vec![1])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BlewError::NotifyKindMismatch {
+                char_uuid,
+                requested: NotifyKind::Indicate,
+            } if char_uuid == notify_only
+        ));
+
+        let err = peripheral
+            .notify_characteristic(&device_id, indicate_only, NotifyKind::Notify, vec![1])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BlewError::NotifyKindMismatch {
+                char_uuid,
+                requested: NotifyKind::Notify,
+            } if char_uuid == indicate_only
+        ));
+    }
+
+    #[tokio::test]
+    async fn contract_notify_indicate_delivers_to_subscriber() {
+        let (c, p) = MockLink::pair();
+        let central = Central::from_backend(c.central);
+        let peripheral = Peripheral::from_backend(p.peripheral);
+
+        let char_uuid = Uuid::from_u128(0xAA03);
+        peripheral
+            .add_service(&GattService {
+                uuid: Uuid::from_u128(0x1234),
+                primary: true,
+                characteristics: vec![GattCharacteristic {
+                    uuid: char_uuid,
+                    properties: CharacteristicProperties::INDICATE,
+                    permissions: AttributePermissions::READ,
+                    value: vec![],
+                    descriptors: vec![],
+                }],
+            })
+            .await
+            .unwrap();
+        let device_id = DeviceId::from("mock-peripheral");
+        central.connect(&device_id).await.unwrap();
+
+        let mut events = central.events();
+        assert!(matches!(
+            events.next().await.unwrap(),
+            CentralEvent::AdapterStateChanged { powered: true }
+        ));
+        assert!(matches!(
+            events.next().await.unwrap(),
+            CentralEvent::DeviceConnected { .. }
+        ));
+
+        central
+            .subscribe_characteristic(&device_id, char_uuid)
+            .await
+            .unwrap();
+
+        peripheral
+            .notify_characteristic(
+                &DeviceId::from("mock-central"),
+                char_uuid,
+                NotifyKind::Indicate,
+                b"indicated".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(100), events.next())
+            .await
+            .expect("should receive indication")
+            .expect("stream should not end");
+        assert!(matches!(
+            ev,
+            CentralEvent::CharacteristicNotification { value, .. } if &value[..] == b"indicated"
+        ));
     }
 
     use proptest::collection::vec as prop_vec;
