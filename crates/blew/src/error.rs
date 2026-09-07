@@ -1,3 +1,4 @@
+use crate::peripheral::types::NotifyKind;
 use crate::types::DeviceId;
 use std::error::Error;
 use uuid::Uuid;
@@ -39,6 +40,14 @@ pub enum BlewError {
 
     #[error("local characteristic {char_uuid} not found")]
     LocalCharacteristicNotFound { char_uuid: Uuid },
+
+    #[error(
+        "local characteristic {char_uuid} does not declare a property supporting {requested:?} value updates"
+    )]
+    NotifyKindMismatch {
+        char_uuid: Uuid,
+        requested: NotifyKind,
+    },
 
     #[error("already advertising")]
     AlreadyAdvertising,

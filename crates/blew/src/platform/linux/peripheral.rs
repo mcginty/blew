@@ -4,8 +4,8 @@ use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, types::Psm};
 use crate::peripheral::backend::{self, PeripheralBackend};
 use crate::peripheral::types::{
-    AdvertisingConfig, PeripheralConfig, PeripheralRequest, PeripheralStateEvent, ReadResponder,
-    WriteResponder,
+    AdvertisingConfig, NotifyKind, PeripheralConfig, PeripheralRequest, PeripheralStateEvent,
+    ReadResponder, WriteResponder,
 };
 use crate::platform::linux::l2cap::bridge_l2cap;
 use crate::types::DeviceId;
@@ -39,6 +39,9 @@ struct PeripheralInner {
     adv_handle: Mutex<Option<bluer::adv::AdvertisementHandle>>,
     app_handle: Mutex<Option<ApplicationHandle>>,
     notifiers: Mutex<HashMap<Uuid, Vec<SharedNotifier>>>,
+    /// Declared `CharacteristicProperties` per characteristic, so
+    /// `notify_characteristic` can validate the requested `NotifyKind`.
+    char_props: Mutex<HashMap<Uuid, CharacteristicProperties>>,
     request_tx: mpsc::UnboundedSender<PeripheralRequest>,
     request_rx: Mutex<Option<mpsc::UnboundedReceiver<PeripheralRequest>>>,
     state_tx: broadcast::Sender<PeripheralStateEvent>,
@@ -142,6 +145,7 @@ fn build_characteristic(
 ) -> Characteristic {
     let uuid = ch.uuid;
     let props = ch.properties;
+    inner.char_props.lock().insert(uuid, props);
 
     let read = if props.contains(CharacteristicProperties::READ) {
         // Static value -- auto-respond without round-tripping through the event
@@ -241,10 +245,19 @@ fn build_characteristic(
         None
     };
 
-    let notify = if props.contains(CharacteristicProperties::NOTIFY) {
+    let notify = if props
+        .intersects(CharacteristicProperties::NOTIFY | CharacteristicProperties::INDICATE)
+    {
         let inner_n = Arc::clone(inner);
         Some(CharacteristicNotify {
-            notify: true,
+            // BlueZ derives notification-vs-indication from the CCCD the
+            // central wrote, so declaring both properties lets a central pick
+            // either wire format. That is separate from the confirmation
+            // channel, which bluer only creates for an Indicate-only
+            // characteristic (`indicate && !notify`): only then does the
+            // peer's confirmation gate `notify()`.
+            notify: props.contains(CharacteristicProperties::NOTIFY),
+            indicate: props.contains(CharacteristicProperties::INDICATE),
             method: CharacteristicNotifyMethod::Fun(Box::new(
                 move |notifier: CharacteristicNotifier| {
                     let inner_n = Arc::clone(&inner_n);
@@ -332,6 +345,7 @@ impl PeripheralBackend for LinuxPeripheral {
             adv_handle: Mutex::new(None),
             app_handle: Mutex::new(None),
             notifiers: Mutex::new(HashMap::new()),
+            char_props: Mutex::new(HashMap::new()),
             request_tx,
             request_rx: Mutex::new(Some(request_rx)),
             state_tx,
@@ -453,6 +467,7 @@ impl PeripheralBackend for LinuxPeripheral {
             handle.adv_handle.lock().take();
             handle.app_handle.lock().take();
             handle.notifiers.lock().clear();
+            handle.char_props.lock().clear();
             Ok(())
         }
     }
@@ -461,15 +476,37 @@ impl PeripheralBackend for LinuxPeripheral {
         &self,
         _device_id: &crate::types::DeviceId,
         char_uuid: Uuid,
+        kind: NotifyKind,
         value: Vec<u8>,
     ) -> impl Future<Output = BlewResult<()>> + Send {
         // NOTE: BlueZ's `CharacteristicNotifier` callback does not expose the
         // remote device identity, so we cannot route a notification to a
         // specific subscriber here. Every live notifier for the characteristic
         // receives the value. See the trait doc for details.
+        //
+        // BlueZ also has no per-call kind control: the CCCD the central wrote
+        // decides between notification and indication, and bluer only creates
+        // a confirmation channel for an Indicate-only characteristic. Validate
+        // the requested kind against the declared properties so an
+        // unsupported request is a typed error rather than a silent
+        // wire-format mismatch.
         let handle = Arc::clone(&self.0);
         async move {
-            trace!(%char_uuid, len = value.len(), "notifying characteristic");
+            let Some(declared) = handle.char_props.lock().get(&char_uuid).copied() else {
+                return Err(BlewError::LocalCharacteristicNotFound { char_uuid });
+            };
+            let supported = match kind {
+                NotifyKind::Notify => declared.contains(CharacteristicProperties::NOTIFY),
+                NotifyKind::Indicate => declared.contains(CharacteristicProperties::INDICATE),
+            };
+            if !supported {
+                return Err(BlewError::NotifyKindMismatch {
+                    char_uuid,
+                    requested: kind,
+                });
+            }
+
+            trace!(%char_uuid, ?kind, len = value.len(), "notifying characteristic");
             // Collect live notifiers without holding the outer Mutex across awaits.
             let arcs: Vec<SharedNotifier> = handle
                 .notifiers

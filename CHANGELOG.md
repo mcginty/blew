@@ -5,6 +5,48 @@ All notable changes to `blew` are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`NotifyKind::{Notify, Indicate}` — per-call selection of the ATT write
+  kind in `Peripheral::notify_characteristic`** (issue #18). `NotifyKind::Indicate`
+  sends an ATT Handle Value Indication; `NotifyKind::Notify` (default) a
+  Handle Value Notification. Android honours the selection exactly. Apple and
+  Linux derive the wire format from the property the central subscribed
+  through (the CCCD) and reject an unsupported kind, and the mock backend
+  mirrors them, with **`BlewError::NotifyKindMismatch { char_uuid,
+  requested }`** as the typed error. An unknown characteristic id is still a
+  `LocalCharacteristicNotFound`, matching Apple and Android.
+
+- **Android `notify_characteristic` now resolves `NotifyKind::Indicate` only
+  once the stack reports the send** via `onNotificationSent` (issue #9). For
+  an indication that is after the peer's ATT confirmation — a true
+  acknowledgement. A five-second backstop degrades a stack that never reports
+  to "accepted". A stack that rejects the send outright fails fast with an
+  error instead of looking busy. Apple and Linux already resolve
+  appropriately: CoreBluetooth on queue acceptance and BlueZ after the peer
+  confirms. `nativeOnNotificationSent`
+  was added to the Android JNI bridge to carry the callback into Rust; the
+  call is tagged with a monotonic seq so a busy-retry can never resolve a newer
+  call with an older callback. A per-device Kotlin semaphore serializes sends
+  (Android silently drops concurrent ones); it is released only for a tracked
+  in-flight send, and a Kotlin-side backstop frees it if `onNotificationSent`
+  never arrives, so a silent stack cannot wedge future notifications.
+
+- **Linux indication support.** Characteristics declaring
+  `CharacteristicProperties::INDICATE` now register an indication CCCD. Bluer
+  only wires up a confirmation channel for an Indicate-only characteristic
+  (`INDICATE` without `NOTIFY`), so only there does BlueZ resolve the notifier
+  after the peer confirms an indication; on a characteristic that also
+  declares `NOTIFY`, the central's CCCD pick is delivered without
+  confirmation.
+
+### Changed
+
+- **Breaking: `Peripheral::notify_characteristic` gained a `kind:
+  NotifyKind` argument** before `value` (issue #18). It is a single type
+  parameter — not an options struct — so the compiler points you at every call
+  site. See the upgrade guide below.
+
 ### Fixed
 
 - **Android: `BleCentralManager.init` / `BlePeripheralManager.init` crashed on
@@ -709,6 +751,30 @@ PeripheralRequest::Write { client_id, char_uuid, offset, value, responder, .. } 
 
 `offset` is `0` for ordinary writes, so applications that never receive a
 payload larger than `MTU - 3` can keep treating `value` as the whole value.
+
+---
+
+## Upgrade guide — Unreleased → next
+
+**If you called `Peripheral::notify_characteristic`, pass a `NotifyKind`**:
+
+```rust
+// Before
+peripheral.notify_characteristic(&device_id, char_uuid, value).await?;
+
+// After — a notification (unchanged wire format)
+peripheral
+    .notify_characteristic(&device_id, char_uuid, NotifyKind::Notify, value)
+    .await?;
+
+// After — an indication; on Android the call resolves only once the peer
+// has confirmed at the ATT layer
+peripheral
+    .notify_characteristic(&device_id, char_uuid, NotifyKind::Indicate, value)
+    .await?;
+```
+
+`use blew::peripheral::NotifyKind;` (also re-exported from `blew`).
 
 ---
 

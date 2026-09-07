@@ -16,6 +16,7 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -51,6 +52,12 @@ object BlePeripheralManager {
      */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    // How long to wait for `onNotificationSent` before freeing the notify
+    // semaphore ourselves. Slightly longer than Rust's NOTIFY_ACK_TIMEOUT
+    // (5s), so Rust's own timeout resolves its waiter first and the backstop
+    // only frees the Kotlin-side semaphore that Rust cannot see.
+    private const val NOTIFY_BACKSTOP_MS = 6_000L
+
     private var gattServer: BluetoothGattServer? = null
     private var advertiser: BluetoothLeAdvertiser? = null
 
@@ -85,6 +92,50 @@ object BlePeripheralManager {
     private fun releaseNotify(addr: String) {
         notifySemaphores[addr]?.release()
     }
+
+    /**
+     * Resolve the in-flight notification for [addr], if one is tracked.
+     * Consuming the tracked seq via `remove` makes this idempotent, so a
+     * stale/duplicate `onNotificationSent` or the backstop can never release
+     * the semaphore twice (over-release would let Android silently drop
+     * concurrent sends). Forwards the outcome to Rust.
+     *
+     * [delayMs] the backstop's artificial delay used purely for logging.
+     */
+    private fun completeNotify(
+        addr: String,
+        status: Int,
+        delayMs: Long = 0,
+    ) {
+        notifySeqByDevice.remove(addr)?.let { seq ->
+            releaseNotify(addr)
+            if (delayMs > 0) {
+                Log.w(TAG, "onNotificationSent did not arrive within ${delayMs}ms; releasing notify semaphore")
+            }
+            nativeOnNotificationSent(addr, seq, status)
+        }
+    }
+
+    /**
+     * Safety net for stacks that never fire `onNotificationSent`. The Rust
+     * future times out on its own, but the Kotlin per-device semaphore would
+     * otherwise stay acquired forever, stalling every later send for this
+     * device. After [NOTIFY_BACKSTOP_MS] this consumes the tracked seq and
+     * frees the semaphore. `completeNotify` is idempotent, so if the real
+     * callback already arrived this is a no-op.
+     */
+    private fun scheduleNotifyBackstop(addr: String) {
+        scope.launch {
+            delay(NOTIFY_BACKSTOP_MS)
+            completeNotify(addr, BluetoothStatusCodes.ERROR_UNKNOWN, NOTIFY_BACKSTOP_MS)
+        }
+    }
+
+    // Rust-assigned id for the notify call currently in flight per device.
+    // Stored on accept and echoed back through [nativeOnNotificationSent] so a
+    // busy-retry can never resolve a newer call with an older callback. Safe
+    // as a single slot per device: the semaphore above serializes sends.
+    private val notifySeqByDevice = ConcurrentHashMap<String, Long>()
 
     // ── L2CAP state ──
     private val l2cap =
@@ -136,6 +187,18 @@ object BlePeripheralManager {
 
     @JvmStatic
     external fun nativeOnAdapterStateChanged(powered: Boolean)
+
+    /**
+     * Reports that a previously accepted [`notifyCharacteristic`] call reached
+     * the stack's `onNotificationSent` callback. `seq` is the id Rust assigned
+     * when the call was made; `status` is the BluetoothGatt status code.
+     */
+    @JvmStatic
+    external fun nativeOnNotificationSent(
+        deviceAddr: String,
+        seq: Long,
+        status: Int,
+    )
 
     // ── L2CAP JNI hooks ──
 
@@ -243,7 +306,13 @@ object BlePeripheralManager {
                 device: BluetoothDevice,
                 status: Int,
             ) {
-                releaseNotify(device.address)
+                val addr = device.address
+                // Only release the per-device semaphore when this callback is for a
+                // send we actually accepted and which hasn't already been resolved
+                // (by a prior callback or the backstop). Removing the tracked seq
+                // atomically both consumes it and gates the release, so a stale or
+                // duplicate callback can never over-release.
+                completeNotify(addr, status)
             }
 
             override fun onCharacteristicReadRequest(
@@ -548,19 +617,28 @@ object BlePeripheralManager {
     }
 
     /**
-     * Send a notification on a characteristic to a single subscribed device.
+     * Send a notification/indication on a characteristic to a single
+     * subscribed device.
+     *
+     * `confirm` selects the ATT write kind: `false` is a Handle Value
+     * Notification, `true` a Handle Value Indication. `seq` is Rust's
+     * monotonically increasing id for this call, echoed back through
+     * [nativeOnNotificationSent] from `onNotificationSent`.
      *
      * Returns:
-     *   0 = success
+     *   0 = accepted (the stack reports completion via onNotificationSent)
      *   1 = busy (semaphore not available — caller should retry after a short delay)
      *   2 = device not connected or not subscribed to this characteristic
      *   3 = characteristic not found
+     *   4 = stack rejected the send (do not retry)
      */
     @JvmStatic
     fun notifyCharacteristic(
         deviceAddr: String,
         charUuid: String,
         value: ByteArray,
+        confirm: Boolean,
+        seq: Long,
     ): Int {
         val uuid = UUID.fromString(charUuid)
         val char = characteristics[uuid] ?: return 3
@@ -568,32 +646,38 @@ object BlePeripheralManager {
         val subs = subscriptions[deviceAddr] ?: return 2
         if (uuid !in subs) return 2
         if (!acquireNotify(deviceAddr, timeoutMs = 50)) return 1
-        val sent = sendNotification(device, char, value)
-        if (!sent) {
+        val status = sendNotification(device, char, value, confirm)
+        if (status != BluetoothStatusCodes.SUCCESS) {
             releaseNotify(deviceAddr)
-            return 1
+            return 4
         }
+        notifySeqByDevice[deviceAddr] = seq
+        scheduleNotifyBackstop(deviceAddr)
         return 0
     }
 
     /**
-     * Send a single notification, handling the API 33+ / legacy split.
-     * On API < 33, synchronizes on [char] to prevent concurrent `char.value`
-     * races when multiple devices are notified from different threads.
+     * Send a single notification/indication, handling the API 33+ / legacy
+     * split. Returns `BluetoothStatusCodes.SUCCESS` when the stack accepted
+     * the value. On API < 33, synchronizes on [char] to prevent concurrent
+     * `char.value` races when multiple devices are notified from different
+     * threads.
      */
     private fun sendNotification(
         device: BluetoothDevice,
         char: BluetoothGattCharacteristic,
         value: ByteArray,
-    ): Boolean =
+        confirm: Boolean,
+    ): Int =
         if (Build.VERSION.SDK_INT >= 33) {
-            gattServer?.notifyCharacteristicChanged(device, char, false, value) ==
-                BluetoothStatusCodes.SUCCESS
+            gattServer?.notifyCharacteristicChanged(device, char, confirm, value)
+                ?: BluetoothStatusCodes.ERROR_UNKNOWN
         } else {
             @Suppress("DEPRECATION")
             synchronized(char) {
                 char.value = value
-                gattServer?.notifyCharacteristicChanged(device, char, false) ?: false
+                val sent = gattServer?.notifyCharacteristicChanged(device, char, confirm) ?: false
+                if (sent) BluetoothStatusCodes.SUCCESS else BluetoothStatusCodes.ERROR_UNKNOWN
             }
         }
 

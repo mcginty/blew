@@ -28,13 +28,14 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use jni::objects::{JByteArray, JClass, JString};
-use jni::sys::{JNI_TRUE, jboolean, jint};
+use jni::sys::{JNI_TRUE, jboolean, jint, jlong};
 use jni::{EnvUnowned, jni_sig, jni_str};
 use tokio::sync::oneshot;
-use tracing::trace;
+use tracing::{debug, trace};
 use uuid::Uuid;
 
 use crate::central::types::{CentralEvent, DisconnectCause};
+use crate::error::BlewError;
 use crate::l2cap::types::Psm;
 use crate::peripheral::types::{
     PeripheralRequest, PeripheralStateEvent, ReadResponder, WriteResponder,
@@ -301,6 +302,34 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnAdap
         super::peripheral::send_state_event(PeripheralStateEvent::AdapterStateChanged {
             powered: powered == JNI_TRUE,
         });
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnNotificationSent(
+    mut env: EnvUnowned,
+    _class: JClass,
+    device_addr: JString,
+    seq: jlong,
+    status: jint,
+) {
+    guard("nativeOnNotificationSent", || {
+        env.with_env(|env| {
+            let Some(addr) = jstring_to_string(env, &device_addr) else {
+                return Ok::<_, jni::errors::Error>(());
+            };
+            debug!(addr, seq, status, "notification ack from Kotlin");
+            let result = if status == 0 {
+                Ok(())
+            } else {
+                Err(BlewError::Peripheral {
+                    source: format!("notification send failed (status {status})").into(),
+                })
+            };
+            super::peripheral::complete_pending_notify(&addr, seq, result);
+            Ok(())
+        })
+        .into_outcome();
     });
 }
 
