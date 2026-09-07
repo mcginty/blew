@@ -623,13 +623,13 @@ object BlePeripheralManager {
     ): Int =
         if (Build.VERSION.SDK_INT >= 33) {
             gattServer?.notifyCharacteristicChanged(device, char, confirm, value)
-                ?: BluetoothStatusCodes.ERROR
+                ?: BluetoothStatusCodes.ERROR_UNKNOWN
         } else {
             @Suppress("DEPRECATION")
             synchronized(char) {
                 char.value = value
                 val sent = gattServer?.notifyCharacteristicChanged(device, char, confirm) ?: false
-                if (sent) BluetoothStatusCodes.SUCCESS else BluetoothStatusCodes.ERROR
+                if (sent) BluetoothStatusCodes.SUCCESS else BluetoothStatusCodes.ERROR_UNKNOWN
             }
         }
 

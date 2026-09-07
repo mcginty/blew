@@ -935,9 +935,8 @@ impl PeripheralBackend for ApplePeripheral {
                 NotifyKind::Notify => CBCharacteristicProperties::Notify,
                 NotifyKind::Indicate => CBCharacteristicProperties::Indicate,
             };
-            let props = match handle.inner.char_properties(char_uuid) {
-                Some(props) => props,
-                None => return Err(BlewError::LocalCharacteristicNotFound { char_uuid }),
+            let Some(props) = handle.inner.char_properties(char_uuid) else {
+                return Err(BlewError::LocalCharacteristicNotFound { char_uuid });
             };
             if !props.contains(required) {
                 return Err(BlewError::NotifyKindMismatch {
