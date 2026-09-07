@@ -27,7 +27,10 @@ All notable changes to `blew` are documented here. Format follows
   confirms. `nativeOnNotificationSent`
   was added to the Android JNI bridge to carry the callback into Rust; the
   call is tagged with a monotonic seq so a busy-retry can never resolve a newer
-  call with an older callback.
+  call with an older callback. A per-device Kotlin semaphore serializes sends
+  (Android silently drops concurrent ones); it is released only for a tracked
+  in-flight send, and a Kotlin-side backstop frees it if `onNotificationSent`
+  never arrives, so a silent stack cannot wedge future notifications.
 
 - **Linux indication support.** Characteristics declaring
   `CharacteristicProperties::INDICATE` now register an indication CCCD. Bluer

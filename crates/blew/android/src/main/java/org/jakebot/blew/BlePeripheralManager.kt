@@ -16,6 +16,7 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -51,6 +52,12 @@ object BlePeripheralManager {
      */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    // How long to wait for `onNotificationSent` before freeing the notify
+    // semaphore ourselves. Slightly longer than Rust's NOTIFY_ACK_TIMEOUT
+    // (5s), so Rust's own timeout resolves its waiter first and the backstop
+    // only frees the Kotlin-side semaphore that Rust cannot see.
+    private const val NOTIFY_BACKSTOP_MS = 6_000L
+
     private var gattServer: BluetoothGattServer? = null
     private var advertiser: BluetoothLeAdvertiser? = null
 
@@ -84,6 +91,44 @@ object BlePeripheralManager {
 
     private fun releaseNotify(addr: String) {
         notifySemaphores[addr]?.release()
+    }
+
+    /**
+     * Resolve the in-flight notification for [addr], if one is tracked.
+     * Consuming the tracked seq via `remove` makes this idempotent, so a
+     * stale/duplicate `onNotificationSent` or the backstop can never release
+     * the semaphore twice (over-release would let Android silently drop
+     * concurrent sends). Forwards the outcome to Rust.
+     *
+     * [delayMs] the backstop's artificial delay used purely for logging.
+     */
+    private fun completeNotify(
+        addr: String,
+        status: Int,
+        delayMs: Long = 0,
+    ) {
+        notifySeqByDevice.remove(addr)?.let { seq ->
+            releaseNotify(addr)
+            if (delayMs > 0) {
+                Log.w(TAG, "onNotificationSent did not arrive within ${delayMs}ms; releasing notify semaphore")
+            }
+            nativeOnNotificationSent(addr, seq, status)
+        }
+    }
+
+    /**
+     * Safety net for stacks that never fire `onNotificationSent`. The Rust
+     * future times out on its own, but the Kotlin per-device semaphore would
+     * otherwise stay acquired forever, stalling every later send for this
+     * device. After [NOTIFY_BACKSTOP_MS] this consumes the tracked seq and
+     * frees the semaphore. `completeNotify` is idempotent, so if the real
+     * callback already arrived this is a no-op.
+     */
+    private fun scheduleNotifyBackstop(addr: String) {
+        scope.launch {
+            delay(NOTIFY_BACKSTOP_MS)
+            completeNotify(addr, BluetoothStatusCodes.ERROR_UNKNOWN, NOTIFY_BACKSTOP_MS)
+        }
     }
 
     // Rust-assigned id for the notify call currently in flight per device.
@@ -262,10 +307,12 @@ object BlePeripheralManager {
                 status: Int,
             ) {
                 val addr = device.address
-                releaseNotify(addr)
-                notifySeqByDevice.remove(addr)?.let { seq ->
-                    nativeOnNotificationSent(addr, seq, status)
-                }
+                // Only release the per-device semaphore when this callback is for a
+                // send we actually accepted and which hasn't already been resolved
+                // (by a prior callback or the backstop). Removing the tracked seq
+                // atomically both consumes it and gates the release, so a stale or
+                // duplicate callback can never over-release.
+                completeNotify(addr, status)
             }
 
             override fun onCharacteristicReadRequest(
@@ -605,6 +652,7 @@ object BlePeripheralManager {
             return 4
         }
         notifySeqByDevice[deviceAddr] = seq
+        scheduleNotifyBackstop(deviceAddr)
         return 0
     }
 
