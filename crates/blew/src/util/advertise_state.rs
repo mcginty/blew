@@ -189,6 +189,51 @@ mod tests {
     }
 
     #[test]
+    fn a_stop_during_startup_leaves_the_start_unable_to_prove_ownership() {
+        // The shape of the Android advertising race: a stop can take the slot
+        // while the start it displaced has not yet reached the platform, and
+        // that start can go on to begin advertising afterwards. Its cleanup
+        // therefore cannot ask "do I still own the slot?" before tearing the
+        // request down -- the answer is always no, and the radio would be left
+        // advertising with the state machine saying `Idle`. Cancellation has
+        // to be keyed on the request id, which survives here regardless.
+        let mut state = AdvertiseState::default();
+        let (id, _rx) = state.register().unwrap();
+
+        let displaced = state.take();
+        assert_eq!(
+            displaced.request_id(),
+            Some(id),
+            "stop must name what it displaced"
+        );
+
+        assert!(
+            !state.release(id),
+            "the stop already freed the slot, so the start cannot claim ownership"
+        );
+    }
+
+    #[test]
+    fn a_stop_names_the_request_it_displaces_in_every_state() {
+        // Stop reaches the platform qualified by this id, so that an older
+        // stop cannot tear down a newer start that claimed the advertiser
+        // after the slot was freed.
+        let mut state = AdvertiseState::default();
+        assert_eq!(
+            state.take().request_id(),
+            None,
+            "nothing registered, nothing to stop"
+        );
+
+        let (starting, _rx) = state.register().unwrap();
+        assert_eq!(state.take().request_id(), Some(starting));
+
+        let (active, _rx) = state.register().unwrap();
+        state.complete(active, true).expect("waiter");
+        assert_eq!(state.take().request_id(), Some(active));
+    }
+
+    #[test]
     fn a_start_confirmed_after_a_stop_does_not_reclaim_the_slot() {
         // The regression this state machine exists for: with a separate
         // `active` flag, a stop landing between the wake-up and the flag being

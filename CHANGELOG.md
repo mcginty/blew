@@ -7,6 +7,19 @@ All notable changes to `blew` are documented here. Format follows
 
 ### Fixed
 
+- **Android: a `stop_advertising()` could leave the radio advertising with the
+  Rust state machine saying `Idle`.**
+  ([#26](https://github.com/mcginty/blew/issues/26)) A stop that took the
+  advertising slot from a start still between its Rust registration and its JNI call
+  reached Kotlin first and found nothing to stop, and the start then began
+  advertising anyway. Its cleanup asked whether it still owned the slot, was
+  told no — the stop had freed it — and skipped the teardown, leaving an
+  advertisement running with nothing holding the request id needed to stop it.
+  Cleanup is now keyed on the request id rather than on slot ownership. The
+  matching hazard in the other direction is closed too: `stopAdvertising` takes
+  the request id it means to stop, so an older stop can no longer tear down a
+  newer start that claimed the advertiser after the slot was freed.
+
 - **Android: `BleCentralManager.init` / `BlePeripheralManager.init` crashed on
   startup with `MethodNotFound`.** Both `init(Context)` methods were missing
   `@JvmStatic`, so on a Kotlin `object` they only compiled as instance methods

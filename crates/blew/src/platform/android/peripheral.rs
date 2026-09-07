@@ -102,28 +102,36 @@ impl AdvertiseGuard {
 
 impl Drop for AdvertiseGuard {
     fn drop(&mut self) {
-        if self.armed && release_advertise(self.request_id) {
-            cancel_advertise(self.request_id);
+        if !self.armed {
+            return;
+        }
+        release_advertise(self.request_id);
+        // Not conditional on that release succeeding. A stop landing between
+        // this request claiming the slot and reaching Kotlin leaves Rust
+        // `Idle` -- so the release reports someone else's slot -- while the
+        // JNI call that follows can still start the radio, with nothing left
+        // holding the id needed to stop it. Kotlin qualifies the teardown by
+        // request id, so this is a no-op unless the live advertisement is ours.
+        if let Err(e) = stop_platform_advertising(self.request_id) {
+            warn!(
+                "failed to stop advertising request {request_id}: {e}",
+                request_id = self.request_id
+            );
         }
     }
 }
 
-/// Ask Kotlin to tear down `request_id` if it is still the live one. Best
-/// effort: this runs on failure paths where the JNI call may itself be why we
-/// are here.
-fn cancel_advertise(request_id: i32) {
-    let result = jvm().attach_current_thread(|env| {
+/// Ask Kotlin to tear down `request_id` if it is still the live one.
+fn stop_platform_advertising(request_id: i32) -> Result<(), jni::errors::Error> {
+    jvm().attach_current_thread(|env| {
         env.call_static_method(
             peripheral_class(),
-            jni_str!("cancelAdvertising"),
+            jni_str!("stopAdvertising"),
             jni_sig!("(I)V"),
             &[request_id.into()],
         )?;
         Ok::<_, jni::errors::Error>(())
-    });
-    if let Err(e) = result {
-        warn!("failed to cancel advertising request {request_id}: {e}");
-    }
+    })
 }
 
 static STATE: Mutex<Option<PeripheralState>> = Mutex::new(None);
@@ -364,28 +372,25 @@ impl PeripheralBackend for AndroidPeripheral {
         // Take the slot whatever state it is in. Clearing only an `active`
         // flag left a start still in flight owning the slot, so a stop during
         // startup blocked every later start until that request timed out.
-        match take_advertise() {
-            Advertising::Starting(_, tx) => {
-                // Wake the start rather than leaving it on its deadline. Its
-                // guard sees the error and tears the request down.
-                let _ = tx.send(Err(BlewError::Peripheral {
-                    source: "advertising stopped before it started".into(),
-                }));
-            }
-            Advertising::Active(_) | Advertising::Idle => {}
+        let displaced = take_advertise();
+        let request_id = displaced.request_id();
+        if let Advertising::Starting(_, tx) = displaced {
+            // Wake the start rather than leaving it on its deadline. Its
+            // guard sees the error and tears the request down.
+            let _ = tx.send(Err(BlewError::Peripheral {
+                source: "advertising stopped before it started".into(),
+            }));
         }
 
-        jvm()
-            .attach_current_thread(|env| {
-                env.call_static_method(
-                    peripheral_class(),
-                    jni_str!("stopAdvertising"),
-                    jni_sig!("()V"),
-                    &[],
-                )?;
-                Ok(())
-            })
-            .map_err(|e| jni_err(&e))?;
+        // An empty slot means nothing of ours is advertising. Reaching into
+        // Kotlin anyway would stop whatever is running there, and by this
+        // point that can already be a newer start admitted after the slot was
+        // freed.
+        let Some(request_id) = request_id else {
+            return Ok(());
+        };
+
+        stop_platform_advertising(request_id).map_err(|e| jni_err(&e))?;
         Ok(())
     }
 

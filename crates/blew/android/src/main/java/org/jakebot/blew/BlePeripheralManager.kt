@@ -424,7 +424,7 @@ object BlePeripheralManager {
 
     private var advertiseCallback: AdvertiseCallback? = null
 
-    /** Request id of the live [advertiseCallback], for [cancelAdvertising]. */
+    /** Request id of the live [advertiseCallback], for [stopAdvertising]. */
     private var advertiseRequestId: Int = 0
 
     /**
@@ -517,34 +517,29 @@ object BlePeripheralManager {
         return ADVERTISE_OK
     }
 
-    @JvmStatic
-    fun stopAdvertising() {
-        synchronized(advertiseLock) {
-            advertiseCallback?.let { cb ->
-                advertiser?.stopAdvertising(cb)
-                advertiseCallback = null
-            }
-        }
-        Log.d(TAG, "advertising stopped")
-    }
-
     /**
-     * Tear down [requestId] if it is still the live request, otherwise do
-     * nothing.
+     * Stop [requestId] if it is still the live request, otherwise do nothing.
      *
-     * Used when Rust gives up on a start: the callback cannot be
-     * un-registered, so the advertisement has to be stopped explicitly or it
-     * runs on with nothing able to reach it.
+     * Both an explicit stop and the cleanup of an abandoned start arrive here,
+     * and either can be overtaken by a newer start that has already claimed
+     * the advertiser. Stopping whatever happens to be running would tear that
+     * newer request down and leave it waiting on a callback that never comes,
+     * so the teardown is qualified by request id instead.
+     *
+     * The callback cannot be un-registered, so a start Rust has given up on
+     * has to be stopped explicitly or it runs on with nothing able to reach it.
      */
     @JvmStatic
-    fun cancelAdvertising(requestId: Int) {
-        // `synchronized` is reentrant, so the nested stopAdvertising is fine.
+    fun stopAdvertising(requestId: Int) {
         synchronized(advertiseLock) {
-            if (advertiseRequestId == requestId && advertiseCallback != null) {
-                Log.d(TAG, "cancelling advertising request $requestId")
-                stopAdvertising()
+            val cb = advertiseCallback
+            if (cb == null || advertiseRequestId != requestId) {
+                return
             }
+            advertiser?.stopAdvertising(cb)
+            advertiseCallback = null
         }
+        Log.d(TAG, "advertising stopped (request $requestId)")
     }
 
     /**
