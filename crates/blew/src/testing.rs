@@ -288,7 +288,7 @@ impl CentralBackend for MockCentral {
         let tx = self.event_tx.clone();
         async move {
             if advertising {
-                let name = adv_config.map(|c| c.local_name);
+                let name = adv_config.map(|c| c.local_name).filter(|it| !it.is_empty());
                 let _ = tx.send(CentralEvent::DeviceDiscovered(BleDevice {
                     id: DeviceId::from("mock-peripheral"),
                     name,
@@ -1168,6 +1168,32 @@ mod tests {
         peripheral.start_advertising(&config).await.unwrap();
         let result = peripheral.start_advertising(&config).await;
         assert!(matches!(result, Err(BlewError::AlreadyAdvertising)));
+    }
+
+    #[tokio::test]
+    async fn an_empty_local_name_advertises_no_name_at_all() {
+        let (c, p) = MockLink::pair();
+        let peripheral = Peripheral::from_backend(p.peripheral);
+        let central = Central::from_backend(c.central);
+
+        peripheral
+            .start_advertising(&AdvertisingConfig {
+                local_name: String::new(),
+                service_uuids: vec![],
+            })
+            .await
+            .unwrap();
+        let mut events = central.events();
+        assert!(matches!(
+            events.next().await.unwrap(),
+            CentralEvent::AdapterStateChanged { powered: true }
+        ));
+        central.start_scan(ScanFilter::default()).await.unwrap();
+
+        let Some(CentralEvent::DeviceDiscovered(device)) = events.next().await else {
+            panic!("the advertisement never reached the central");
+        };
+        assert_eq!(device.name, None);
     }
 
     #[tokio::test]

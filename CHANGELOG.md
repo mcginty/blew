@@ -14,6 +14,32 @@ All notable changes to `blew` are documented here. Format follows
   with `call_static_method`, which found no matching static method and
   panicked, aborting the process. Every other Rust-called method in these
   files already carried `@JvmStatic`; `init` was the one omission.
+- **Android: the adapter name is given back when advertising stops.**
+  `startAdvertising` overwrote `BluetoothAdapter.name` and never restored it,
+  so the beacon name outlived the process: the handset kept answering to it in
+  the car, in the headphones and in every pairing dialog, and still did after
+  the app was uninstalled. The name in place beforehand is now remembered and
+  put back in `stopAdvertising`.
+
+- **Android: the first advertisement after an install no longer fails.**
+  A new adapter name is applied asynchronously, but the scan response carries
+  whatever name is in place when advertising starts — so setting the name and
+  advertising in the same breath went out under the old one, and an old name
+  long enough to overflow the 31-byte scan response failed the advertisement
+  with `ADVERTISE_FAILED_DATA_TOO_LARGE`. It struck once per fresh install,
+  and permanently on a device whose owner writes in a non-Latin script.
+  Advertising now waits for `ACTION_LOCAL_NAME_CHANGED`, with a one-second
+  backstop for a broadcast that never arrives.
+
+### Changed
+
+- **An empty `AdvertisingConfig::local_name` now advertises no name.** It
+  previously advertised an empty one — a `CBAdvertisementDataLocalNameKey` and
+  a BlueZ `LocalName` holding nothing, and on Android the adapter's own name
+  overwritten with the empty string and `setIncludeDeviceName(true)` on top.
+  Leaving the handset's name alone was not expressible, and it is the only
+  name it has: there is no per-advertisement name on Android. A peer that
+  identifies itself through service data rather than a name can now say so.
 
 ## [0.4.0-beta.1] — 2026-09-01
 

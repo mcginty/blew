@@ -16,11 +16,13 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Singleton managing the Android BLE peripheral role (GATT server + advertiser).
@@ -428,6 +430,17 @@ object BlePeripheralManager {
     private var advertiseRequestId: Int = 0
 
     /**
+     * The adapter name as its owner had it, held while a beacon name of ours is
+     * in its place. This is the phone's Bluetooth name everywhere -- in the car,
+     * in the headphones, in every pairing dialog -- so it is given back in
+     * [stopAdvertising] rather than left behind.
+     */
+    private var nameBeforeAdvertising: String? = null
+
+    /** Backstop for a [BluetoothAdapter.ACTION_LOCAL_NAME_CHANGED] that never arrives. */
+    private const val NAME_APPLIED_WITHIN_MS = 1_000L
+
+    /**
      * Begin advertising. Returns [ADVERTISE_OK] when the request was handed to
      * the stack, or a failure code for something that went wrong before that.
      *
@@ -465,8 +478,6 @@ object BlePeripheralManager {
         advertiser = adv
         advertiseRequestId = requestId
 
-        bluetoothManager?.adapter?.name = name
-
         val settings =
             AdvertiseSettings
                 .Builder()
@@ -488,7 +499,7 @@ object BlePeripheralManager {
         val scanResponse =
             AdvertiseData
                 .Builder()
-                .setIncludeDeviceName(true)
+                .setIncludeDeviceName(name.isNotEmpty())
                 .build()
 
         advertiseCallback =
@@ -513,8 +524,59 @@ object BlePeripheralManager {
                 }
             }
 
-        adv.startAdvertising(settings, data, scanResponse, advertiseCallback)
+        takeTheNameThenAdvertise(adv, name, settings, data, scanResponse, advertiseCallback)
         return ADVERTISE_OK
+    }
+
+    /**
+     * Android applies a new adapter name asynchronously, and the scan response
+     * carries whatever name is in place when advertising starts. Setting the
+     * name and advertising in the same breath therefore goes out under the old
+     * one, and an old name long enough to overflow the scan response fails the
+     * advertisement outright with `ADVERTISE_FAILED_DATA_TOO_LARGE` -- once, on
+     * the first session after an install, which is the hardest one to catch.
+     */
+    private fun takeTheNameThenAdvertise(
+        adv: BluetoothLeAdvertiser,
+        name: String,
+        settings: AdvertiseSettings,
+        data: AdvertiseData,
+        scanResponse: AdvertiseData,
+        callback: AdvertiseCallback?,
+    ) {
+        val adapter = bluetoothManager?.adapter
+        val ctx = context
+        val adapterKeepsItsOwnName = name.isEmpty()
+        if (adapterKeepsItsOwnName || adapter == null || ctx == null || adapter.name == name) {
+            adv.startAdvertising(settings, data, scanResponse, callback)
+            return
+        }
+        if (nameBeforeAdvertising == null) {
+            nameBeforeAdvertising = adapter.name
+        }
+        val started = AtomicBoolean(false)
+        var applied: BroadcastReceiver? = null
+        val advertiseOnce = {
+            if (started.compareAndSet(false, true)) {
+                applied?.let { runCatching { ctx.unregisterReceiver(it) } }
+                adv.startAdvertising(settings, data, scanResponse, callback)
+            }
+        }
+        applied =
+            object : BroadcastReceiver() {
+                override fun onReceive(
+                    unused: Context,
+                    intent: Intent,
+                ) {
+                    if (adapter.name == name) advertiseOnce()
+                }
+            }
+        ctx.registerReceiver(applied, IntentFilter(BluetoothAdapter.ACTION_LOCAL_NAME_CHANGED))
+        adapter.name = name
+        scope.launch {
+            delay(NAME_APPLIED_WITHIN_MS)
+            advertiseOnce()
+        }
     }
 
     @JvmStatic
@@ -523,6 +585,10 @@ object BlePeripheralManager {
             advertiseCallback?.let { cb ->
                 advertiser?.stopAdvertising(cb)
                 advertiseCallback = null
+            }
+            nameBeforeAdvertising?.let { theirs ->
+                bluetoothManager?.adapter?.name = theirs
+                nameBeforeAdvertising = null
             }
         }
         Log.d(TAG, "advertising stopped")

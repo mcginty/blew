@@ -885,7 +885,13 @@ impl PeripheralBackend for ApplePeripheral {
                 let ln_any: &AnyObject = &local_name;
                 let ua_any: &AnyObject = &uuid_array;
 
-                let adv_data = NSDictionary::from_slices(&[key_name, key_uuids], &[ln_any, ua_any]);
+                let mut keys = vec![key_uuids];
+                let mut values = vec![ua_any];
+                if !config.local_name.is_empty() {
+                    keys.push(key_name);
+                    values.push(ln_any);
+                }
+                let adv_data = NSDictionary::from_slices(&keys, &values);
 
                 let (tx, rx) = oneshot::channel();
                 *handle.inner.adv_tx.lock() = Some(tx);
