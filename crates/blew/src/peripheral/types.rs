@@ -1,5 +1,6 @@
 use crate::l2cap::L2capConfig;
 use crate::types::DeviceId;
+use std::collections::BTreeMap;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -166,6 +167,10 @@ impl WriteResponder {
 pub struct AdvertisingConfig {
     pub local_name: String,
     pub service_uuids: Vec<Uuid>,
+    /// Payload per service UUID. Apple accepts no such key, so a non-empty map
+    /// there is [`BlewError::NotSupported`](crate::BlewError::NotSupported)
+    /// rather than a silent omission.
+    pub service_data: BTreeMap<Uuid, Vec<u8>>,
 }
 
 #[cfg(test)]

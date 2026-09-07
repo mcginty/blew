@@ -15,6 +15,34 @@ All notable changes to `blew` are documented here. Format follows
   panicked, aborting the process. Every other Rust-called method in these
   files already carried `@JvmStatic`; `init` was the one omission.
 
+### Added
+
+- **`AdvertisingConfig::service_data`**, payload keyed by service UUID
+  (part of #16). Android maps it to `AdvertiseData.addServiceData`, Linux to
+  bluer's `Advertisement::service_data`. It is a few bytes beside a UUID rather
+  than a second 128-bit UUID, which is what fits once the advertisement already
+  carries one.
+
+  On Android it rides in the **scan response**, alongside the name and for the
+  same reason: a 128-bit service UUID costs 18 of the advertisement's 31 bytes
+  and service data keyed by another one costs 18 more, so the two together
+  never fit and the stack answers `ADVERTISE_FAILED_DATA_TOO_LARGE`. The scan
+  response has 31 bytes of its own. Every backend here scans actively, as do
+  the platform defaults, so a scan response is delivered like any other field.
+
+  Apple is the exception, and it says so: `startAdvertising:` honours no such
+  key, so a non-empty map there is `BlewError::NotSupported` rather than an
+  advertisement quietly missing what it was told to carry. That is the same
+  reasoning that keeps manufacturer data off this struct, answered differently
+  because service data is the only remaining way to put bytes on the air, and
+  the two backends that can do it are the two where an application cannot fall
+  back to the local name — Android has no per-advertisement name, only the
+  adapter's own.
+
+  The mock backend now carries advertised service data through to the scanning
+  central, which it previously dropped; `BleDevice::service_data` was otherwise
+  untestable.
+
 ## [0.4.0-beta.1] — 2026-09-01
 
 ### Added

@@ -181,6 +181,9 @@ async fn drive_advertising(
 ) -> BlewResult<()> {
     let uuid_count = i32::try_from(config.service_uuids.len())
         .map_err(|_| BlewError::Internal("too many service UUIDs in AdvertisingConfig".into()))?;
+    let data_count = i32::try_from(config.service_data.len()).map_err(|_| {
+        BlewError::Internal("too many service data entries in AdvertisingConfig".into())
+    })?;
 
     let code: i32 = jvm()
         .attach_current_thread(|env| {
@@ -194,11 +197,29 @@ async fn drive_advertising(
                 uuids.set_element(env, i, &s)?;
             }
 
+            let byte_array_class = env.find_class(jni_str!("[B"))?;
+            let data_uuids: JObjectArray =
+                env.new_object_array(data_count, &string_class, JObject::null())?;
+            let data_values: JObjectArray =
+                env.new_object_array(data_count, &byte_array_class, JObject::null())?;
+            for (i, (uuid, value)) in config.service_data.iter().enumerate() {
+                let s = env.new_string(uuid.to_string())?;
+                data_uuids.set_element(env, i, &s)?;
+                let bytes = env.byte_array_from_slice(value)?;
+                data_values.set_element(env, i, &bytes)?;
+            }
+
             env.call_static_method(
                 peripheral_class(),
                 jni_str!("startAdvertising"),
-                jni_sig!("(Ljava/lang/String;[Ljava/lang/String;I)I"),
-                &[(&name).into(), (&uuids).into(), request_id.into()],
+                jni_sig!("(Ljava/lang/String;[Ljava/lang/String;[Ljava/lang/String;[[BI)I"),
+                &[
+                    (&name).into(),
+                    (&uuids).into(),
+                    (&data_uuids).into(),
+                    (&data_values).into(),
+                    request_id.into(),
+                ],
             )?
             .i()
         })
