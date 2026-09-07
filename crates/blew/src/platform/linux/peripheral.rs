@@ -251,9 +251,11 @@ fn build_characteristic(
         let inner_n = Arc::clone(inner);
         Some(CharacteristicNotify {
             // BlueZ derives notification-vs-indication from the CCCD the
-            // central wrote. Declare both properties so a central can pick
-            // either; bluer only creates the confirmation channel when
-            // `indicate && !notify` (an Indicate-only characteristic).
+            // central wrote, so declaring both properties lets a central pick
+            // either wire format. That is separate from the confirmation
+            // channel, which bluer only creates for an Indicate-only
+            // characteristic (`indicate && !notify`): only then does the
+            // peer's confirmation gate `notify()`.
             notify: props.contains(CharacteristicProperties::NOTIFY),
             indicate: props.contains(CharacteristicProperties::INDICATE),
             method: CharacteristicNotifyMethod::Fun(Box::new(

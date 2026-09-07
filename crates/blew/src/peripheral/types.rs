@@ -22,7 +22,11 @@ use uuid::Uuid;
 /// - **Apple**: when CoreBluetooth accepts the value into its transmit queue.
 ///   CoreBluetooth exposes no per-indication acknowledgement.
 /// - **Linux/BlueZ**: when every live notifier's `notify()` returns. BlueZ
-///   resolves an indication only after the peer confirms.
+///   confirms an indication only after the peer's ATT acknowledgement, but
+///   bluer only wires up the confirmation channel for an *Indicate-only*
+///   characteristic (`INDICATE` without `NOTIFY`). On a characteristic that
+///   also declares `NOTIFY`, the central's CCCD pick is delivered without a
+///   confirmation.
 /// - **Mock**: immediately.
 ///
 /// # Per-call vs per-subscription

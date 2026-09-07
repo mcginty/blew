@@ -30,8 +30,12 @@ All notable changes to `blew` are documented here. Format follows
   call with an older callback.
 
 - **Linux indication support.** Characteristics declaring
-  `CharacteristicProperties::INDICATE` now register an indication CCCD, and
-  BlueZ resolves the notifier only after the peer confirms a `NotifyKind::Indicate`.
+  `CharacteristicProperties::INDICATE` now register an indication CCCD. Bluer
+  only wires up a confirmation channel for an Indicate-only characteristic
+  (`INDICATE` without `NOTIFY`), so only there does BlueZ resolve the notifier
+  after the peer confirms an indication; on a characteristic that also
+  declares `NOTIFY`, the central's CCCD pick is delivered without
+  confirmation.
 
 ### Changed
 

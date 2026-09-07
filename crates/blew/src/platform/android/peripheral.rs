@@ -489,7 +489,7 @@ impl PeripheralBackend for AndroidPeripheral {
             // would be dropped (we then stall until NOTIFY_ACK_TIMEOUT).
             set_pending_notify(&device_addr, seq, ack_tx);
 
-            let status: i32 = jvm()
+            let status: i32 = match jvm()
                 .attach_current_thread(|env| {
                     let addr_str = env.new_string(&device_addr)?;
                     let uuid_str = env.new_string(char_uuid.to_string())?;
@@ -509,7 +509,16 @@ impl PeripheralBackend for AndroidPeripheral {
                     )?;
                     ret.i()
                 })
-                .map_err(|e| jni_err(&e))?;
+                .map_err(|e| jni_err(&e))
+            {
+                Ok(status) => status,
+                // JNI failure: the call was never accepted, so no callback
+                // will arrive. Drop the waiter so the map can't leak.
+                Err(e) => {
+                    remove_pending_notify(&device_addr, seq);
+                    return Err(e);
+                }
+            };
 
             match status {
                 // 0 = accepted; resolve once onNotificationSent reports.
