@@ -383,6 +383,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnConnect
     device_addr: JString,
     connected: jboolean,
     gatt_status: jint,
+    generation: jint,
 ) {
     guard("nativeOnConnectionStateChanged", || {
         env.with_env(|env| {
@@ -396,7 +397,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnConnect
                 super::central::send_event(CentralEvent::DeviceConnected {
                     device_id: device_id.clone(),
                 });
-                super::central::complete_connect(&addr, Ok(()));
+                super::central::complete_connect(&addr, generation, Ok(()));
             } else {
                 trace!(%device_id, "central: device disconnected");
                 // Fail any pending connect() call -- the connection dropped before
@@ -404,6 +405,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnConnect
                 // is deferred until onMtuChanged).
                 super::central::complete_connect(
                     &addr,
+                    generation,
                     Err(crate::error::BlewError::NotConnected(device_id.clone())),
                 );
                 // Release any caller awaiting disconnect() completion.

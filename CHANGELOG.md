@@ -7,6 +7,32 @@ All notable changes to `blew` are documented here. Format follows
 
 ### Fixed
 
+- **Android: a connect timeout leaked the GATT client it gave up on.**
+  ([#24](https://github.com/mcginty/blew/issues/24)) `openGatt()` discarded the
+  `BluetoothGatt` that `connectGatt()` returned, and the address-keyed handle
+  map was populated only by the `STATE_CONNECTED` callback. A timeout before
+  the connection completed therefore found nothing to close: it reported the
+  disconnect and left the native client outstanding, where the stale-client
+  cleanup on the next `connect()` could not reach it either. Repeated timeouts
+  accumulated clients against Android's cap of roughly seven, after which
+  connecting failed until the process restarted. Each attempt now owns its
+  client from the moment `connectGatt()` returns, and a timeout closes that
+  exact one.
+
+- **Android: a retired connection attempt's late callback could tear down the
+  attempt that replaced it.**
+  ([#25](https://github.com/mcginty/blew/issues/25)) Every GATT callback
+  identified its connection by device address alone. A superseded attempt's
+  delayed `STATE_DISCONNECTED` removed the live attempt's handle, closed its
+  operation queue, dropped its pending nonces and completed its `connect()` as
+  disconnected; a delayed `STATE_CONNECTED`, or an MTU exchange finishing after
+  the attempt it belonged to was retired, could satisfy a waiter that referred
+  to a different GATT client. Attempts now carry a generation that travels to
+  the platform with the connect request and returns on every callback.
+  Callbacks are matched to the attempt that owns the handle, state is cleared
+  by compare-and-remove rather than by address, and a stale callback may
+  release only its own client.
+
 - **Android: a `stop_advertising()` could leave the radio advertising with the
   Rust state machine saying `Idle`.**
   ([#26](https://github.com/mcginty/blew/issues/26)) A stop that took the

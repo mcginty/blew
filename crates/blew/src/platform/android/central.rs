@@ -18,6 +18,7 @@ use crate::gatt::service::{GattCharacteristic, GattService};
 use crate::l2cap::{L2capChannel, types::Psm};
 use crate::types::{BleDevice, DeviceId};
 use crate::util::BroadcastEventStream;
+use crate::util::connect_state::{ANY_GENERATION, ConnectAttempts};
 use crate::util::request_map::KeyedRequestMap;
 
 use super::jni_globals::{central_class, jvm};
@@ -32,7 +33,7 @@ const DISCONNECT_CALLBACK_TIMEOUT: Duration = Duration::from_secs(2);
 struct CentralState {
     event_tx: broadcast::Sender<CentralEvent>,
     pending_ops: KeyedRequestMap<String, oneshot::Sender<BlewResult<Vec<u8>>>>,
-    pending_connects: KeyedRequestMap<String, oneshot::Sender<BlewResult<()>>>,
+    connects: Mutex<ConnectAttempts>,
     pending_disconnects: KeyedRequestMap<String, oneshot::Sender<()>>,
     pending_discover: KeyedRequestMap<String, oneshot::Sender<BlewResult<Vec<GattService>>>>,
     discovered: Mutex<Vec<BleDevice>>,
@@ -52,7 +53,7 @@ fn init_statics(connect_timeout: Option<Duration>) {
         .set(CentralState {
             event_tx,
             pending_ops: KeyedRequestMap::new(),
-            pending_connects: KeyedRequestMap::new(),
+            connects: Mutex::new(ConnectAttempts::default()),
             pending_disconnects: KeyedRequestMap::new(),
             pending_discover: KeyedRequestMap::new(),
             discovered: Mutex::new(Vec::new()),
@@ -88,9 +89,15 @@ pub(crate) fn update_discovered(device: BleDevice) {
     }
 }
 
-pub(crate) fn complete_connect(addr: &str, result: BlewResult<()>) {
+/// Deliver a connection outcome to the `connect()` that asked for it.
+///
+/// `generation` identifies the attempt the platform is reporting on. A
+/// callback for an attempt that no longer owns the address is dropped: Android
+/// keys its callbacks on the address alone, so a superseded attempt's late
+/// disconnect would otherwise resolve its replacement's caller.
+pub(crate) fn complete_connect(addr: &str, generation: i32, result: BlewResult<()>) {
     if let Some(s) = STATE.get()
-        && let Some(tx) = s.pending_connects.take(&addr.to_owned())
+        && let Some(tx) = s.connects.lock().complete(addr, generation)
     {
         let _ = tx.send(result);
     }
@@ -327,23 +334,24 @@ impl CentralBackend for AndroidCentral {
         let did = device_id.clone();
         async move {
             let s = state();
-            let (tx, rx) = oneshot::channel();
-
-            if s.pending_connects.try_insert(addr.clone(), tx).is_err() {
+            // The generation travels to Kotlin with the request and comes back
+            // on every callback for it, so this attempt can be told apart from
+            // one that replaces it on the same address.
+            let Some((generation, rx)) = s.connects.lock().begin(&addr) else {
                 return Err(BlewError::ConnectInFlight(did));
-            }
+            };
 
             if let Err(err) = jvm().attach_current_thread(|env| {
                 let j_addr = env.new_string(&addr)?;
                 env.call_static_method(
                     central_class(),
                     jni_str!("connect"),
-                    jni_sig!("(Ljava/lang/String;)V"),
-                    &[(&j_addr).into()],
+                    jni_sig!("(Ljava/lang/String;I)V"),
+                    &[(&j_addr).into(), generation.into()],
                 )?;
                 Ok(())
             }) {
-                s.pending_connects.take(&addr);
+                s.connects.lock().complete(&addr, generation);
                 return Err(jni_err(&err));
             }
 
@@ -353,8 +361,8 @@ impl CentralBackend for AndroidCentral {
                     Ok(Ok(result)) => result,
                     Ok(Err(_)) => Err(BlewError::DisconnectedDuringOperation(did)),
                     Err(_) => {
-                        s.pending_connects.take(&addr);
-                        force_close_gatt(&addr);
+                        s.connects.lock().complete(&addr, generation);
+                        force_close_gatt(&addr, generation);
                         let _ = s.event_tx.send(CentralEvent::DeviceDisconnected {
                             device_id: did.clone(),
                             cause: DisconnectCause::Timeout,
@@ -402,7 +410,9 @@ impl CentralBackend for AndroidCentral {
             {
                 warn!(device = %addr, "disconnect callback did not fire; force-closing GATT");
                 s.pending_disconnects.take(&addr);
-                force_close_gatt(&addr);
+                // No particular attempt in mind: the connect that produced
+                // this handle completed long ago and its generation is gone.
+                force_close_gatt(&addr, ANY_GENERATION);
             }
             Ok(())
         }
@@ -669,15 +679,19 @@ fn jni_err(e: &jni::errors::Error) -> BlewError {
 /// the normal disconnect callback path can't be trusted — connect timeout,
 /// the status-133 zombie scenario, or a disconnect whose callback never
 /// arrives. The Kotlin `forceClose` calls `refresh()` + `gatt.close()` and
-/// removes the entry from `gattConnections`, freeing the client-IF slot.
-fn force_close_gatt(addr: &str) {
+/// retires the attempt, freeing the client-IF slot.
+///
+/// `generation` names the attempt to tear down so a timeout that has already
+/// been superseded cannot close a newer attempt's client; [`ANY_GENERATION`]
+/// closes whichever attempt is live.
+fn force_close_gatt(addr: &str, generation: i32) {
     let result: Result<(), jni::errors::Error> = jvm().attach_current_thread(|env| {
         let j_addr = env.new_string(addr)?;
         env.call_static_method(
             central_class(),
             jni_str!("forceClose"),
-            jni_sig!("(Ljava/lang/String;)V"),
-            &[(&j_addr).into()],
+            jni_sig!("(Ljava/lang/String;I)V"),
+            &[(&j_addr).into(), generation.into()],
         )?;
         Ok(())
     });
