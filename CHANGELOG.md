@@ -29,9 +29,14 @@ All notable changes to `blew` are documented here. Format follows
   the attempt it belonged to was retired, could satisfy a waiter that referred
   to a different GATT client. Attempts now carry a generation that travels to
   the platform with the connect request and returns on every callback.
-  Callbacks are matched to the attempt that owns the handle, state is cleared
-  by compare-and-remove rather than by address, and a stale callback may
-  release only its own client.
+  Each attempt gets its own `BluetoothGattCallback`, so identity is exact from
+  the moment `connectGatt()` is called rather than from whenever its handle is
+  published; every callback checks ownership under the same lock retirement
+  takes before touching the per-device tables; state is cleared by
+  compare-and-remove rather than by address; and a stale callback may release
+  only its own client. A connection-state change is reported to Rust only by
+  the attempt that owns the address when it is reported, so a superseded
+  attempt can no longer emit a disconnect against its replacement.
 
 - **Android: a `stop_advertising()` could leave the radio advertising with the
   Rust state machine saying `Idle`.**

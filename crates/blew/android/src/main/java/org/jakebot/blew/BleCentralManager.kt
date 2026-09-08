@@ -247,12 +247,34 @@ object BleCentralManager {
     /** The GATT client for [addr], or null unless it is connected. */
     private fun connectedGatt(addr: String): BluetoothGatt? = attempts[addr]?.takeIf { it.connected }?.gatt
 
+    /** Whether [attempt] still owns its address. */
+    private fun isLive(attempt: Attempt): Boolean = attempts[attempt.addr] === attempt
+
     /**
-     * The attempt that owns [gatt], or null when the callback belongs to one
-     * that has already been retired. A stale callback may only touch its own
-     * client: the address it reports is shared with whatever replaced it.
+     * Consume the pending nonce at [key] and complete [attempt]'s queue with
+     * [value]. Returns false — meaning the caller should drop the callback —
+     * when [attempt] has been superseded, or when no operation was waiting.
+     *
+     * Every GATT callback routes its bookkeeping through here. Android reports
+     * these by address alone, so a retired attempt's late callback would
+     * otherwise consume the nonce its replacement is waiting on and complete
+     * that queue with a result belonging to a different connection. The check
+     * and the mutation share [connectLock] with retirement, so a check that
+     * passes cannot be followed by a mutation that lands on the replacement.
      */
-    private fun ownerOf(gatt: BluetoothGatt): Attempt? = attempts[gatt.device.address]?.takeIf { it.gatt === gatt }
+    private fun <T> completeOp(
+        attempt: Attempt,
+        key: String,
+        value: T,
+    ): Boolean =
+        synchronized(connectLock) {
+            if (attempts[attempt.addr] !== attempt) {
+                return@synchronized false
+            }
+            val nonce = pendingNonces.remove(key) ?: return@synchronized false
+            gattQueues[attempt.addr]?.completeCurrent(nonce, value)
+            true
+        }
 
     /**
      * Drop [attempt] from the live slot and clear the per-device tables it
@@ -392,33 +414,37 @@ object BleCentralManager {
 
     // ── GATT callback ──
 
-    private val gattCallback =
+    /**
+     * A [BluetoothGattCallback] bound to one [Attempt].
+     *
+     * Android hands a callback the device address it belongs to and nothing
+     * else, so a callback shared across attempts cannot tell a retired
+     * attempt's late report from the live one's. Binding the attempt in makes
+     * the identity exact — and it is exact from the moment `connectGatt()` is
+     * called, rather than from whenever the connecting thread gets around to
+     * publishing the handle it returns.
+     */
+    private fun callbackFor(attempt: Attempt): BluetoothGattCallback =
         object : BluetoothGattCallback() {
             override fun onConnectionStateChange(
                 gatt: BluetoothGatt,
                 status: Int,
                 newState: Int,
             ) {
-                val addr = gatt.device.address
-                val attempt = ownerOf(gatt)
-                if (attempt == null) {
-                    // A retired attempt reporting in. It may release its own
-                    // client and nothing else: the handle, queue and pending
-                    // operations filed under this address belong to whatever
-                    // attempt replaced it.
-                    Log.d(TAG, "ignoring stale connection state for $addr (state=$newState status=$status)")
-                    if (newState == BluetoothProfile.STATE_CONNECTED) {
-                        try {
-                            gatt.disconnect()
-                        } catch (e: Exception) {
-                            Log.w(TAG, "stale disconnect threw for $addr: ${e.message}")
-                        }
-                    }
-                    gatt.close()
-                    return
-                }
+                val addr = attempt.addr
+                // The connecting thread may not have published the handle yet.
+                // This is the same instance it is about to store, and the
+                // teardown paths below need it now.
+                attempt.gatt = gatt
 
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    if (!isLive(attempt)) {
+                        // Retired before the connection came up. Release the
+                        // client rather than leave it holding a clientIf slot.
+                        Log.d(TAG, "connected on a retired attempt for $addr; closing")
+                        release(attempt, disconnectFirst = true)
+                        return
+                    }
                     attempt.connected = true
                     // Capture the queue reference before launching so a racing
                     // disconnect (which removes the entry from gattQueues) can't
@@ -446,16 +472,15 @@ object BleCentralManager {
                         }
                         // The attempt can be retired while the MTU exchange is
                         // in flight. Reporting connected now would hand Rust a
-                        // completion for a client that is already closed, and
-                        // satisfy a waiter belonging to its replacement.
-                        if (attempts[addr] !== attempt) {
+                        // completion for a client that is already closed.
+                        if (!isLive(attempt)) {
                             Log.d(TAG, "MTU completed for a retired attempt on $addr")
                             return@launch
                         }
                         nativeOnConnectionStateChanged(addr, true, 0, attempt.generation)
                     }
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    retire(attempt)
+                    val owned = retire(attempt)
                     // Status 133 is the Android BLE zombie signal. Flush the
                     // client-side service cache before close() so the next
                     // connectGatt() on this address starts with a clean slate.
@@ -465,6 +490,13 @@ object BleCentralManager {
                         }
                     }
                     release(attempt, disconnectFirst = false)
+                    if (!owned) {
+                        // Superseded already, and whoever retired it reported
+                        // the disconnect. Reporting again would name a
+                        // generation that no longer owns the address.
+                        Log.d(TAG, "ignoring disconnect for a retired attempt on $addr")
+                        return
+                    }
                     nativeOnConnectionStateChanged(addr, false, status, attempt.generation)
                 }
             }
@@ -474,13 +506,24 @@ object BleCentralManager {
                 mtu: Int,
                 status: Int,
             ) {
-                val addr = gatt.device.address
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    mtuMap[addr] = mtu
+                val addr = attempt.addr
+                val negotiated =
+                    synchronized(connectLock) {
+                        if (attempts[addr] !== attempt) {
+                            return@synchronized false
+                        }
+                        if (status == BluetoothGatt.GATT_SUCCESS) {
+                            mtuMap[addr] = mtu
+                        }
+                        val nonce = pendingNonces.remove("$addr:mtu")
+                        if (nonce != null) {
+                            gattQueues[addr]?.completeCurrent<Int>(nonce, mtu)
+                        }
+                        status == BluetoothGatt.GATT_SUCCESS
+                    }
+                if (negotiated) {
                     nativeOnMtuChanged(addr, mtu)
                 }
-                val nonce = pendingNonces.remove("$addr:mtu") ?: return
-                gattQueues[addr]?.completeCurrent<Int>(nonce, mtu)
                 // Do NOT call nativeOnConnectionStateChanged here; the coroutine in the CONNECTED branch does it.
             }
 
@@ -488,9 +531,8 @@ object BleCentralManager {
                 gatt: BluetoothGatt,
                 status: Int,
             ) {
-                val addr = gatt.device.address
-                val nonce = pendingNonces.remove("$addr:services") ?: return
-                gattQueues[addr]?.completeCurrent<Unit>(nonce, Unit)
+                val addr = attempt.addr
+                if (!completeOp(attempt, "$addr:services", Unit)) return
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     nativeOnServicesDiscovered(addr, servicesToJson(gatt.services))
                 } else {
@@ -504,10 +546,9 @@ object BleCentralManager {
                 value: ByteArray,
                 status: Int,
             ) {
-                val addr = gatt.device.address
+                val addr = attempt.addr
                 val charUuid = characteristic.uuid.toString()
-                val nonce = pendingNonces.remove("$addr:read:$charUuid") ?: return
-                gattQueues[addr]?.completeCurrent<Unit>(nonce, Unit)
+                if (!completeOp(attempt, "$addr:read:$charUuid", Unit)) return
                 nativeOnCharacteristicRead(addr, charUuid, value, status)
             }
 
@@ -516,15 +557,18 @@ object BleCentralManager {
                 characteristic: BluetoothGattCharacteristic,
                 status: Int,
             ) {
-                val addr = gatt.device.address
-                if (noResponseHandled.remove(addr) != null) {
+                val addr = attempt.addr
+                val handledByKick =
+                    synchronized(connectLock) {
+                        isLive(attempt) && noResponseHandled.remove(addr) != null
+                    }
+                if (handledByKick) {
                     // Kick lambda already completed the queue and fired the
                     // native callback for this no-response write.
                     return
                 }
                 val charUuid = characteristic.uuid.toString()
-                val nonce = pendingNonces.remove("$addr:write:$charUuid") ?: return
-                gattQueues[addr]?.completeCurrent<Unit>(nonce, Unit)
+                if (!completeOp(attempt, "$addr:write:$charUuid", Unit)) return
                 nativeOnCharacteristicWrite(
                     addr,
                     charUuid,
@@ -537,10 +581,9 @@ object BleCentralManager {
                 descriptor: BluetoothGattDescriptor,
                 status: Int,
             ) {
-                val addr = gatt.device.address
+                val addr = attempt.addr
                 val charUuid = descriptor.characteristic.uuid.toString()
-                val nonce = pendingNonces.remove("$addr:cccd:$charUuid") ?: return
-                gattQueues[addr]?.completeCurrent<Unit>(nonce, Unit)
+                completeOp(attempt, "$addr:cccd:$charUuid", Unit)
             }
 
             override fun onCharacteristicChanged(
@@ -548,9 +591,12 @@ object BleCentralManager {
                 characteristic: BluetoothGattCharacteristic,
                 value: ByteArray,
             ) {
-                // Notifications are passive; don't touch the queue.
+                // Notifications are passive; don't touch the queue. Still
+                // gated: a retired attempt's notification would surface to the
+                // app as data from the connection that replaced it.
+                if (!isLive(attempt)) return
                 nativeOnCharacteristicChanged(
-                    gatt.device.address,
+                    attempt.addr,
                     characteristic.uuid.toString(),
                     value,
                 )
@@ -606,6 +652,17 @@ object BleCentralManager {
         }
     }
 
+    /**
+     * Report [attempt] as failed, but only if it still owns its address. A
+     * superseded attempt has nothing to report: the report would name a
+     * generation Rust no longer has a waiter for, against an address that now
+     * belongs to a live connection.
+     */
+    private fun failAttempt(attempt: Attempt) {
+        if (!retire(attempt)) return
+        nativeOnConnectionStateChanged(attempt.addr, false, 0, attempt.generation)
+    }
+
     private fun openGatt(
         ctx: Context,
         attempt: Attempt,
@@ -620,16 +677,14 @@ object BleCentralManager {
         val device =
             adapter?.getRemoteDevice(addr) ?: run {
                 Log.e(TAG, "could not get remote device $addr")
-                retire(attempt)
-                nativeOnConnectionStateChanged(addr, false, 0, attempt.generation)
+                failAttempt(attempt)
                 return
             }
         // TRANSPORT_LE ensures we connect over BLE, not classic Bluetooth.
-        val gatt = device.connectGatt(ctx, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+        val gatt = device.connectGatt(ctx, false, callbackFor(attempt), BluetoothDevice.TRANSPORT_LE)
         if (gatt == null) {
             Log.e(TAG, "connectGatt returned null for $addr")
-            retire(attempt)
-            nativeOnConnectionStateChanged(addr, false, 0, attempt.generation)
+            failAttempt(attempt)
             return
         }
         // Owned from creation, not from STATE_CONNECTED: a timeout before the
@@ -666,9 +721,11 @@ object BleCentralManager {
      * particular attempt in mind.
      *
      * Flushes the client-side service cache with `refresh()` before closing
-     * so the next connectGatt() starts clean. Emits a synthetic
+     * so the next connectGatt() starts clean, then emits a synthetic
      * [nativeOnConnectionStateChanged]`(addr, false, 0, generation)` so any
-     * Rust-side state waiting on the disconnect callback unblocks.
+     * Rust-side state waiting on the disconnect callback unblocks. Nothing is
+     * emitted when the named attempt was already gone: that report would carry
+     * a generation which no longer owns the address.
      */
     @JvmStatic
     fun forceClose(
@@ -679,12 +736,18 @@ object BleCentralManager {
             attempts[deviceAddr]?.takeIf {
                 generation == ANY_GENERATION || it.generation == generation
             }
-        if (attempt != null && retire(attempt)) {
-            attempt.gatt?.let { refreshGatt(it) }
-            release(attempt, disconnectFirst = true)
-            Log.d(TAG, "forceClose: tore down GATT for $deviceAddr (generation=${attempt.generation})")
+        if (attempt == null || !retire(attempt)) {
+            // The named attempt is already gone, and whoever retired it
+            // reported the disconnect. Reporting one here would name a
+            // generation that no longer owns the address, and Rust would
+            // apply it to whatever replaced it.
+            Log.d(TAG, "forceClose: no live attempt for $deviceAddr (generation=$generation)")
+            return
         }
-        nativeOnConnectionStateChanged(deviceAddr, false, 0, attempt?.generation ?: generation)
+        attempt.gatt?.let { refreshGatt(it) }
+        release(attempt, disconnectFirst = true)
+        Log.d(TAG, "forceClose: tore down GATT for $deviceAddr (generation=${attempt.generation})")
+        nativeOnConnectionStateChanged(deviceAddr, false, 0, attempt.generation)
     }
 
     private fun refreshGatt(gatt: BluetoothGatt): Boolean =
