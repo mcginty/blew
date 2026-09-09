@@ -1,35 +1,52 @@
-//! Generation-tagged connect attempts.
-//!
-//! Lives outside `platform::android` so it can be tested on every host rather
-//! than only on a device. Android reports a GATT callback by device address
-//! alone, so a retired attempt's late callback is indistinguishable from the
-//! live one's unless every attempt carries an identity of its own. The
-//! generation is that identity: it travels to Kotlin with the connect request
-//! and comes back on every completion, and a completion naming an attempt that
-//! no longer owns the address is dropped rather than applied to its successor.
+//! Android connection identity, retained through disconnect and cancellation.
 
+use crate::central::DisconnectCause;
+use crate::error::{BlewError, BlewResult};
+use crate::types::DeviceId;
 use std::collections::HashMap;
-
 use tokio::sync::oneshot;
-
-use crate::error::BlewResult;
 
 type Waiter = oneshot::Sender<BlewResult<()>>;
 
-/// Generation meaning "whichever attempt is live for this address", for
-/// callers with no particular attempt in mind. Matches
-/// `BleCentralManager.ANY_GENERATION`; never handed out by
-/// [`ConnectAttempts::begin`], so it matches nothing in [`ConnectAttempts`]
-/// itself.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
-pub(crate) const ANY_GENERATION: i32 = 0;
+pub(crate) struct ConnectionGuard<F: FnOnce(DisconnectCause)> {
+    cleanup: Option<F>,
+    cause: DisconnectCause,
+}
+
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+impl<F: FnOnce(DisconnectCause)> ConnectionGuard<F> {
+    pub(crate) fn new(cleanup: F) -> Self {
+        Self {
+            cleanup: Some(cleanup),
+            cause: DisconnectCause::LocalClose,
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.cleanup = None;
+    }
+
+    pub(crate) fn timed_out(&mut self) {
+        self.cause = DisconnectCause::Timeout;
+    }
+}
+
+impl<F: FnOnce(DisconnectCause)> Drop for ConnectionGuard<F> {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup(self.cause.clone());
+        }
+    }
+}
 
 struct Attempt {
     generation: i32,
-    waiter: Waiter,
+    waiter: Option<Waiter>,
+    disconnecting: bool,
+    disconnects: Vec<oneshot::Sender<()>>,
 }
 
-/// The connect attempt in flight per device address, at most one each.
 #[derive(Default)]
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub(crate) struct ConnectAttempts {
@@ -39,151 +56,192 @@ pub(crate) struct ConnectAttempts {
 
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 impl ConnectAttempts {
-    /// Claim the connect slot for `addr`, returning the attempt's generation
-    /// and its waiter.
-    ///
-    /// `None` when a connect is already in flight there. Deliberately not
-    /// "latest wins": evicting the first caller's waiter silently orphans it.
     pub(crate) fn begin(&mut self, addr: &str) -> Option<(i32, oneshot::Receiver<BlewResult<()>>)> {
-        if self.pending.contains_key(addr) {
+        if self
+            .pending
+            .get(addr)
+            .is_some_and(|a| a.waiter.is_some() || a.disconnecting)
+        {
             return None;
         }
-        let generation = self.next_generation();
+        self.next_generation = self.next_generation.wrapping_add(1);
+        if self.next_generation == 0 {
+            self.next_generation = 1;
+        }
+        let generation = self.next_generation;
         let (tx, rx) = oneshot::channel();
         self.pending.insert(
             addr.to_owned(),
             Attempt {
                 generation,
-                waiter: tx,
+                waiter: Some(tx),
+                disconnecting: false,
+                disconnects: Vec::new(),
             },
         );
         Some((generation, rx))
     }
 
-    /// Take the waiter for `addr`, but only if it belongs to `generation`.
-    ///
-    /// A completion naming a retired attempt leaves the live one untouched.
-    /// The failure this exists for is a superseded attempt's late disconnect
-    /// resolving its replacement's `connect()` as if the link had dropped.
-    pub(crate) fn complete(&mut self, addr: &str, generation: i32) -> Option<Waiter> {
-        if self.pending.get(addr)?.generation != generation {
-            return None;
-        }
-        self.pending.remove(addr).map(|attempt| attempt.waiter)
+    pub(crate) fn generation(&self, addr: &str) -> Option<i32> {
+        self.pending.get(addr).map(|a| a.generation)
     }
 
-    fn next_generation(&mut self) -> i32 {
-        // Skipped rather than allowed to land on ANY_GENERATION, which would
-        // make one attempt in every wrap of the counter unaddressable.
-        self.next_generation = self.next_generation.wrapping_add(1);
-        if self.next_generation == ANY_GENERATION {
-            self.next_generation = 1;
+    pub(crate) fn is_live(&self, addr: &str, generation: i32) -> bool {
+        self.generation(addr) == Some(generation)
+    }
+
+    pub(crate) fn connected(&mut self, addr: &str, generation: i32) -> bool {
+        let Some(attempt) = self.pending.get_mut(addr) else {
+            return false;
+        };
+        if attempt.generation != generation || attempt.disconnecting {
+            return false;
         }
-        self.next_generation
+        let Some(tx) = attempt.waiter.take() else {
+            return false;
+        };
+        let _ = tx.send(Ok(()));
+        true
+    }
+
+    pub(crate) fn disconnect(&mut self, addr: &str) -> Option<(i32, oneshot::Receiver<()>)> {
+        let attempt = self.pending.get_mut(addr)?;
+        attempt.disconnecting = true;
+        let (tx, rx) = oneshot::channel();
+        attempt.disconnects.push(tx);
+        Some((attempt.generation, rx))
+    }
+
+    pub(crate) fn retire(&mut self, addr: &str, generation: i32) -> bool {
+        if !self.is_live(addr, generation) {
+            return false;
+        }
+        let attempt = self.pending.remove(addr).expect("matched attempt");
+        if let Some(tx) = attempt.waiter {
+            let _ = tx.send(Err(BlewError::NotConnected(DeviceId::from(addr))));
+        }
+        for tx in attempt.disconnects {
+            let _ = tx.send(());
+        }
+        true
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::BlewError;
-    use crate::types::DeviceId;
+    #[tokio::test]
+    async fn dropping_an_inflight_future_retires_and_closes_its_attempt() {
+        use std::sync::{Arc, Mutex};
+        let state = Arc::new(Mutex::new(ConnectAttempts::default()));
+        let closes = Arc::new(Mutex::new(Vec::new()));
+        let (generation, rx) = state.lock().unwrap().begin(A).unwrap();
+        let worker_state = state.clone();
+        let worker_closes = closes.clone();
+        let (started, ready) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = ConnectionGuard::new(move |cause| {
+                worker_state.lock().unwrap().retire(A, generation);
+                worker_closes.lock().unwrap().push((generation, cause));
+            });
+            started.send(()).unwrap();
+            let _ = rx.await;
+        });
+        ready.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            *closes.lock().unwrap(),
+            [(generation, DisconnectCause::LocalClose)]
+        );
+        assert!(state.lock().unwrap().begin(A).is_some());
+    }
+
+    #[test]
+    fn timeout_cleanup_is_single_fire_and_success_disarms_it() {
+        let mut causes = Vec::new();
+        {
+            let mut guard = ConnectionGuard::new(|cause| causes.push(cause));
+            guard.timed_out();
+        }
+        {
+            let mut guard = ConnectionGuard::new(|cause| causes.push(cause));
+            guard.disarm();
+        }
+        assert_eq!(causes, [DisconnectCause::Timeout]);
+    }
 
     const A: &str = "AA:BB:CC:DD:EE:FF";
-    const B: &str = "11:22:33:44:55:66";
-
-    fn disconnected() -> BlewResult<()> {
-        Err(BlewError::NotConnected(DeviceId::from(A)))
-    }
 
     #[test]
-    fn an_overlapping_connect_is_refused() {
+    fn overlapping_connect_is_refused() {
         let mut state = ConnectAttempts::default();
-        let (_gen, _rx) = state.begin(A).expect("first connect claims the slot");
-        assert!(
-            state.begin(A).is_none(),
-            "latest-wins would orphan the first"
-        );
+        let _first = state.begin(A).unwrap();
+        assert!(state.begin(A).is_none());
+        assert!(state.begin("other").is_some());
     }
 
     #[test]
-    fn different_addresses_are_independent() {
-        let mut state = ConnectAttempts::default();
-        let (first, _rx) = state.begin(A).unwrap();
-        let (second, _rx) = state.begin(B).unwrap();
-        assert_ne!(first, second, "generations are global, not per address");
-    }
-
-    #[test]
-    fn generations_are_unique_and_never_the_wildcard() {
-        let mut state = ConnectAttempts::default();
-        let mut seen = Vec::new();
-        for _ in 0..4 {
-            let (generation, _rx) = state.begin(A).unwrap();
-            assert_ne!(generation, ANY_GENERATION);
-            assert!(!seen.contains(&generation));
-            seen.push(generation);
-            state.complete(A, generation).expect("waiter");
-        }
-    }
-
-    #[test]
-    fn a_completion_reaches_its_own_attempt() {
+    fn identity_survives_connected_until_disconnect() {
         let mut state = ConnectAttempts::default();
         let (generation, rx) = state.begin(A).unwrap();
-        state
-            .complete(A, generation)
-            .expect("waiter")
-            .send(Ok(()))
-            .expect("receiver still live");
-        assert!(rx.blocking_recv().expect("delivered").is_ok());
-    }
-
-    #[test]
-    fn a_retired_attempts_disconnect_does_not_resolve_its_replacement() {
-        // Retire attempt A, start B to the same address, then deliver A's
-        // delayed disconnect. Address-keyed completion resolved B's caller as
-        // disconnected while B's connection was still coming up.
-        let mut state = ConnectAttempts::default();
-        let (retired, _rx) = state.begin(A).unwrap();
-        state
-            .complete(A, retired)
-            .expect("timeout takes the waiter");
-
-        let (live, mut live_rx) = state.begin(A).unwrap();
-        assert_ne!(retired, live);
-
+        assert!(state.connected(A, generation));
+        assert!(rx.blocking_recv().unwrap().is_ok());
+        assert_eq!(state.generation(A), Some(generation));
         assert!(
-            state.complete(A, retired).is_none(),
-            "the retired attempt's callback must not take the live waiter"
+            !state.connected(A, generation),
+            "duplicate connection event"
         );
-        assert!(
-            live_rx.try_recv().is_err(),
-            "the live connect is still waiting on its own callback"
-        );
-
-        // ...and the live attempt still completes normally afterwards.
-        state
-            .complete(A, live)
-            .expect("waiter")
-            .send(disconnected())
-            .expect("receiver still live");
-        assert!(live_rx.blocking_recv().expect("delivered").is_err());
+        let (closing, rx) = state.disconnect(A).unwrap();
+        assert_eq!(closing, generation);
+        assert!(state.begin(A).is_none());
+        assert!(state.retire(A, generation));
+        assert!(rx.blocking_recv().is_ok());
+        assert_eq!(state.generation(A), None);
     }
 
     #[test]
-    fn the_wildcard_generation_resolves_nothing() {
-        // Kotlin reports ANY_GENERATION when a force-close found no attempt to
-        // tear down. That must not be read as "matches whatever is pending".
+    fn stale_results_do_not_reach_replacement_or_its_disconnect_waiters() {
         let mut state = ConnectAttempts::default();
-        let (_generation, _rx) = state.begin(A).unwrap();
-        assert!(state.complete(A, ANY_GENERATION).is_none());
+        let (old, _) = state.begin(A).unwrap();
+        assert!(state.retire(A, old));
+        let (new, mut connect_rx) = state.begin(A).unwrap();
+        assert!(!state.connected(A, old));
+        assert!(!state.retire(A, old));
+        assert!(matches!(
+            connect_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(state.connected(A, new));
+        let (_, mut disconnect_rx) = state.disconnect(A).unwrap();
+        assert!(!state.retire(A, old));
+        assert!(matches!(
+            disconnect_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(state.retire(A, new));
+        assert!(disconnect_rx.blocking_recv().is_ok());
     }
 
     #[test]
-    fn a_completion_for_an_unknown_address_is_dropped() {
+    fn disconnect_during_mtu_suppresses_connected_and_releases_all_waiters() {
         let mut state = ConnectAttempts::default();
-        let (generation, _rx) = state.begin(A).unwrap();
-        assert!(state.complete(B, generation).is_none());
+        let (generation, connect_rx) = state.begin(A).unwrap();
+        let (_, first) = state.disconnect(A).unwrap();
+        let (_, second) = state.disconnect(A).unwrap();
+        assert!(!state.connected(A, generation));
+        assert!(state.retire(A, generation));
+        assert!(connect_rx.blocking_recv().unwrap().is_err());
+        assert!(first.blocking_recv().is_ok());
+        assert!(second.blocking_recv().is_ok());
+    }
+
+    #[test]
+    fn generations_wrap_without_reusing_zero() {
+        let mut state = ConnectAttempts {
+            next_generation: -1,
+            ..Default::default()
+        };
+        assert_eq!(state.begin(A).unwrap().0, 1);
     }
 }

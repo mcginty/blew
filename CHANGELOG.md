@@ -7,6 +7,15 @@ All notable changes to `blew` are documented here. Format follows
 
 ### Fixed
 
+- **Android: connection ownership now spans the entire GATT lifecycle.**
+  Each attempt owns its callback, client, operation queue, pending nonces and
+  MTU. Callback effects and retirement are serialized, and generations qualify
+  GATT requests/results and remain live in Rust through disconnect. Late callbacks
+  and queued completions cannot affect a replacement connection. Dropping an
+  unfinished connect or disconnect closes its exact client; pending GATT waiters
+  are released on retirement. Early callbacks and cancellation before client
+  publication are covered by deterministic fake-factory tests run in CI.
+
 - **Android: a connect timeout leaked the GATT client it gave up on.**
   ([#24](https://github.com/mcginty/blew/issues/24)) `openGatt()` discarded the
   `BluetoothGatt` that `connectGatt()` returned, and the address-keyed handle

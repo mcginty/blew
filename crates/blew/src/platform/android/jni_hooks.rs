@@ -381,48 +381,23 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnConnect
     mut env: EnvUnowned,
     _class: JClass,
     device_addr: JString,
+    generation: jint,
     connected: jboolean,
     gatt_status: jint,
-    generation: jint,
 ) {
     guard("nativeOnConnectionStateChanged", || {
         env.with_env(|env| {
             let Some(addr) = jstring_to_string(env, &device_addr) else {
                 return Ok::<_, jni::errors::Error>(());
             };
-            let device_id = DeviceId::from(addr.as_str());
-
-            if connected == JNI_TRUE {
-                trace!(%device_id, "central: device connected");
-                super::central::send_event(CentralEvent::DeviceConnected {
-                    device_id: device_id.clone(),
-                });
-                super::central::complete_connect(&addr, generation, Ok(()));
-            } else {
-                trace!(%device_id, "central: device disconnected");
-                // Fail any pending connect() call -- the connection dropped before
-                // MTU negotiation completed (nativeOnConnectionStateChanged(true)
-                // is deferred until onMtuChanged).
-                super::central::complete_connect(
-                    &addr,
-                    generation,
-                    Err(crate::error::BlewError::NotConnected(device_id.clone())),
-                );
-                // Release any caller awaiting disconnect() completion.
-                super::central::complete_disconnect(&addr);
-                let cause = match gatt_status {
-                    // 0 = GATT_SUCCESS + local disconnect; 22 = GATT_CONN_TERMINATE_LOCAL_HOST.
-                    0 | 22 => DisconnectCause::LocalClose,
-                    8 => DisconnectCause::LinkLoss, // GATT_CONN_TIMEOUT
-                    19 => DisconnectCause::RemoteClose, // GATT_CONN_TERMINATE_PEER_USER
-                    133 => DisconnectCause::Gatt133, // the infamous
-                    other => DisconnectCause::Unknown(other),
-                };
-                super::central::send_event(CentralEvent::DeviceDisconnected {
-                    device_id: device_id.clone(),
-                    cause,
-                });
-            }
+            let cause = match gatt_status {
+                0 | 22 => DisconnectCause::LocalClose,
+                8 => DisconnectCause::LinkLoss,
+                19 => DisconnectCause::RemoteClose,
+                133 => DisconnectCause::Gatt133,
+                other => DisconnectCause::Unknown(other),
+            };
+            super::central::connection_changed(&addr, generation, connected == JNI_TRUE, cause);
 
             Ok(())
         })
@@ -435,6 +410,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnService
     mut env: EnvUnowned,
     _class: JClass,
     device_addr: JString,
+    generation: jint,
     services_json: JString,
 ) {
     guard("nativeOnServicesDiscovered", || {
@@ -447,7 +423,12 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnService
             };
 
             let services = super::central::parse_services_json(&json);
-            super::central::complete_discover_services(&addr, Ok(services));
+            super::central::with_generation(&addr, generation, || {
+                super::central::complete_discover_services(
+                    &format!("{addr}:{generation}"),
+                    Ok(services),
+                );
+            });
 
             Ok(())
         })
@@ -460,6 +441,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnCharact
     mut env: EnvUnowned,
     _class: JClass,
     device_addr: JString,
+    generation: jint,
     char_uuid: JString,
     value: JByteArray,
     status: jint,
@@ -483,8 +465,10 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnCharact
                 })
             };
 
-            let key = format!("{addr}:read:{chr}");
-            super::central::complete_pending(&key, result);
+            let key = format!("{addr}:{generation}:read:{chr}");
+            super::central::with_generation(&addr, generation, || {
+                super::central::complete_pending(&key, result);
+            });
 
             Ok(())
         })
@@ -497,6 +481,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnCharact
     mut env: EnvUnowned,
     _class: JClass,
     device_addr: JString,
+    generation: jint,
     char_uuid: JString,
     status: jint,
 ) {
@@ -518,8 +503,10 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnCharact
                 })
             };
 
-            let key = format!("{addr}:write:{chr}");
-            super::central::complete_pending(&key, result);
+            let key = format!("{addr}:{generation}:write:{chr}");
+            super::central::with_generation(&addr, generation, || {
+                super::central::complete_pending(&key, result);
+            });
 
             Ok(())
         })
@@ -532,6 +519,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnCharact
     mut env: EnvUnowned,
     _class: JClass,
     device_addr: JString,
+    generation: jint,
     char_uuid: JString,
     value: JByteArray,
 ) {
@@ -548,10 +536,12 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnCharact
             };
             let data = jbytes_to_vec(env, &value);
 
-            super::central::send_event(CentralEvent::CharacteristicNotification {
-                device_id: DeviceId::from(addr.as_str()),
-                char_uuid: char_id,
-                value: data.into(),
+            super::central::with_generation(&addr, generation, || {
+                super::central::send_event(CentralEvent::CharacteristicNotification {
+                    device_id: DeviceId::from(addr.as_str()),
+                    char_uuid: char_id,
+                    value: data.into(),
+                });
             });
 
             Ok(())
@@ -565,6 +555,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnMtuChan
     mut env: EnvUnowned,
     _class: JClass,
     device_addr: JString,
+    generation: jint,
     mtu: jint,
 ) {
     guard("nativeOnMtuChanged", || {
@@ -573,7 +564,9 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnMtuChan
                 return Ok::<_, jni::errors::Error>(());
             };
             trace!(addr, mtu, "MTU changed");
-            super::central::set_mtu(&addr, mtu as u16);
+            super::central::with_generation(&addr, generation, || {
+                super::central::set_mtu(&addr, mtu as u16);
+            });
             Ok(())
         })
         .into_outcome();
