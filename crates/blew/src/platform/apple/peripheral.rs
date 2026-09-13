@@ -864,6 +864,9 @@ impl PeripheralBackend for ApplePeripheral {
         let handle = Arc::clone(&self.0);
         let config = config.clone();
         async move {
+            if !config.service_data.is_empty() {
+                return Err(BlewError::NotSupported);
+            }
             if unsafe { handle.manager.isAdvertising() } {
                 return Err(BlewError::AlreadyAdvertising);
             }

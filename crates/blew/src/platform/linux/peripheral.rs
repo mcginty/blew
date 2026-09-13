@@ -415,6 +415,7 @@ impl PeripheralBackend for LinuxPeripheral {
                 advertisement_type: AdvType::Peripheral,
                 local_name: Some(config.local_name.clone()),
                 service_uuids: config.service_uuids.clone().into_iter().collect(),
+                service_data: config.service_data.clone().into_iter().collect(),
                 secondary_channel,
                 ..Default::default()
             };

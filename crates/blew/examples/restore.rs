@@ -122,6 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .start_advertising(&AdvertisingConfig {
                     local_name: "blew-restore".into(),
                     service_uuids: vec![SVC_UUID],
+                    ..Default::default()
                 })
                 .await?;
         }
