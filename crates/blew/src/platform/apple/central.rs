@@ -995,8 +995,9 @@ impl CentralBackend for AppleCentral {
             if encryption != L2capEncryption::Insecure {
                 return Err(BlewError::L2capEncryptionUnsupported {
                     requested: encryption,
-                    reason: "CoreBluetooth's openL2CAPChannel: takes no security \
-                             argument — the publishing peripheral decides",
+                    reason: "CoreBluetooth exposes no way to raise link security \
+                             on demand, so an opening central can only accept \
+                             whatever the peer's PSM insists on",
                 });
             }
             let id_for_err = device_id.clone();

@@ -185,6 +185,17 @@ Rounding *up* is fine (Android's single secure socket serves `RequireEncryption`
 The default is `Insecure`, matching what every backend hardcoded before 0.4.0;
 don't raise it without a major bump.
 
+The setting is meaningful on *both* paths and the two enforce it differently:
+the listener refuses a `LE_CREDIT_BASED_CONNECTION_REQ` whose link doesn't meet
+its requirement (the request PDU carries no security field), while the opener
+elevates the ACL link first — which on LE only the Central can actuate. **Don't
+"simplify" this by dropping the central-side knob**: Linux (`BT_SECURITY_*` on
+the connecting socket) and Android (`createL2capChannel`) both implement it
+correctly, and it's the only protection available when you don't control the
+peer's PSM. Apple's central is refused because CoreBluetooth has no
+raise-security API, which is an API gap specific to that backend — not a
+protocol rule.
+
 **L2CAP accept channel policy.** This governs the *accept* path only — the
 stream of newly-arrived channels. Every L2CAP **data** path is bounded; see the
 flow-control rule under Project goals.
