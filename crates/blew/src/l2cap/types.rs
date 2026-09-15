@@ -42,6 +42,18 @@ pub const MIN_L2CAP_READ_CHUNK_SIZE: usize = 64;
 
 /// Link security demanded of an L2CAP CoC channel.
 ///
+/// LE encryption is a property of the ACL link, not of one channel, and the two
+/// ends enforce a requirement by different mechanisms. The listener enforces by
+/// *refusing*: `LE_CREDIT_BASED_CONNECTION_REQ` carries no security field, so a
+/// PSM whose requirement is unmet answers with "insufficient
+/// authentication/encryption" and the channel never opens. The opener enforces
+/// by *elevating*: it raises the link's security before the request goes out,
+/// which on LE only the Central can actually actuate (a Peripheral can only send
+/// an SMP Security Request and ask). So this field is meaningful on both
+/// [`Central::open_l2cap_channel`](crate::Central::open_l2cap_channel) and
+/// [`Peripheral::l2cap_listener`](crate::Peripheral::l2cap_listener) — it just
+/// reaches the same guarantee from opposite directions.
+///
 /// Platforms express this at very different resolutions, so a backend maps the
 /// requested level onto the nearest level its API can express that is **never
 /// weaker** than what was asked for. Where no such level exists the backend
@@ -56,9 +68,13 @@ pub const MIN_L2CAP_READ_CHUNK_SIZE: usize = 64;
 /// | Android | `…InsecureL2capChannel` | `…L2capChannel` (stronger) | `…L2capChannel` |
 /// | Linux | `BT_SECURITY_LOW` | `BT_SECURITY_MEDIUM` | `BT_SECURITY_HIGH` |
 ///
-/// CoreBluetooth's central role has no security knob at all — the publishing
-/// peripheral decides, and the central can neither demand nor verify it — so
-/// anything other than [`Insecure`](Self::Insecure) is refused there.
+/// The Apple central row is an API gap, not a protocol one. Linux and Android
+/// both elevate the link from the opening side — `BT_SECURITY_*` on a connecting
+/// socket, and `createL2capChannel`'s authenticated-and-encrypted contract — but
+/// CoreBluetooth exposes no way to pair or raise security on demand, so an Apple
+/// central can only take whatever the peer's PSM happens to insist on. It cannot
+/// demand or verify anything itself, so anything other than
+/// [`Insecure`](Self::Insecure) is refused there rather than silently ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum L2capEncryption {
