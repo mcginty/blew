@@ -5,6 +5,20 @@ All notable changes to `blew` are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **`AdvertisingConfig::local_name` is now `Option<String>`, defaulting to no
+  name.** ([#29](https://github.com/mcginty/blew/issues/29)) Every
+  advertisement used to carry a name. On Android that meant renaming the
+  device's Bluetooth adapter — `AdvertiseData` can only include the adapter's
+  own name — which is device-global, persists after `stop_advertising()`, and
+  shows up in system Settings and to every Bluetooth peer. On every backend
+  the name also competed with a 128-bit service UUID for the 31-byte legacy
+  advertisement. With `None`, Android leaves the adapter name alone and sends
+  no scan response, Linux omits the name from the advertisement, and Apple
+  omits `CBAdvertisementDataLocalNameKey`. `Some(name)` keeps the previous
+  behaviour on every backend, including the Android rename.
+
 ### Fixed
 
 - **Linux: a discovered device's name, UUIDs, manufacturer data and service
@@ -17,6 +31,59 @@ All notable changes to `blew` are documented here. Format follows
   `DeviceDiscovered` when the advertised payload changes. RSSI updates the
   snapshot without an event, since it moves with every packet and says nothing
   new about the peer.
+- **Android: connection ownership now spans the entire GATT lifecycle.**
+  Each attempt owns its callback, client, operation queue, pending nonces and
+  MTU. Callback effects and retirement are serialized, and generations qualify
+  GATT requests/results and remain live in Rust through disconnect. Late callbacks
+  and queued completions cannot affect a replacement connection. Dropping an
+  unfinished connect or disconnect closes its exact client; pending GATT waiters
+  are released on retirement. Early callbacks and cancellation before client
+  publication are covered by deterministic fake-factory tests run in CI.
+
+- **Android: a connect timeout leaked the GATT client it gave up on.**
+  ([#24](https://github.com/mcginty/blew/issues/24)) `openGatt()` discarded the
+  `BluetoothGatt` that `connectGatt()` returned, and the address-keyed handle
+  map was populated only by the `STATE_CONNECTED` callback. A timeout before
+  the connection completed therefore found nothing to close: it reported the
+  disconnect and left the native client outstanding, where the stale-client
+  cleanup on the next `connect()` could not reach it either. Repeated timeouts
+  accumulated clients against Android's cap of roughly seven, after which
+  connecting failed until the process restarted. Each attempt now owns its
+  client from the moment `connectGatt()` returns, and a timeout closes that
+  exact one.
+
+- **Android: a retired connection attempt's late callback could tear down the
+  attempt that replaced it.**
+  ([#25](https://github.com/mcginty/blew/issues/25)) Every GATT callback
+  identified its connection by device address alone. A superseded attempt's
+  delayed `STATE_DISCONNECTED` removed the live attempt's handle, closed its
+  operation queue, dropped its pending nonces and completed its `connect()` as
+  disconnected; a delayed `STATE_CONNECTED`, or an MTU exchange finishing after
+  the attempt it belonged to was retired, could satisfy a waiter that referred
+  to a different GATT client. Attempts now carry a generation that travels to
+  the platform with the connect request and returns on every callback.
+  Each attempt gets its own `BluetoothGattCallback`, so identity is exact from
+  the moment `connectGatt()` is called rather than from whenever its handle is
+  published; every callback checks ownership under the same lock retirement
+  takes before touching the per-device tables; state is cleared by
+  compare-and-remove rather than by address; and a stale callback may release
+  only its own client. A connection-state change is reported to Rust only by
+  the attempt that owns the address when it is reported, so a superseded
+  attempt can no longer emit a disconnect against its replacement.
+
+- **Android: a `stop_advertising()` could leave the radio advertising with the
+  Rust state machine saying `Idle`.**
+  ([#26](https://github.com/mcginty/blew/issues/26)) A stop that took the
+  advertising slot from a start still between its Rust registration and its JNI call
+  reached Kotlin first and found nothing to stop, and the start then began
+  advertising anyway. Its cleanup asked whether it still owned the slot, was
+  told no — the stop had freed it — and skipped the teardown, leaving an
+  advertisement running with nothing holding the request id needed to stop it.
+  Cleanup is now keyed on the request id rather than on slot ownership. The
+  matching hazard in the other direction is closed too: `stopAdvertising` takes
+  the request id it means to stop, so an older stop can no longer tear down a
+  newer start that claimed the advertiser after the slot was freed.
+
 - **Android: `BleCentralManager.init` / `BlePeripheralManager.init` crashed on
   startup with `MethodNotFound`.** Both `init(Context)` methods were missing
   `@JvmStatic`, so on a Kotlin `object` they only compiled as instance methods
@@ -719,6 +786,32 @@ PeripheralRequest::Write { client_id, char_uuid, offset, value, responder, .. } 
 
 `offset` is `0` for ordinary writes, so applications that never receive a
 payload larger than `MTU - 3` can keep treating `value` as the whole value.
+
+**If you were setting `AdvertisingConfig::local_name`**, it is now an
+`Option<String>`:
+
+```rust
+// Before
+let config = AdvertisingConfig {
+    local_name: "my-device".into(),
+    service_uuids: vec![SVC_UUID],
+};
+
+// After — keep a name
+let config = AdvertisingConfig {
+    local_name: Some("my-device".into()),
+    service_uuids: vec![SVC_UUID],
+};
+
+// After — or advertise none, and identify the peripheral by its service UUID
+let config = AdvertisingConfig {
+    service_uuids: vec![SVC_UUID],
+    ..Default::default()
+};
+```
+
+On Android, `Some(name)` renames the device's Bluetooth adapter, as the old
+field always did. Prefer `None` unless peers genuinely need the name.
 
 ---
 

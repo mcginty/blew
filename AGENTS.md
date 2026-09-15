@@ -28,6 +28,7 @@ mise run fmt                             # format
 mise run fmt:check                       # check formatting
 mise run deny                            # license/vulnerability audit
 mise run ci:compile-kotlin               # compile the Android Kotlin sources
+mise run ci:test-kotlin                  # deterministic JVM GATT ownership tests
 cargo run --example scan -p blew         # scan for 10s
 cargo run --example advertise -p blew    # advertise GATT service
 ```
@@ -280,7 +281,8 @@ rx.await?; // safe to await now
 
 **Global state:** Module-level `OnceLock` statics store event channels and pending operation maps. Only one Bluetooth adapter exists on Android so singletons are correct.
 
-- `AndroidCentral`: uses a `tokio::sync::broadcast` channel (central events are `Clone`; wrapped in `BroadcastEventStream` so slow-subscriber lag is swallowed) + `KeyedRequestMap<oneshot::Sender>` for async request/response coupling. A per-device Kotlin coroutine queue serializes GATT ops (replacing the old adapter-wide semaphore) so a slow peer can't block others.
+- `AndroidCentral`: uses `tokio::sync::broadcast` for events and generation-qualified pending GATT operations. `ConnectAttempts` retains identity through connected/disconnecting states. Register waiters and apply callback effects under its mutex, but **never hold that mutex across JNI**: Kotlin delivers callbacks while holding its lifecycle monitor.
+- `GattConnections` owns each attempt's callback, handle, queue, nonces and MTU. Its monitor orders callbacks, operation kicks, retirement and delivery to Rust; `GattFactory.open` runs outside the monitor so an unpublished handle can be retired. The callback captures its attempt before factory entry. All lifecycle/GATT JNI requests and results carry a generation (except read-only `refresh`/`getMtu`). Disconnect fallback and cancellation target exact generations; there is no wildcard close. `ci:test-kotlin` exercises the production controller with a fake factory and virtual coroutine time.
 - `AndroidPeripheral`: state events fan out through `tokio::sync::broadcast` (`PeripheralStateEvent` is `Clone`). GATT reads/writes are delivered as `PeripheralRequest` over an `mpsc::UnboundedSender`, handed out once via `take_requests()`. For each request, a tokio task awaits the responder's oneshot then calls Kotlin `respondToRead`/`respondToWrite` via JNI. All Rust-side synchronization uses `parking_lot::Mutex`.
 
 **JNI data marshalling:** Complex data (GATT services, UUID lists) passed as flat arrays or JSON strings to avoid complex JNI type construction. Service characteristics use parallel arrays (uuids, properties, permissions, values).
@@ -300,7 +302,7 @@ rx.await?; // safe to await now
   match precisely.
 - Overlapping `connect()` on the same device is rejected with
   `BlewError::ConnectInFlight(DeviceId)` on Apple and Android (built on
-  `KeyedRequestMap::try_insert`) and on Linux (`CentralInner::pending_connects`).
+  `KeyedRequestMap::try_insert` on Apple and `ConnectAttempts` on Android) and on Linux (`CentralInner::pending_connects`).
   Do not reintroduce "latest wins" eviction — it silently orphans the first
   caller's oneshot.
 - Android `disconnect()` **awaits** `onConnectionStateChange(DISCONNECTED)`

@@ -86,7 +86,7 @@ jobs:
       - run: mise run ci:check-android
 
   compile-kotlin:
-    name: Compile (Kotlin)
+    name: Compile and test (Kotlin)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -96,4 +96,4 @@ jobs:
       - uses: android-actions/setup-android@v3
       - name: Install Linux system dependencies
         run: sudo apt-get update && sudo apt-get install -y $LINUX_APT_DEPS
-      - run: mise run ci:compile-kotlin
+      - run: mise run ci:test-kotlin

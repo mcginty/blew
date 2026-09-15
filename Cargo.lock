@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "blew"
-version = "0.4.0-beta.3"
+version = "0.4.0-beta.5"
 dependencies = [
  "bitflags 2.13.1",
  "bluer",
@@ -3572,7 +3572,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-blew"
-version = "0.4.0-beta.3"
+version = "0.4.0-beta.5"
 dependencies = [
  "blew",
  "jni 0.22.4",

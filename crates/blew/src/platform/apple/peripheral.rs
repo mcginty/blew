@@ -867,10 +867,10 @@ impl PeripheralBackend for ApplePeripheral {
             if unsafe { handle.manager.isAdvertising() } {
                 return Err(BlewError::AlreadyAdvertising);
             }
-            debug!(local_name = %config.local_name, "starting advertising");
+            debug!(local_name = ?config.local_name, "starting advertising");
 
             let rx = {
-                let local_name = NSString::from_str(&config.local_name);
+                let local_name = config.local_name.as_deref().map(NSString::from_str);
 
                 let service_uuids: Vec<Retained<CBUUID>> = config
                     .service_uuids
@@ -879,13 +879,14 @@ impl PeripheralBackend for ApplePeripheral {
                     .collect();
                 let uuid_array = NSArray::from_retained_slice(&service_uuids);
 
-                let key_name = unsafe { CBAdvertisementDataLocalNameKey };
-                let key_uuids = unsafe { CBAdvertisementDataServiceUUIDsKey };
+                let mut keys = vec![unsafe { CBAdvertisementDataServiceUUIDsKey }];
+                let mut values: Vec<&AnyObject> = vec![&uuid_array];
+                if let Some(local_name) = &local_name {
+                    keys.push(unsafe { CBAdvertisementDataLocalNameKey });
+                    values.push(local_name);
+                }
 
-                let ln_any: &AnyObject = &local_name;
-                let ua_any: &AnyObject = &uuid_array;
-
-                let adv_data = NSDictionary::from_slices(&[key_name, key_uuids], &[ln_any, ua_any]);
+                let adv_data = NSDictionary::from_slices(&keys, &values);
 
                 let (tx, rx) = oneshot::channel();
                 *handle.inner.adv_tx.lock() = Some(tx);

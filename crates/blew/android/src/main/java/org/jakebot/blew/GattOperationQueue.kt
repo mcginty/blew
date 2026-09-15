@@ -8,10 +8,10 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.channels.ClosedSendChannelException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.coroutines.CoroutineContext
 
 /**
  * Per-device GATT operation queue.
@@ -26,11 +26,15 @@ import java.util.concurrent.atomic.AtomicLong
  */
 class GattOperationQueue(
     tag: String,
+    context: CoroutineContext = Dispatchers.Default,
 ) {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val scope = CoroutineScope(context + SupervisorJob(context[Job]))
     private val channel = Channel<Task<*>>(capacity = Channel.UNLIMITED)
     private val worker: Job
     private val taskSeq = AtomicLong(0)
+    private val lock = Any()
+    private var closed: Throwable? = null
+    private val tasks = mutableSetOf<Task<*>>()
 
     @Volatile private var current: Task<*>? = null
 
@@ -52,12 +56,16 @@ class GattOperationQueue(
         onComplete: (Task<T>) -> Unit = {},
     ): Result<T> {
         val task = Task<T>(name, timeoutMs, kick, onComplete)
-        try {
-            channel.send(task)
-        } catch (_: ClosedSendChannelException) {
-            return Result.failure(CancellationException("queue closed before $name could be enqueued"))
+        synchronized(lock) {
+            closed?.let { return Result.failure(it) }
+            tasks.add(task)
+            channel.trySend(task).getOrThrow()
         }
-        return task.await()
+        return try {
+            task.await()
+        } finally {
+            synchronized(lock) { tasks.remove(task) }
+        }
     }
 
     @Suppress("UNCHECKED_CAST")
@@ -71,15 +79,15 @@ class GattOperationQueue(
     }
 
     fun close(reason: Throwable = CancellationException("queue closed")) {
-        channel.close()
-        scope.launch {
-            current?.fail(reason)
-            while (true) {
-                val next = channel.tryReceive().getOrNull() ?: break
-                next.fail(reason)
+        val pending =
+            synchronized(lock) {
+                if (closed != null) return
+                closed = reason
+                channel.close()
+                tasks.toList().also { tasks.clear() }
             }
-            scope.cancel()
-        }
+        pending.forEach { it.fail(reason) }
+        scope.cancel()
     }
 
     inner class Task<T>(
@@ -92,6 +100,7 @@ class GattOperationQueue(
         private val deferred = CompletableDeferred<Result<T>>()
 
         suspend fun run() {
+            if (deferred.isCompleted) return
             current = this
             try {
                 if (!kick()) {
@@ -102,6 +111,9 @@ class GattOperationQueue(
                 if (result == null) {
                     deferred.complete(Result.failure(RuntimeException("$name timed out after ${timeoutMs}ms")))
                 }
+            } catch (e: Exception) {
+                deferred.complete(Result.failure(e))
+                if (e is CancellationException) throw e
             } finally {
                 current = null
                 onComplete(this)

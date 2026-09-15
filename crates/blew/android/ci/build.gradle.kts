@@ -12,6 +12,8 @@ android {
     }
 
     // Compile the real sources in place rather than copying them.
+    testOptions.unitTests.isReturnDefaultValues = true
+    sourceSets["test"].java.srcDirs("../src/test/java")
     sourceSets["main"].java.srcDirs("../src/main/java")
     sourceSets["main"].manifest.srcFile("../src/main/AndroidManifest.xml")
 
@@ -33,4 +35,7 @@ dependencies {
     implementation("androidx.core:core-ktx:1.9.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     implementation(project(":tauri-android"))
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.mockito:mockito-core:5.14.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
 }
