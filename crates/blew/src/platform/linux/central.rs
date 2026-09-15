@@ -3,8 +3,8 @@ use crate::central::types::{CentralConfig, CentralEvent, DisconnectCause, ScanFi
 use crate::error::{BlewError, BlewResult};
 use crate::gatt::props::{AttributePermissions, CharacteristicProperties};
 use crate::gatt::service::{GattCharacteristic, GattService};
-use crate::l2cap::{L2capChannel, types::Psm};
-use crate::platform::linux::l2cap::bridge_l2cap;
+use crate::l2cap::{L2capChannel, L2capEncryption, types::Psm};
+use crate::platform::linux::l2cap::{apply_security, bridge_l2cap};
 use crate::types::{BleDevice, DeviceId};
 use crate::util::BroadcastEventStream;
 use bluer::gatt::CharacteristicFlags;
@@ -42,6 +42,7 @@ struct CentralInner {
     connected: Mutex<HashSet<DeviceId>>,
     adapter_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     connect_timeout: Mutex<Option<std::time::Duration>>,
+    l2cap_encryption: Mutex<L2capEncryption>,
     pending_connects: crate::util::request_map::KeyedRequestMap<DeviceId, ()>,
 }
 
@@ -297,6 +298,7 @@ impl LinuxCentral {
     pub async fn with_config(config: CentralConfig) -> crate::error::BlewResult<Self> {
         let this = Self::new().await?;
         *this.0.connect_timeout.lock() = config.connect_timeout;
+        *this.0.l2cap_encryption.lock() = config.l2cap.encryption;
         Ok(this)
     }
 }
@@ -462,6 +464,7 @@ impl CentralBackend for LinuxCentral {
             _session: session,
             adapter,
             connect_timeout: Mutex::new(None),
+            l2cap_encryption: Mutex::new(L2capEncryption::default()),
             pending_connects: crate::util::request_map::KeyedRequestMap::new(),
             discovered: Mutex::new(HashMap::new()),
             mtu_cache: Mutex::new(HashMap::new()),
@@ -831,19 +834,12 @@ impl CentralBackend for LinuxCentral {
             let socket_addr = bluer::l2cap::SocketAddr::new(addr, addr_type, psm.0);
             // Brief delay to ensure ACL connection is ready before L2CAP CoC setup
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            // Use low-level Socket API to explicitly set security to Low,
-            // preventing BlueZ from triggering a pairing request.
+            // Use the low-level Socket API so BT_SECURITY is set explicitly
+            // rather than left to BlueZ's default.
             let socket = bluer::l2cap::Socket::new_stream().map_err(|e| BlewError::L2cap {
                 source: Box::new(e),
             })?;
-            socket
-                .set_security(bluer::l2cap::Security {
-                    level: bluer::l2cap::SecurityLevel::Low,
-                    key_size: 0,
-                })
-                .map_err(|e| BlewError::L2cap {
-                    source: Box::new(e),
-                })?;
+            apply_security(&socket, *handle.l2cap_encryption.lock())?;
             // Advertise a large receive MPS so the peer can send bigger PDUs.
             socket.set_recv_mtu(65535).map_err(|e| BlewError::L2cap {
                 source: Box::new(e),

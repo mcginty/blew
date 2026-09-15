@@ -18,7 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{BlewError, BlewResult};
-use crate::l2cap::types::{L2capCloseReason, L2capConfig, Psm};
+use crate::l2cap::types::{L2capCloseReason, L2capConfig, L2capEncryption, Psm};
 use crate::l2cap::{CloseReasonSlot, DuplexBridge, L2capChannel};
 use crate::types::DeviceId;
 
@@ -116,6 +116,31 @@ pub(crate) fn set_server_config(config: L2capConfig) {
     if let Some(s) = STATE.get() {
         *s.server_config.lock() = config;
     }
+}
+
+/// Whether Kotlin should take the `secure` branch of the L2CAP socket APIs.
+///
+/// `BluetoothDevice::createL2capChannel` / `BluetoothAdapter::listenUsingL2capChannel`
+/// require an authenticated, encrypted link; the `Insecure` variants require
+/// neither. There is no middle setting, so `RequireEncryption` gets the secure
+/// socket too — stronger than asked for, which is the safe direction to round.
+fn secure_flag(config: &L2capConfig) -> bool {
+    match config.encryption {
+        L2capEncryption::Insecure => false,
+        L2capEncryption::RequireEncryption | L2capEncryption::RequireAuthentication => true,
+    }
+}
+
+pub(crate) fn client_secure() -> bool {
+    STATE
+        .get()
+        .is_some_and(|s| secure_flag(&s.client_config.lock()))
+}
+
+pub(crate) fn server_secure() -> bool {
+    STATE
+        .get()
+        .is_some_and(|s| secure_flag(&s.server_config.lock()))
 }
 
 pub(crate) fn set_pending_server(tx: oneshot::Sender<BlewResult<Psm>>) {

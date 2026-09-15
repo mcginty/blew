@@ -706,6 +706,7 @@ impl CentralBackend for AndroidCentral {
         let addr = device_id.as_str().to_owned();
         let id_for_err = device_id.clone();
         async move {
+            let secure = super::l2cap_state::client_secure();
             let (tx, rx) = oneshot::channel();
             super::l2cap_state::set_pending_open(addr.clone(), tx);
 
@@ -715,8 +716,12 @@ impl CentralBackend for AndroidCentral {
                     env.call_static_method(
                         central_class(),
                         jni_str!("openL2capChannel"),
-                        jni_sig!("(Ljava/lang/String;I)V"),
-                        &[(&j_addr).into(), i32::from(psm.value()).into()],
+                        jni_sig!("(Ljava/lang/String;IZ)V"),
+                        &[
+                            (&j_addr).into(),
+                            i32::from(psm.value()).into(),
+                            secure.into(),
+                        ],
                     )?;
                     Ok(())
                 })

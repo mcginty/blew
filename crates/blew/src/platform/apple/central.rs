@@ -50,7 +50,7 @@ use crate::central::types::{CentralConfig, CentralEvent, DisconnectCause, ScanFi
 use crate::error::{BlewError, BlewResult};
 use crate::gatt::props::{AttributePermissions, CharacteristicProperties};
 use crate::gatt::service::{GattCharacteristic, GattService};
-use crate::l2cap::{L2capChannel, types::Psm};
+use crate::l2cap::{L2capChannel, L2capEncryption, types::Psm};
 use crate::platform::apple::helpers::{
     ObjcSend, cbuuid_to_uuid, peripheral_device_id, retain_send, uuid_to_cbuuid,
 };
@@ -991,6 +991,14 @@ impl CentralBackend for AppleCentral {
         let device_id = device_id.clone();
         async move {
             debug!(device_id = %device_id, psm = psm.0, "opening L2CAP channel");
+            let encryption = handle.inner.l2cap_config.lock().encryption;
+            if encryption != L2capEncryption::Insecure {
+                return Err(BlewError::L2capEncryptionUnsupported {
+                    requested: encryption,
+                    reason: "CoreBluetooth's openL2CAPChannel: takes no security \
+                             argument — the publishing peripheral decides",
+                });
+            }
             let id_for_err = device_id.clone();
             let rx = {
                 let peripheral = handle

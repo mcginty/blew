@@ -462,13 +462,14 @@ impl PeripheralBackend for AndroidPeripheral {
         let (accept_tx, accept_rx) = mpsc::unbounded_channel();
         super::l2cap_state::set_accept_tx(accept_tx);
 
+        let secure = super::l2cap_state::server_secure();
         jvm()
             .attach_current_thread(|env| {
                 env.call_static_method(
                     peripheral_class(),
                     jni_str!("openL2capServer"),
-                    jni_sig!("()V"),
-                    &[],
+                    jni_sig!("(Z)V"),
+                    &[secure.into()],
                 )?;
                 Ok(())
             })

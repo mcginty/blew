@@ -1,13 +1,13 @@
 use crate::error::{BlewError, BlewResult};
 use crate::gatt::props::CharacteristicProperties;
 use crate::gatt::service::GattService;
-use crate::l2cap::{L2capChannel, types::Psm};
+use crate::l2cap::{L2capChannel, L2capEncryption, types::Psm};
 use crate::peripheral::backend::{self, PeripheralBackend};
 use crate::peripheral::types::{
     AdvertisingConfig, PeripheralConfig, PeripheralRequest, PeripheralStateEvent, ReadResponder,
     WriteResponder,
 };
-use crate::platform::linux::l2cap::bridge_l2cap;
+use crate::platform::linux::l2cap::{apply_security, bridge_l2cap};
 use crate::types::DeviceId;
 use crate::util::BroadcastEventStream;
 use bluer::adv::{Advertisement, SecondaryChannel, Type as AdvType};
@@ -42,35 +42,33 @@ struct PeripheralInner {
     request_tx: mpsc::UnboundedSender<PeripheralRequest>,
     request_rx: Mutex<Option<mpsc::UnboundedReceiver<PeripheralRequest>>>,
     state_tx: broadcast::Sender<PeripheralStateEvent>,
+    l2cap_encryption: Mutex<L2capEncryption>,
     _adapter_task: tokio::task::JoinHandle<()>,
 }
 
 pub struct LinuxPeripheral(Arc<PeripheralInner>);
 
 impl LinuxPeripheral {
-    pub async fn with_config(_config: PeripheralConfig) -> BlewResult<Self> {
-        <Self as PeripheralBackend>::new().await
+    pub async fn with_config(config: PeripheralConfig) -> BlewResult<Self> {
+        let this = <Self as PeripheralBackend>::new().await?;
+        *this.0.l2cap_encryption.lock() = config.l2cap.encryption;
+        Ok(this)
     }
 
     #[allow(clippy::type_complexity)]
-    fn bind_l2cap_listener() -> BlewResult<(
+    fn bind_l2cap_listener(
+        encryption: L2capEncryption,
+    ) -> BlewResult<(
         Psm,
         impl futures_core::Stream<Item = BlewResult<(DeviceId, L2capChannel)>> + Send + 'static,
     )> {
-        debug!("starting L2CAP CoC listener");
-        // Use low-level Socket API to explicitly set security to Low,
-        // preventing BlueZ from triggering a pairing request.
+        debug!(%encryption, "starting L2CAP CoC listener");
+        // Use the low-level Socket API so BT_SECURITY is set explicitly rather
+        // than left to BlueZ's default.
         let socket = bluer::l2cap::Socket::new_stream().map_err(|e| BlewError::L2cap {
             source: Box::new(e),
         })?;
-        socket
-            .set_security(bluer::l2cap::Security {
-                level: bluer::l2cap::SecurityLevel::Low,
-                key_size: 0,
-            })
-            .map_err(|e| BlewError::L2cap {
-                source: Box::new(e),
-            })?;
+        apply_security(&socket, encryption)?;
         // Advertise a large receive MPS so the peer can send bigger PDUs.
         socket.set_recv_mtu(65535).map_err(|e| BlewError::L2cap {
             source: Box::new(e),
@@ -335,6 +333,7 @@ impl PeripheralBackend for LinuxPeripheral {
             request_tx,
             request_rx: Mutex::new(Some(request_rx)),
             state_tx,
+            l2cap_encryption: Mutex::new(L2capEncryption::default()),
             _adapter_task: adapter_task,
         })))
     }
@@ -509,7 +508,7 @@ impl PeripheralBackend for LinuxPeripheral {
         // Nothing here awaits: binding the listener is synchronous and the
         // accept loop runs in its own task. Kept fallible in a helper so `?`
         // still reads naturally.
-        std::future::ready(Self::bind_l2cap_listener())
+        std::future::ready(Self::bind_l2cap_listener(*self.0.l2cap_encryption.lock()))
     }
 
     fn state_events(&self) -> Self::StateEvents {

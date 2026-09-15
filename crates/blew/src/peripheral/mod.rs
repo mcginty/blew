@@ -99,6 +99,10 @@ impl<B: PeripheralBackend> Peripheral<B> {
 
     /// Publish an L2CAP CoC channel.  Returns the OS-assigned PSM and a stream
     /// of incoming [`L2capChannel`] connections.
+    ///
+    /// Link security comes from
+    /// [`PeripheralConfig::l2cap`](crate::peripheral::PeripheralConfig::l2cap)'s
+    /// [`encryption`](crate::L2capConfig::encryption).
     pub async fn l2cap_listener(
         &self,
     ) -> BlewResult<(

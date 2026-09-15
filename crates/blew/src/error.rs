@@ -98,6 +98,16 @@ pub enum BlewError {
         source: Box<dyn Error + Send + Sync>,
     },
 
+    /// The configured [`L2capEncryption`](crate::L2capEncryption) level has no
+    /// equivalent in this platform's L2CAP API. The backend refuses rather than
+    /// substituting a weaker level, which would hand back a channel that is
+    /// less protected than the caller asked for.
+    #[error("L2CAP encryption level '{requested}' is unavailable here: {reason}")]
+    L2capEncryptionUnsupported {
+        requested: crate::l2cap::L2capEncryption,
+        reason: &'static str,
+    },
+
     #[error("internal error: {0}")]
     Internal(String),
 }

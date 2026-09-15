@@ -78,7 +78,7 @@ crates/blew/src/
 ├── l2cap/
 │   ├── mod.rs                    # L2capChannel (AsyncRead + AsyncWrite), DuplexBridge,
 │   │                             #   CloseReasonSlot, flush-on-close
-│   └── types.rs                  # Psm(u16), L2capConfig, L2capCloseReason
+│   └── types.rs                  # Psm(u16), L2capConfig, L2capEncryption, L2capCloseReason
 ├── platform/
 │   ├── mod.rs                    # #[cfg] type aliases: PlatformCentral, PlatformPeripheral
 │   ├── apple/
@@ -173,6 +173,17 @@ rx.await...
 - Draining the inbound queue frees the capacity a paused `pump_input` is waiting on, and produces no event either: `hasBytesAvailable` is a level, not an edge, so the unread bytes that caused the pause generate no new notification. The inbound bridge marks after each delivery. Removing that stalls reads until the backstop.
 
 **L2CAP close invariant:** exactly one `ReactorCmd::Close` per channel. `DuplexTransport::trigger_close` uses `Option::take` on the close hook so `.close().await` and `Drop` both route to the same single-fire path. **Do not** add defensive `ReactorCmd::Close` sends from the bridge tasks — the hook is the only sender. Closing is a *lingering* close: the hook does not tear the channel down, it asks the backend to stop once drained. Apple sets `closing_since` and keeps pumping output until the queue empties or `L2capConfig::linger_timeout` passes (`linger_finished`); Android lets its outbound task close the socket when it drains, with a delayed force-close as the backstop. `close()` and `Drop` therefore behave identically, which is deliberate — a transport that only kept queued data when you remembered to call `close()` would be a trap. Note that a closing Apple channel stops pumping *input*: its inbound queue is usually already dropped, which would otherwise read as a teardown reason and defeat the linger.
+
+**L2CAP encryption invariant.** `L2capConfig::encryption` (`L2capEncryption`) is
+read from `CentralConfig::l2cap` on open and `PeripheralConfig::l2cap` on
+publish. Platforms are coarser than the three-level enum, so a backend picks the
+nearest level it can express that is **never weaker** than requested, and returns
+`BlewError::L2capEncryptionUnsupported` when there is none. **Do not** map an
+unsupported level onto a weaker one to avoid the error path — silently
+under-delivering a security guarantee is the bug this rule exists to prevent.
+Rounding *up* is fine (Android's single secure socket serves `RequireEncryption`).
+The default is `Insecure`, matching what every backend hardcoded before 0.4.0;
+don't raise it without a major bump.
 
 **L2CAP accept channel policy.** This governs the *accept* path only — the
 stream of newly-arrived channels. Every L2CAP **data** path is bounded; see the

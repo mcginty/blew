@@ -158,6 +158,10 @@ impl<B: CentralBackend> Central<B> {
     }
 
     /// Open an L2CAP CoC channel to a connected peripheral.
+    ///
+    /// Link security comes from
+    /// [`CentralConfig::l2cap`](crate::central::CentralConfig::l2cap)'s
+    /// [`encryption`](crate::L2capConfig::encryption).
     pub async fn open_l2cap_channel(
         &self,
         device_id: &DeviceId,

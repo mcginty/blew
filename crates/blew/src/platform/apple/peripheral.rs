@@ -47,7 +47,7 @@ use tracing::{debug, trace, warn};
 use crate::error::{BlewError, BlewResult};
 use crate::gatt::props::{AttributePermissions, CharacteristicProperties};
 use crate::gatt::service::GattService;
-use crate::l2cap::{L2capChannel, types::Psm};
+use crate::l2cap::{L2capChannel, L2capEncryption, types::Psm};
 use crate::peripheral::backend::{self, PeripheralBackend};
 use crate::peripheral::types::{
     AdvertisingConfig, PeripheralConfig, PeripheralRequest, PeripheralStateEvent, ReadResponder,
@@ -98,6 +98,23 @@ fn our_perms_to_cb(perms: AttributePermissions) -> CBAttributePermissions {
         out |= CBAttributePermissions::WriteEncryptionRequired;
     }
     out
+}
+
+/// The `encryptionRequired:` argument for `publishL2CAPChannelWithEncryption:`.
+///
+/// CoreBluetooth offers one bit, so `RequireAuthentication` has no expressible
+/// form: publishing with encryption demands an encrypted link but says nothing
+/// about whether the pairing that produced the key was MITM-protected.
+fn publish_encryption_flag(encryption: L2capEncryption) -> BlewResult<bool> {
+    match encryption {
+        L2capEncryption::Insecure => Ok(false),
+        L2capEncryption::RequireEncryption => Ok(true),
+        other => Err(BlewError::L2capEncryptionUnsupported {
+            requested: other,
+            reason: "publishL2CAPChannelWithEncryption: is a single boolean and \
+                     cannot demand an authenticated pairing",
+        }),
+    }
 }
 
 /// A notification CoreBluetooth refused because its transmit queue was full.
@@ -963,13 +980,15 @@ impl PeripheralBackend for ApplePeripheral {
     > + Send {
         let handle = Arc::clone(&self.0);
         async move {
-            debug!("publishing L2CAP CoC channel");
+            let encryption = handle.inner.l2cap_config.lock().encryption;
+            let encrypted = publish_encryption_flag(encryption)?;
+            debug!(%encryption, "publishing L2CAP CoC channel");
             let (ch_tx, ch_rx) = mpsc::unbounded_channel::<BlewResult<(DeviceId, L2capChannel)>>();
             let (pub_tx, pub_rx) = oneshot::channel::<BlewResult<Psm>>();
             {
                 *handle.inner.l2cap_channel_tx.lock() = Some(ch_tx);
                 *handle.inner.l2cap_publish_tx.lock() = Some(pub_tx);
-                unsafe { handle.manager.publishL2CAPChannelWithEncryption(false) };
+                unsafe { handle.manager.publishL2CAPChannelWithEncryption(encrypted) };
             }
             let psm = pub_rx.await.unwrap_or(Err(BlewError::Internal(
                 "l2cap_publish channel dropped".into(),
@@ -1000,5 +1019,30 @@ impl ApplePeripheral {
     #[must_use]
     pub fn take_restored(&self) -> Option<Vec<Uuid>> {
         self.0.inner.restored.lock().take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encryption_maps_to_the_publish_flag() {
+        assert!(!publish_encryption_flag(L2capEncryption::Insecure).unwrap());
+        assert!(publish_encryption_flag(L2capEncryption::RequireEncryption).unwrap());
+    }
+
+    #[test]
+    fn authentication_is_refused_rather_than_downgraded() {
+        // CoreBluetooth can't demand MITM protection, and handing back a
+        // merely-encrypted channel would be weaker than what was asked for.
+        let err = publish_encryption_flag(L2capEncryption::RequireAuthentication).unwrap_err();
+        assert!(matches!(
+            err,
+            BlewError::L2capEncryptionUnsupported {
+                requested: L2capEncryption::RequireAuthentication,
+                ..
+            }
+        ));
     }
 }
