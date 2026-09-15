@@ -40,6 +40,51 @@ pub const MIN_L2CAP_BUFFER_SIZE: usize = 1024;
 /// makes no progress either.
 pub const MIN_L2CAP_READ_CHUNK_SIZE: usize = 64;
 
+/// Link security demanded of an L2CAP CoC channel.
+///
+/// Platforms express this at very different resolutions, so a backend maps the
+/// requested level onto the nearest level its API can express that is **never
+/// weaker** than what was asked for. Where no such level exists the backend
+/// returns
+/// [`BlewError::L2capEncryptionUnsupported`](crate::error::BlewError::L2capEncryptionUnsupported)
+/// rather than quietly handing back a less protected channel.
+///
+/// | | `Insecure` | `RequireEncryption` | `RequireAuthentication` |
+/// |---|---|---|---|
+/// | Apple peripheral | `publishL2CAPChannelWithEncryption:NO` | `…WithEncryption:YES` | unsupported |
+/// | Apple central | `openL2CAPChannel:` | unsupported | unsupported |
+/// | Android | `…InsecureL2capChannel` | `…L2capChannel` (stronger) | `…L2capChannel` |
+/// | Linux | `BT_SECURITY_LOW` | `BT_SECURITY_MEDIUM` | `BT_SECURITY_HIGH` |
+///
+/// CoreBluetooth's central role has no security knob at all — the publishing
+/// peripheral decides, and the central can neither demand nor verify it — so
+/// anything other than [`Insecure`](Self::Insecure) is refused there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum L2capEncryption {
+    /// No link security requested: the channel may carry plaintext over an
+    /// unbonded link. This is the default, and what every backend did before
+    /// the setting existed.
+    #[default]
+    Insecure,
+    /// The link must be encrypted. Unauthenticated ("Just Works") pairing
+    /// satisfies this.
+    RequireEncryption,
+    /// The link must be encrypted *and* the pairing authenticated
+    /// (MITM-protected).
+    RequireAuthentication,
+}
+
+impl std::fmt::Display for L2capEncryption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Insecure => "insecure",
+            Self::RequireEncryption => "require-encryption",
+            Self::RequireAuthentication => "require-authentication",
+        })
+    }
+}
+
 /// Tuning for a single L2CAP channel.
 ///
 /// Construct with `..Default::default()` so a new field costs you one
@@ -47,11 +92,13 @@ pub const MIN_L2CAP_READ_CHUNK_SIZE: usize = 64;
 ///
 /// # Platform caveats
 ///
-/// **Linux observes none of these.** `bluer::l2cap::Stream` is already an async
-/// byte stream, so the backend hands it to the caller directly and the kernel
-/// socket buffers provide flow control. There is no in-process bridge to size
-/// and nothing queued locally to flush. Apple and Android both marshal bytes
-/// between a platform socket and the async world, so they observe all three.
+/// **Linux observes none of the buffering fields.** `bluer::l2cap::Stream` is
+/// already an async byte stream, so the backend hands it to the caller directly
+/// and the kernel socket buffers provide flow control. There is no in-process
+/// bridge to size and nothing queued locally to flush. Apple and Android both
+/// marshal bytes between a platform socket and the async world, so they observe
+/// all three. [`encryption`](Self::encryption) is honoured everywhere; see
+/// [`L2capEncryption`] for how each platform coarsens it.
 #[derive(Debug, Clone)]
 pub struct L2capConfig {
     /// Bytes buffered in each direction between the application and the
@@ -91,6 +138,13 @@ pub struct L2capConfig {
     /// Note this is delivery to the *platform socket*, not acknowledgement by
     /// the peer. Nothing here waits for the far end to read.
     pub linger_timeout: Option<Duration>,
+    /// Link security demanded when publishing or opening a channel.
+    ///
+    /// Defaults to [`L2capEncryption::Insecure`], which is what every backend
+    /// did before this field existed. Raising it can make the platform trigger
+    /// pairing on the first channel, and a backend that cannot express the
+    /// requested level fails the call rather than substituting a weaker one.
+    pub encryption: L2capEncryption,
 }
 
 // Only the bridged backends size a buffer; Linux hands `bluer::l2cap::Stream`
@@ -122,6 +176,7 @@ impl Default for L2capConfig {
             buffer_size: DEFAULT_L2CAP_BUFFER_SIZE,
             read_chunk_size: DEFAULT_L2CAP_READ_CHUNK_SIZE,
             linger_timeout: Some(DEFAULT_L2CAP_LINGER_TIMEOUT),
+            encryption: L2capEncryption::Insecure,
         }
     }
 }
@@ -172,6 +227,13 @@ mod tests {
             config.effective_read_chunk_size(),
             DEFAULT_L2CAP_READ_CHUNK_SIZE
         );
+    }
+
+    #[test]
+    fn encryption_defaults_to_insecure() {
+        // Raising this default would silently start triggering pairing for
+        // every existing caller, so it stays put until a major bump.
+        assert_eq!(L2capConfig::default().encryption, L2capEncryption::Insecure);
     }
 
     #[test]

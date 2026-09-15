@@ -660,7 +660,7 @@ object BlePeripheralManager {
     // ── L2CAP ──
 
     @JvmStatic
-    fun openL2capServer() {
+    fun openL2capServer(secure: Boolean) {
         if (android.os.Build.VERSION.SDK_INT < 29) {
             nativeOnL2capServerError("L2CAP requires API 29+")
             return
@@ -673,7 +673,12 @@ object BlePeripheralManager {
             }
 
         try {
-            val serverSocket = adapter.listenUsingInsecureL2capChannel()
+            val serverSocket =
+                if (secure) {
+                    adapter.listenUsingL2capChannel()
+                } else {
+                    adapter.listenUsingInsecureL2capChannel()
+                }
             l2capServerSocket = serverSocket
             val psm = serverSocket.psm
             nativeOnL2capServerOpened(psm)

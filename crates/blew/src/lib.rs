@@ -126,6 +126,6 @@ pub mod util;
 
 pub use central::{Central, CentralConfig, DisconnectCause};
 pub use error::{BlewError, BlewResult};
-pub use l2cap::{L2capChannel, L2capCloseReason, L2capConfig, Psm};
+pub use l2cap::{L2capChannel, L2capCloseReason, L2capConfig, L2capEncryption, Psm};
 pub use peripheral::Peripheral;
 pub use types::{BleDevice, DeviceId};

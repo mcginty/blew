@@ -1,6 +1,6 @@
 pub mod types;
 
-pub use types::{L2capCloseReason, L2capConfig, Psm};
+pub use types::{L2capCloseReason, L2capConfig, L2capEncryption, Psm};
 
 use std::future::poll_fn;
 use std::pin::Pin;

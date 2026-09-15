@@ -388,6 +388,7 @@ object BleCentralManager {
     fun openL2capChannel(
         deviceAddr: String,
         psm: Int,
+        secure: Boolean,
     ) {
         if (android.os.Build.VERSION.SDK_INT < 29) {
             nativeOnL2capChannelError(deviceAddr, "L2CAP requires API 29+")
@@ -404,7 +405,12 @@ object BleCentralManager {
         // dispatcher rather than on a raw thread per channel.
         scope.launch(Dispatchers.IO) {
             try {
-                val socket = device.createInsecureL2capChannel(psm)
+                val socket =
+                    if (secure) {
+                        device.createL2capChannel(psm)
+                    } else {
+                        device.createInsecureL2capChannel(psm)
+                    }
                 socket.connect()
                 val socketId = l2cap.register(socket)
                 nativeOnL2capChannelOpened(deviceAddr, socketId, false)

@@ -5,6 +5,29 @@ All notable changes to `blew` are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **L2CAP channel encryption is configurable via `L2capConfig::encryption`.**
+  ([#19](https://github.com/mcginty/blew/issues/19)) Every backend used to
+  hardcode the weakest setting — `publishL2CAPChannelWithEncryption(false)` on
+  Apple, `listenUsingInsecureL2capChannel()` / `createInsecureL2capChannel()` on
+  Android, `BT_SECURITY_LOW` on Linux — with no way to ask for anything else.
+  The new `L2capEncryption` enum (`Insecure`, `RequireEncryption`,
+  `RequireAuthentication`) is read from `CentralConfig::l2cap` when opening a
+  channel and from `PeripheralConfig::l2cap` when publishing a listener. The
+  default stays `Insecure`, so nothing changes unless you set it.
+
+  Platforms are far coarser than the enum, so a backend picks the nearest level
+  it can express that is never *weaker* than what was requested, and returns the
+  new `BlewError::L2capEncryptionUnsupported` when no such level exists rather
+  than quietly handing back a less protected channel. Concretely: Linux maps the
+  three levels onto `BT_SECURITY_LOW` / `MEDIUM` / `HIGH` exactly; Android has
+  only insecure-vs-secure, so `RequireEncryption` gets the secure socket too
+  (stronger than asked); Apple's peripheral role takes a single boolean and so
+  refuses `RequireAuthentication`; and CoreBluetooth's `openL2CAPChannel:` has
+  no security argument at all, so the Apple central role refuses anything but
+  `Insecure`.
+
 ### Changed
 
 - **`AdvertisingConfig::local_name` is now `Option<String>`, defaulting to no
@@ -767,6 +790,24 @@ use blew::{CentralConfig, L2capConfig};
 let config = CentralConfig {
     l2cap: L2capConfig {
         buffer_size: 128 * 1024,
+        ..Default::default()
+    },
+    ..Default::default()
+};
+```
+
+`L2capConfig` also carries `encryption`, which defaults to
+`L2capEncryption::Insecure` — the level every backend hardcoded before 0.4.0.
+Raising it makes the platform demand a secured link, and a backend that cannot
+express the level you asked for fails the call with
+`BlewError::L2capEncryptionUnsupported` rather than substituting a weaker one:
+
+```rust
+use blew::{L2capConfig, L2capEncryption, PeripheralConfig};
+
+let config = PeripheralConfig {
+    l2cap: L2capConfig {
+        encryption: L2capEncryption::RequireEncryption,
         ..Default::default()
     },
     ..Default::default()
