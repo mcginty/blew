@@ -164,7 +164,16 @@ impl WriteResponder {
 /// is available on [`BleDevice::manufacturer_data`](crate::BleDevice).
 #[derive(Debug, Clone, Default)]
 pub struct AdvertisingConfig {
-    pub local_name: String,
+    /// Name to advertise. `None`, the default, puts no name in the advertising
+    /// data, leaving its byte budget to the service UUIDs; peers identify the
+    /// peripheral by those instead. The OS may still expose the device name
+    /// through the GAP Device Name characteristic once a peer connects.
+    ///
+    /// **Android:** `Some` renames the device's Bluetooth adapter, because
+    /// `AdvertiseData` can only include the adapter's own name. The rename is
+    /// device-global and persistent -- it appears in system Settings and to
+    /// every Bluetooth peer -- and is not undone by `stop_advertising`.
+    pub local_name: Option<String>,
     pub service_uuids: Vec<Uuid>,
 }
 

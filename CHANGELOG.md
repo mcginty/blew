@@ -5,6 +5,20 @@ All notable changes to `blew` are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **`AdvertisingConfig::local_name` is now `Option<String>`, defaulting to no
+  name.** ([#29](https://github.com/mcginty/blew/issues/29)) Every
+  advertisement used to carry a name. On Android that meant renaming the
+  device's Bluetooth adapter — `AdvertiseData` can only include the adapter's
+  own name — which is device-global, persists after `stop_advertising()`, and
+  shows up in system Settings and to every Bluetooth peer. On every backend
+  the name also competed with a 128-bit service UUID for the 31-byte legacy
+  advertisement. With `None`, Android leaves the adapter name alone and sends
+  no scan response, Linux omits the name from the advertisement, and Apple
+  omits `CBAdvertisementDataLocalNameKey`. `Some(name)` keeps the previous
+  behaviour on every backend, including the Android rename.
+
 ### Fixed
 
 - **Android: connection ownership now spans the entire GATT lifecycle.**
@@ -762,6 +776,32 @@ PeripheralRequest::Write { client_id, char_uuid, offset, value, responder, .. } 
 
 `offset` is `0` for ordinary writes, so applications that never receive a
 payload larger than `MTU - 3` can keep treating `value` as the whole value.
+
+**If you were setting `AdvertisingConfig::local_name`**, it is now an
+`Option<String>`:
+
+```rust
+// Before
+let config = AdvertisingConfig {
+    local_name: "my-device".into(),
+    service_uuids: vec![SVC_UUID],
+};
+
+// After — keep a name
+let config = AdvertisingConfig {
+    local_name: Some("my-device".into()),
+    service_uuids: vec![SVC_UUID],
+};
+
+// After — or advertise none, and identify the peripheral by its service UUID
+let config = AdvertisingConfig {
+    service_uuids: vec![SVC_UUID],
+    ..Default::default()
+};
+```
+
+On Android, `Some(name)` renames the device's Bluetooth adapter, as the old
+field always did. Prefer `None` unless peers genuinely need the name.
 
 ---
 

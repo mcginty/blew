@@ -288,7 +288,7 @@ impl CentralBackend for MockCentral {
         let tx = self.event_tx.clone();
         async move {
             if advertising {
-                let name = adv_config.map(|c| c.local_name);
+                let name = adv_config.and_then(|c| c.local_name);
                 let _ = tx.send(CentralEvent::DeviceDiscovered(BleDevice {
                     id: DeviceId::from("mock-peripheral"),
                     name,
@@ -859,7 +859,7 @@ mod tests {
 
         peripheral
             .start_advertising(&AdvertisingConfig {
-                local_name: "test".into(),
+                local_name: Some("test".into()),
                 service_uuids: vec![svc_uuid],
             })
             .await
@@ -879,6 +879,34 @@ mod tests {
                 assert_eq!(device.name.as_deref(), Some("test"));
                 assert!(device.services.contains(&svc_uuid));
             }
+            other => panic!("expected DeviceDiscovered, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mock_link_discovery_without_name() {
+        let (c, p) = MockLink::pair();
+        let central = Central::from_backend(c.central);
+        let peripheral = Peripheral::from_backend(p.peripheral);
+
+        let svc_uuid = Uuid::from_u128(0x1234);
+        peripheral
+            .start_advertising(&AdvertisingConfig {
+                service_uuids: vec![svc_uuid],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let mut events = central.events();
+        assert!(matches!(
+            events.next().await.unwrap(),
+            CentralEvent::AdapterStateChanged { powered: true }
+        ));
+        central.start_scan(ScanFilter::default()).await.unwrap();
+
+        match events.next().await.expect("should get discovery event") {
+            CentralEvent::DeviceDiscovered(device) => assert_eq!(device.name, None),
             other => panic!("expected DeviceDiscovered, got {other:?}"),
         }
     }
@@ -1161,7 +1189,7 @@ mod tests {
         let peripheral = Peripheral::from_backend(p.peripheral);
 
         let config = AdvertisingConfig {
-            local_name: "test".into(),
+            local_name: Some("test".into()),
             service_uuids: vec![],
         };
 
@@ -1527,7 +1555,7 @@ mod tests {
         let peripheral = Peripheral::from_backend(p.peripheral);
 
         let config = AdvertisingConfig {
-            local_name: "test".into(),
+            local_name: Some("test".into()),
             service_uuids: vec![],
         };
 

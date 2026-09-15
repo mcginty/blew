@@ -192,7 +192,10 @@ async fn drive_advertising(
 
     let code: i32 = jvm()
         .attach_current_thread(|env| {
-            let name = env.new_string(&config.local_name)?;
+            let name = match &config.local_name {
+                Some(name) => JObject::from(env.new_string(name)?),
+                None => JObject::null(),
+            };
 
             let string_class = env.find_class(jni_str!("java/lang/String"))?;
             let uuids: JObjectArray =

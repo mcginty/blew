@@ -436,13 +436,13 @@ object BlePeripheralManager {
      */
     @JvmStatic
     fun startAdvertising(
-        name: String,
+        name: String?,
         serviceUuids: Array<String>,
         requestId: Int,
     ): Int = synchronized(advertiseLock) { startAdvertisingLocked(name, serviceUuids, requestId) }
 
     private fun startAdvertisingLocked(
-        name: String,
+        name: String?,
         serviceUuids: Array<String>,
         requestId: Int,
     ): Int {
@@ -465,7 +465,12 @@ object BlePeripheralManager {
         advertiser = adv
         advertiseRequestId = requestId
 
-        bluetoothManager?.adapter?.name = name
+        // AdvertiseData can only carry the adapter's own name, so a custom
+        // name means renaming the adapter device-wide. Only do that when the
+        // caller asked for a name.
+        if (name != null) {
+            bluetoothManager?.adapter?.name = name
+        }
 
         val settings =
             AdvertiseSettings
@@ -486,10 +491,12 @@ object BlePeripheralManager {
 
         // Scan response can carry the device name.
         val scanResponse =
-            AdvertiseData
-                .Builder()
-                .setIncludeDeviceName(true)
-                .build()
+            name?.let {
+                AdvertiseData
+                    .Builder()
+                    .setIncludeDeviceName(true)
+                    .build()
+            }
 
         advertiseCallback =
             object : AdvertiseCallback() {

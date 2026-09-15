@@ -372,7 +372,7 @@ impl PeripheralBackend for LinuxPeripheral {
             if handle.adv_handle.lock().is_some() {
                 return Err(BlewError::AlreadyAdvertising);
             }
-            debug!(local_name = %config.local_name, "starting advertising");
+            debug!(local_name = ?config.local_name, "starting advertising");
 
             let pending: Vec<GattService> = handle.pending_services.lock().clone();
             let bluer_services: Vec<Service> = pending
@@ -413,7 +413,7 @@ impl PeripheralBackend for LinuxPeripheral {
             // doesn't support extended advertising (BLE 4.x adapters).
             let make_adv = |secondary_channel| Advertisement {
                 advertisement_type: AdvType::Peripheral,
-                local_name: Some(config.local_name.clone()),
+                local_name: config.local_name.clone(),
                 service_uuids: config.service_uuids.clone().into_iter().collect(),
                 secondary_channel,
                 ..Default::default()

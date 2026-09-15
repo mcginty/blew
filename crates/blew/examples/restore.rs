@@ -120,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             peripheral
                 .start_advertising(&AdvertisingConfig {
-                    local_name: "blew-restore".into(),
+                    local_name: Some("blew-restore".into()),
                     service_uuids: vec![SVC_UUID],
                 })
                 .await?;
