@@ -165,14 +165,22 @@ async fn follow_the_air(
         tokio::select! {
             event = discovery.next() => match event {
                 Some(AdapterEvent::DeviceAdded(addr)) => {
+                    // Subscribe before snapshotting: `Device::events()` replays no
+                    // current state, so a change arriving during the snapshot's D-Bus
+                    // round trips would be lost with no way to recover it.
+                    match watch_the_advertisement(&handle.adapter, addr).await {
+                        Ok(changes) => {
+                            watched_advertisements.insert(addr, changes);
+                        }
+                        Err(e) => {
+                            warn!(device_id = %addr, "failed to watch advertisement: {e}");
+                        }
+                    }
                     let Some(device) =
                         what_the_device_advertises_so_far(&handle.adapter, addr).await
                     else {
                         continue;
                     };
-                    if let Ok(changes) = watch_the_advertisement(&handle.adapter, addr).await {
-                        watched_advertisements.insert(addr, changes);
-                    }
                     debug!(device_id = %device.id, name = ?device.name, rssi = ?device.rssi,
                         "device discovered");
                     handle.discovered.lock().insert(device.id.clone(), device.clone());
