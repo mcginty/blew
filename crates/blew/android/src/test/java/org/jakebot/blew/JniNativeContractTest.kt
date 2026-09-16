@@ -108,9 +108,16 @@ class JniNativeContractTest {
                 }
 
                 val types = params.split(',').map { it.substringAfter(':').trim() }.filter { it.isNotEmpty() }
-                if (types.size < 2 || rustTypeName(types[1]) != "JClass") {
+                if (types.size < 2) {
                     failures += "$origin: $symbol must take (env, JClass) first, as a static native does"
                     continue
+                }
+                if (rustTypeName(types[0]) !in JNI_ENV_TYPES) {
+                    failures += "$origin: $symbol takes `${types[0]}` where the JNIEnv pointer goes; " +
+                        "expected one of $JNI_ENV_TYPES"
+                }
+                if (rustTypeName(types[1]) != "JClass") {
+                    failures += "$origin: $symbol takes `${types[1]}` where a static native receives its JClass"
                 }
                 val args = types.drop(2).map { descriptorOfRust(it, origin, failures) }
                 val ret = returnType.ifEmpty { null }?.let { descriptorOfRust(it, origin, failures) } ?: "V"
@@ -208,6 +215,12 @@ class JniNativeContractTest {
             )
 
         val GENERICS = Regex("<[^>]*>")
+
+        /**
+         * Wrappers that are ABI-identical to the raw `JNIEnv*` the JVM passes
+         * first. Only add a type here if it is `#[repr(transparent)]` over it.
+         */
+        val JNI_ENV_TYPES = setOf("EnvUnowned")
 
         /**
          * Rust parameter types whose JVM type is unambiguous. `JObject` and
