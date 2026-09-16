@@ -21,6 +21,16 @@ All notable changes to `blew` are documented here. Format follows
 
 ### Fixed
 
+- **Linux: a discovered device's name, UUIDs, manufacturer data and service
+  data are no longer read too early.** BlueZ announces a device the moment its
+  first advertisement lands and fills the rest of the properties as later
+  packets arrive, so a single read at `DeviceAdded` returned a snapshot with
+  none of them: a peer advertising service data was reported with an empty
+  `service_data` map, permanently, for as long as it kept advertising. The
+  Linux central now watches each discovered device's properties and re-emits
+  `DeviceDiscovered` when the advertised payload changes. RSSI updates the
+  snapshot without an event, since it moves with every packet and says nothing
+  new about the peer.
 - **Android: connection ownership now spans the entire GATT lifecycle.**
   Each attempt owns its callback, client, operation queue, pending nonces and
   MTU. Callback effects and retirement are serialized, and generations qualify

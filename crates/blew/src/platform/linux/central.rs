@@ -10,13 +10,15 @@ use crate::util::BroadcastEventStream;
 use bluer::gatt::CharacteristicFlags;
 use bluer::{Adapter, AdapterEvent, Device, DeviceEvent, DeviceProperty, Session};
 use bytes::Bytes;
+use futures_core::Stream;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
-use tokio_stream::StreamExt as _;
+use tokio_stream::{StreamExt as _, StreamMap};
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
@@ -116,6 +118,121 @@ async fn evict_stale_cache_entries(adapter: &Adapter) {
         }
         adapter.remove_device(addr).await.ok();
     }
+}
+
+async fn what_the_device_advertises_so_far(
+    adapter: &Adapter,
+    addr: bluer::Address,
+) -> Option<BleDevice> {
+    let device = adapter.device(addr).ok()?;
+    Some(BleDevice {
+        id: DeviceId(addr.to_string()),
+        name: device.name().await.ok().flatten(),
+        rssi: device.rssi().await.ok().flatten(),
+        services: device
+            .uuids()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
+        manufacturer_data: device
+            .manufacturer_data()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        service_data: device
+            .service_data()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+    })
+}
+
+async fn follow_the_air(
+    handle: Arc<CentralInner>,
+    discovery: impl Stream<Item = AdapterEvent> + Send,
+) {
+    let mut discovery = Box::pin(discovery);
+    let mut watched_advertisements: StreamMap<
+        bluer::Address,
+        Pin<Box<dyn Stream<Item = DeviceEvent> + Send>>,
+    > = StreamMap::new();
+    loop {
+        tokio::select! {
+            event = discovery.next() => match event {
+                Some(AdapterEvent::DeviceAdded(addr)) => {
+                    let Some(device) =
+                        what_the_device_advertises_so_far(&handle.adapter, addr).await
+                    else {
+                        continue;
+                    };
+                    if let Ok(changes) = watch_the_advertisement(&handle.adapter, addr).await {
+                        watched_advertisements.insert(addr, changes);
+                    }
+                    debug!(device_id = %device.id, name = ?device.name, rssi = ?device.rssi,
+                        "device discovered");
+                    handle.discovered.lock().insert(device.id.clone(), device.clone());
+                    let _ = handle.event_tx.send(CentralEvent::DeviceDiscovered(device));
+                }
+                Some(AdapterEvent::DeviceRemoved(addr)) => {
+                    let device_id = DeviceId(addr.to_string());
+                    debug!(device_id = %device_id, "device removed");
+                    watched_advertisements.remove(&addr);
+                    handle.discovered.lock().remove(&device_id);
+                    handle.abort_connection_watcher(&device_id);
+                    let cause = handle.involuntary_cause().await;
+                    handle.emit_disconnect(&device_id, cause);
+                }
+                Some(AdapterEvent::PropertyChanged(_)) => {}
+                None => break,
+            },
+            Some((addr, DeviceEvent::PropertyChanged(property))) = watched_advertisements.next(),
+                if !watched_advertisements.is_empty() =>
+            {
+                let device_id = DeviceId(addr.to_string());
+                let mut discovered = handle.discovered.lock();
+                let Some(known) = discovered.get_mut(&device_id) else {
+                    continue;
+                };
+                if !changes_the_advertised_payload(known, property) {
+                    continue;
+                }
+                let device = known.clone();
+                drop(discovered);
+                debug!(device_id = %device_id, name = ?device.name,
+                    service_data_keys = device.service_data.len(),
+                    "device advertises something new");
+                let _ = handle.event_tx.send(CentralEvent::DeviceDiscovered(device));
+            }
+        }
+    }
+}
+
+async fn watch_the_advertisement(
+    adapter: &Adapter,
+    addr: bluer::Address,
+) -> bluer::Result<Pin<Box<dyn Stream<Item = DeviceEvent> + Send>>> {
+    let changes = adapter.device(addr)?.events().await?;
+    Ok(Box::pin(changes))
+}
+
+fn changes_the_advertised_payload(device: &mut BleDevice, property: DeviceProperty) -> bool {
+    match property {
+        DeviceProperty::Name(name) => device.name = Some(name),
+        DeviceProperty::Uuids(services) => device.services = services.into_iter().collect(),
+        DeviceProperty::ManufacturerData(data) => device.manufacturer_data = data,
+        DeviceProperty::ServiceData(data) => device.service_data = data,
+        DeviceProperty::Rssi(rssi) => {
+            device.rssi = Some(rssi);
+            return false;
+        }
+        _ => return false,
+    }
+    true
 }
 
 /// Watch a connected device's `Connected` property and report link loss.
@@ -384,7 +501,7 @@ impl CentralBackend for LinuxCentral {
                     })?;
             }
 
-            let stream =
+            let discovery =
                 handle
                     .adapter
                     .discover_devices()
@@ -392,73 +509,13 @@ impl CentralBackend for LinuxCentral {
                     .map_err(|e| BlewError::Central {
                         source: Box::new(e),
                     })?;
-            let mut stream = Box::pin(stream);
 
             // Dropping a JoinHandle only detaches; we must abort explicitly.
             if let Some(old) = handle.scan_task.lock().take() {
                 old.abort();
             }
 
-            let handle_task = Arc::clone(&handle);
-            let task = tokio::spawn(async move {
-                let handle = handle_task;
-                while let Some(event) = stream.next().await {
-                    match event {
-                        AdapterEvent::DeviceAdded(addr) => {
-                            let Ok(device) = handle.adapter.device(addr) else {
-                                continue;
-                            };
-                            let name = device.name().await.ok().flatten();
-                            let rssi = device.rssi().await.ok().flatten();
-                            let services = device
-                                .uuids()
-                                .await
-                                .ok()
-                                .flatten()
-                                .map(|s| s.into_iter().collect::<Vec<_>>())
-                                .unwrap_or_default();
-                            let device_id = DeviceId(addr.to_string());
-                            debug!(device_id = %device_id, name = ?name, rssi = ?rssi, "device discovered");
-                            let manufacturer_data = device
-                                .manufacturer_data()
-                                .await
-                                .ok()
-                                .flatten()
-                                .unwrap_or_default();
-                            let service_data = device
-                                .service_data()
-                                .await
-                                .ok()
-                                .flatten()
-                                .unwrap_or_default();
-                            let ble_device = BleDevice {
-                                id: device_id.clone(),
-                                name,
-                                rssi,
-                                services,
-                                manufacturer_data,
-                                service_data,
-                            };
-                            handle
-                                .discovered
-                                .lock()
-                                .insert(device_id, ble_device.clone());
-                            let _ = handle
-                                .event_tx
-                                .send(CentralEvent::DeviceDiscovered(ble_device));
-                        }
-                        AdapterEvent::DeviceRemoved(addr) => {
-                            let device_id = DeviceId(addr.to_string());
-                            debug!(device_id = %device_id, "device removed");
-                            handle.discovered.lock().remove(&device_id);
-                            handle.abort_connection_watcher(&device_id);
-                            let cause = handle.involuntary_cause().await;
-                            handle.emit_disconnect(&device_id, cause);
-                        }
-                        AdapterEvent::PropertyChanged(_) => {}
-                    }
-                }
-            });
+            let task = tokio::spawn(follow_the_air(Arc::clone(&handle), discovery));
 
             *handle.scan_task.lock() = Some(task);
             Ok(())
@@ -871,5 +928,49 @@ fn check_bluez_config() {
              [GATT]\n  Cache=no\n\n  \
              Then: sudo systemctl restart bluetooth"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::changes_the_advertised_payload;
+    use crate::types::{BleDevice, DeviceId};
+    use bluer::DeviceProperty;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    fn seen_once() -> BleDevice {
+        BleDevice {
+            id: DeviceId::from("11:22:33:44:55:66"),
+            name: None,
+            rssi: None,
+            services: Vec::new(),
+            manufacturer_data: HashMap::new(),
+            service_data: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn service_data_arriving_late_is_worth_announcing() {
+        let service = Uuid::from_u128(0x0000_180f_0000_1000_8000_0080_5f9b_34fb);
+        let mut device = seen_once();
+        let arrived = HashMap::from([(service, vec![0x64])]);
+
+        assert!(changes_the_advertised_payload(
+            &mut device,
+            DeviceProperty::ServiceData(arrived.clone())
+        ));
+        assert_eq!(device.service_data, arrived);
+    }
+
+    #[test]
+    fn a_moving_rssi_is_not_something_new_to_announce() {
+        let mut device = seen_once();
+
+        assert!(!changes_the_advertised_payload(
+            &mut device,
+            DeviceProperty::Rssi(-70)
+        ));
+        assert_eq!(device.rssi, Some(-70));
     }
 }
