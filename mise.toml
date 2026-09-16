@@ -91,7 +91,7 @@ gradle -p crates/blew/android/ci compileDebugKotlin --no-daemon
 """
 
 [tasks."ci:test-kotlin"]
-description = "Run Android GATT ownership tests with a fake factory"
+description = "Run the JVM Kotlin unit tests (GATT ownership, JNI contract)"
 tools = { gradle = "8", java = "temurin-17" }
 run = """
 cargo ndk -t arm64-v8a check -p tauri-plugin-blew
