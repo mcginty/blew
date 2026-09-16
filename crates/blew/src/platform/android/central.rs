@@ -15,7 +15,7 @@ use crate::central::types::{CentralConfig, CentralEvent, DisconnectCause, ScanFi
 use crate::error::{BlewError, BlewResult};
 use crate::gatt::props::CharacteristicProperties;
 use crate::gatt::service::{GattCharacteristic, GattService};
-use crate::l2cap::{L2capChannel, types::Psm};
+use crate::l2cap::{L2capChannel, L2capEncryption, types::Psm};
 use crate::types::{BleDevice, DeviceId};
 use crate::util::BroadcastEventStream;
 use crate::util::connect_state::{ConnectAttempts, ConnectionGuard};
@@ -216,7 +216,13 @@ fn gatt_status_to_error(status: i32, device_id: &DeviceId, char_uuid: Uuid) -> B
     }
 }
 
-pub struct AndroidCentral;
+pub struct AndroidCentral {
+    /// Owned per instance, not stored in the process-global L2CAP state: a
+    /// second `Central` constructed with a different config must not be able to
+    /// relax a channel this one opens. See the warning on
+    /// `l2cap_state::L2capState::client_config`.
+    l2cap_encryption: L2capEncryption,
+}
 
 impl AndroidCentral {
     // No awaits in the body (all JNI work is synchronous), but the public API
@@ -236,7 +242,9 @@ impl AndroidCentral {
         init_statics(config.connect_timeout);
         super::l2cap_state::set_client_config(config.l2cap.clone());
         debug!(connect_timeout = ?config.connect_timeout, "AndroidCentral initialized");
-        Ok(AndroidCentral)
+        Ok(AndroidCentral {
+            l2cap_encryption: config.l2cap.encryption,
+        })
     }
 
     /// Clear the GATT cache for `device_id` by calling the hidden
@@ -705,8 +713,9 @@ impl CentralBackend for AndroidCentral {
     ) -> impl Future<Output = BlewResult<L2capChannel>> + Send {
         let addr = device_id.as_str().to_owned();
         let id_for_err = device_id.clone();
+        let encryption = self.l2cap_encryption;
         async move {
-            let secure = super::l2cap_state::client_secure();
+            let secure = super::l2cap_state::secure_flag(encryption);
             let (tx, rx) = oneshot::channel();
             super::l2cap_state::set_pending_open(addr.clone(), tx);
 
