@@ -1,17 +1,17 @@
 package org.jakebot.blew
 
+import org.jakebot.blew.JniTestSupport.descriptorOf
+import org.jakebot.blew.JniTestSupport.rustSources
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
-import java.io.File
-import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 
 /**
  * Asserts that every Kotlin method the Rust backend reaches through
  * `call_static_method` exists, is static, and has exactly the descriptor the
- * Rust passes.
+ * Rust passes. [JniNativeContractTest] checks the other direction.
  *
  * Nothing else checks this. cargo and Gradle never read each other's method
  * tables, so a missing `@JvmStatic` -- which publishes no static of that name
@@ -32,10 +32,7 @@ class JniContractTest {
 
     @Test
     fun `every call_static_method site is parsed`() {
-        val sources = rustSources()
-        assertTrue("found no Rust sources under ${rustAndroidSourceDir()}", sources.isNotEmpty())
-
-        val declared = sources.sumOf { (_, text) -> CALL_SITE_MARKER.findAll(text).count() }
+        val declared = rustSources().sumOf { CALL_SITE_MARKER.findAll(it.text).count() }
         assertTrue("found no call_static_method sites to check", declared > 0)
         assertEquals(
             "the call_static_method sites and the parser have diverged; " +
@@ -80,61 +77,23 @@ class JniContractTest {
     }
 
     private fun callSites(): List<CallSite> =
-        rustSources().flatMap { (file, text) ->
-            CALL_SITE.findAll(text).map { match ->
+        rustSources().flatMap { source ->
+            CALL_SITE.findAll(source.text).map { match ->
                 val (classExpr, method, signature) = match.destructured
                 val classNames =
                     CLASS_EXPRESSIONS[classExpr.trim()]
                         ?: throw AssertionError(
-                            "${file.name}: don't know which class `${classExpr.trim()}` resolves to; " +
+                            "${source.path}: don't know which class `${classExpr.trim()}` resolves to; " +
                                 "add it to CLASS_EXPRESSIONS in this test",
                         )
-                CallSite(classNames, method, signature, file.name)
+                CallSite(classNames, method, signature, source.path)
             }
-        }
-
-    private fun rustSources(): List<Pair<File, String>> =
-        rustAndroidSourceDir()
-            .listFiles { f -> f.isFile && f.name.endsWith(".rs") }
-            .orEmpty()
-            .sortedBy { it.name }
-            .map { it to it.readText() }
-
-    private fun rustAndroidSourceDir(): File {
-        var dir: File? = File(workingDir()).absoluteFile
-        while (dir != null) {
-            for (relative in SOURCE_DIR_CANDIDATES) {
-                val candidate = File(dir, relative)
-                if (candidate.isDirectory) return candidate
-            }
-            dir = dir.parentFile
-        }
-        throw AssertionError(
-            "could not locate the Rust Android backend sources; looked for " +
-                "${SOURCE_DIR_CANDIDATES.joinToString(" or ")} above ${workingDir()}",
-        )
-    }
-
-    private fun workingDir(): String = System.getProperty("user.dir") ?: "."
-
-    private fun descriptorOf(method: Method): String =
-        method.parameterTypes.joinToString("", prefix = "(", postfix = ")") { descriptorOf(it) } +
-            descriptorOf(method.returnType)
-
-    private fun descriptorOf(type: Class<*>): String =
-        when {
-            type.isArray -> "[" + descriptorOf(checkNotNull(type.componentType))
-            !type.isPrimitive -> "L" + type.name.replace('.', '/') + ";"
-            else -> PRIMITIVE_DESCRIPTORS.getValue(type.name)
         }
 
     private companion object {
         const val CENTRAL = "org.jakebot.blew.BleCentralManager"
         const val PERIPHERAL = "org.jakebot.blew.BlePeripheralManager"
         const val PLUGIN = "org.jakebot.blew.BlewPlugin"
-
-        val SOURCE_DIR_CANDIDATES =
-            listOf("crates/blew/src/platform/android", "src/platform/android")
 
         val CALL_SITE_MARKER = Regex("""call_static_method\(""")
 
@@ -159,19 +118,6 @@ class JniContractTest {
                 "socket_class(is_server)" to listOf(CENTRAL, PERIPHERAL),
                 "manager_class" to listOf(CENTRAL, PERIPHERAL),
                 "&plugin_class" to listOf(PLUGIN),
-            )
-
-        val PRIMITIVE_DESCRIPTORS =
-            mapOf(
-                "void" to "V",
-                "boolean" to "Z",
-                "byte" to "B",
-                "char" to "C",
-                "short" to "S",
-                "int" to "I",
-                "long" to "J",
-                "float" to "F",
-                "double" to "D",
             )
     }
 }
