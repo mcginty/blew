@@ -42,6 +42,37 @@ pub const MIN_L2CAP_READ_CHUNK_SIZE: usize = 64;
 
 /// Link security demanded of an L2CAP CoC channel.
 ///
+/// # What this actually guarantees
+///
+/// Where a backend accepts a level, the OS or controller **enforces** it. This
+/// is a requirement, not a hint, and there is no advisory middle ground: a level
+/// is either enforced by the platform or unavailable there.
+///
+/// - **Linux**, both roles: `BT_SECURITY_*` on the socket. A listener rejects
+///   inbound connections that don't meet the level; an opener elevates the link
+///   via SMP before the connect completes, and fails the connect if it can't.
+/// - **Android**, both roles: `listenUsingL2capChannel` /
+///   `createL2capChannel`. The stack pairs the peer or refuses the socket.
+/// - **Apple peripheral**: `publishL2CAPChannelWithEncryption:YES`. The
+///   controller refuses unencrypted connections to that PSM.
+///
+/// Three combinations have no mechanism at all. They are refused with
+/// [`BlewError::L2capEncryptionUnsupported`](crate::error::BlewError::L2capEncryptionUnsupported)
+/// rather than silently ignored, because a setting that quietly does nothing on
+/// one platform is worse than one that fails loudly:
+///
+/// - [`RequireAuthentication`](Self::RequireAuthentication) on an **Apple
+///   peripheral** — `publishL2CAPChannelWithEncryption:` is a single boolean and
+///   says nothing about whether the pairing was MITM-protected.
+/// - Either level on an **Apple central** — see the note under the table.
+///
+/// If you need encryption between two blew peers and one of them is an Apple
+/// central, set it on the peripheral: the requirement is enforced there, and
+/// CoreBluetooth pairs automatically when the CoC connect is refused, so the
+/// channel comes up encrypted anyway.
+///
+/// # How each end enforces it
+///
 /// LE encryption is a property of the ACL link, not of one channel, and the two
 /// ends enforce a requirement by different mechanisms. The listener enforces by
 /// *refusing*: `LE_CREDIT_BASED_CONNECTION_REQ` carries no security field, so a
@@ -54,12 +85,12 @@ pub const MIN_L2CAP_READ_CHUNK_SIZE: usize = 64;
 /// [`Peripheral::l2cap_listener`](crate::Peripheral::l2cap_listener) — it just
 /// reaches the same guarantee from opposite directions.
 ///
+/// # Platform mapping
+///
 /// Platforms express this at very different resolutions, so a backend maps the
 /// requested level onto the nearest level its API can express that is **never
-/// weaker** than what was asked for. Where no such level exists the backend
-/// returns
-/// [`BlewError::L2capEncryptionUnsupported`](crate::error::BlewError::L2capEncryptionUnsupported)
-/// rather than quietly handing back a less protected channel.
+/// weaker** than what was asked for — rounding *up* where a platform is coarse,
+/// and refusing outright where it has nothing.
 ///
 /// | | `Insecure` | `RequireEncryption` | `RequireAuthentication` |
 /// |---|---|---|---|
@@ -72,9 +103,8 @@ pub const MIN_L2CAP_READ_CHUNK_SIZE: usize = 64;
 /// both elevate the link from the opening side — `BT_SECURITY_*` on a connecting
 /// socket, and `createL2capChannel`'s authenticated-and-encrypted contract — but
 /// CoreBluetooth exposes no way to pair or raise security on demand, so an Apple
-/// central can only take whatever the peer's PSM happens to insist on. It cannot
-/// demand or verify anything itself, so anything other than
-/// [`Insecure`](Self::Insecure) is refused there rather than silently ignored.
+/// central can only take whatever the peer's PSM happens to insist on — it can
+/// neither demand nor verify anything itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum L2capEncryption {
@@ -157,9 +187,12 @@ pub struct L2capConfig {
     /// Link security demanded when publishing or opening a channel.
     ///
     /// Defaults to [`L2capEncryption::Insecure`], which is what every backend
-    /// did before this field existed. Raising it can make the platform trigger
-    /// pairing on the first channel, and a backend that cannot express the
-    /// requested level fails the call rather than substituting a weaker one.
+    /// did before this field existed. Raising it is a *requirement*, not a
+    /// preference: the platform enforces it, which can mean triggering pairing
+    /// on the first channel, and a backend with no way to express the level you
+    /// asked for fails the call rather than substituting a weaker one. See
+    /// [`L2capEncryption`] for what each platform enforces and where the three
+    /// gaps are.
     pub encryption: L2capEncryption,
 }
 
