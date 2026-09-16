@@ -1,5 +1,7 @@
 /build
 /.tauri
 /.gradle
+/.kotlin
 /ci/build
 /ci/.gradle
+/ci/.kotlin
