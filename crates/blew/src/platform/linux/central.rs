@@ -120,6 +120,20 @@ async fn evict_stale_cache_entries(adapter: &Adapter) {
     }
 }
 
+/// Stop the running discovery loop and wait for it to be dropped.
+///
+/// bluer's discovery session lives in the stream the task owns and is released
+/// only when that future is dropped, so `abort()` alone is not enough: it marks
+/// the task for cancellation but returns before it has run. Awaiting the handle
+/// is what guarantees the session is gone.
+async fn abort_scan_task(handle: &CentralInner) {
+    let task = handle.scan_task.lock().take();
+    if let Some(task) = task {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
 fn addr_to_device_id(addr: bluer::Address) -> DeviceId {
     DeviceId(addr.to_string())
 }
@@ -497,21 +511,29 @@ impl CentralBackend for LinuxCentral {
         let handle = Arc::clone(&self.0);
         async move {
             debug!(service_filter = ?filter.services, "starting BLE scan");
+
+            // Before anything else: bluer rejects set_discovery_filter with
+            // DiscoveryActive while a session is live, so a restart has to release
+            // the previous one first.
+            abort_scan_task(&handle).await;
+
             evict_stale_cache_entries(&handle.adapter).await;
 
-            if !filter.services.is_empty() {
-                let df = bluer::DiscoveryFilter {
-                    uuids: filter.services.into_iter().collect(),
-                    ..Default::default()
-                };
-                handle
-                    .adapter
-                    .set_discovery_filter(df)
-                    .await
-                    .map_err(|e| BlewError::Central {
-                        source: Box::new(e),
-                    })?;
-            }
+            // Set unconditionally: bluer caches the filter per adapter in its own
+            // Session and re-sends it on every StartDiscovery, so skipping this
+            // would silently reuse the previous scan's UUID list. An empty `uuids`
+            // matches any device.
+            let df = bluer::DiscoveryFilter {
+                uuids: filter.services.into_iter().collect(),
+                ..Default::default()
+            };
+            handle
+                .adapter
+                .set_discovery_filter(df)
+                .await
+                .map_err(|e| BlewError::Central {
+                    source: Box::new(e),
+                })?;
 
             let discovery =
                 handle
@@ -521,11 +543,6 @@ impl CentralBackend for LinuxCentral {
                     .map_err(|e| BlewError::Central {
                         source: Box::new(e),
                     })?;
-
-            // Dropping a JoinHandle only detaches; we must abort explicitly.
-            if let Some(old) = handle.scan_task.lock().take() {
-                old.abort();
-            }
 
             let task = tokio::spawn(run_discovery_loop(Arc::clone(&handle), discovery));
 
@@ -538,9 +555,7 @@ impl CentralBackend for LinuxCentral {
         let handle = Arc::clone(&self.0);
         async move {
             debug!("stopping BLE scan");
-            if let Some(task) = handle.scan_task.lock().take() {
-                task.abort();
-            }
+            abort_scan_task(&handle).await;
             Ok(())
         }
     }

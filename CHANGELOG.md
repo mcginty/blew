@@ -31,6 +31,18 @@ All notable changes to `blew` are documented here. Format follows
   `DeviceDiscovered` when the advertised payload changes. RSSI updates the
   snapshot without an event, since it moves with every packet and says nothing
   new about the peer.
+- **Linux: restarting a scan works, and no longer inherits the previous
+  scan's service filter.** Two problems on the same path. The discovery filter
+  was only sent when `ScanFilter` named at least one service, but bluer caches
+  it per adapter and re-sends it on every `StartDiscovery`, so an unfiltered
+  `start_scan` after a filtered one kept filtering on the old UUID list and
+  silently reported nothing else; the filter is now always set, with an empty
+  UUID list matching any device. Setting it also requires that no discovery
+  session is live — bluer returns `DiscoveryActive` otherwise — so `start_scan`
+  now tears down a running scan and waits for it to be dropped before
+  reconfiguring, which previously made a filtered `start_scan` → `start_scan`
+  fail outright. `stop_scan` waits for the same teardown, so a `stop_scan` →
+  `start_scan` sequence cannot race it.
 - **Android: connection ownership now spans the entire GATT lifecycle.**
   Each attempt owns its callback, client, operation queue, pending nonces and
   MTU. Callback effects and retirement are serialized, and generations qualify
