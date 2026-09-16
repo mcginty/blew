@@ -44,6 +44,13 @@ object BlePeripheralManager {
     /** The stack refused to rename the adapter for a named advertisement. */
     const val ADVERTISE_NAME_REJECTED = 3
 
+    /**
+     * Error code reported through [nativeOnAdvertisingResult] when the adapter
+     * rename a named advertisement waits for never took effect. Negative, so it
+     * can't collide with an `AdvertiseCallback` error.
+     */
+    const val ADVERTISE_FAILED_RENAME_UNCONFIRMED = -1
+
     private var context: Context? = null
     private var bluetoothManager: BluetoothManager? = null
 
@@ -185,20 +192,13 @@ object BlePeripheralManager {
                     BluetoothAdapter.ACTION_STATE_CHANGED -> {
                         val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
                         when (state) {
-                            BluetoothAdapter.STATE_ON -> {
-                                // A name borrowed while the adapter was off couldn't be given back then.
-                                nameLease?.reconcile()
-                                nativeOnAdapterStateChanged(true)
-                            }
-
-                            BluetoothAdapter.STATE_OFF -> {
-                                nativeOnAdapterStateChanged(false)
-                            }
+                            BluetoothAdapter.STATE_ON -> nativeOnAdapterStateChanged(true)
+                            BluetoothAdapter.STATE_OFF -> nativeOnAdapterStateChanged(false)
                         }
                     }
 
                     BluetoothAdapter.ACTION_LOCAL_NAME_CHANGED -> {
-                        nameLease?.onNameChanged(intent.getStringExtra(BluetoothAdapter.EXTRA_LOCAL_NAME))
+                        adapterRename?.onNameChanged(intent.getStringExtra(BluetoothAdapter.EXTRA_LOCAL_NAME))
                     }
                 }
             }
@@ -216,8 +216,8 @@ object BlePeripheralManager {
         // returns null while Bluetooth is off, and nothing refreshes a cached
         // null when it comes back on. It is resolved per startAdvertising call.
         Log.d(TAG, "initialized, adapter=${adapter != null}")
-        if (nameLease == null) {
-            nameLease = AdapterNameLease(AndroidAdapterNames(), PrefsBorrowedNameStore(ctx.applicationContext), scope)
+        if (adapterRename == null) {
+            adapterRename = AdapterRename(AndroidAdapterNames(), scope)
         }
         // Registering the same receiver twice delivers every adapter state
         // change twice. init() runs again whenever the host activity is
@@ -229,16 +229,11 @@ object BlePeripheralManager {
             ctx.registerReceiver(adapterStateReceiver, filter)
             receiverRegistered = true
         }
-        // Gives back a name a previous process borrowed and never returned.
-        nameLease?.reconcile()
     }
 
-    /**
-     * Lends the adapter name to named advertisements; see [AdapterNameLease].
-     * Created once, because it holds the lease across activity recreation.
-     */
+    /** Renames the adapter for named advertisements; see [AdapterRename]. */
     @Volatile
-    private var nameLease: AdapterNameLease? = null
+    private var adapterRename: AdapterRename? = null
 
     private class AndroidAdapterNames : AdapterNames {
         override fun get(): String? =
@@ -254,34 +249,6 @@ object BlePeripheralManager {
             } catch (e: SecurityException) {
                 false
             }
-    }
-
-    private class PrefsBorrowedNameStore(
-        context: Context,
-    ) : BorrowedNameStore {
-        private val prefs = context.getSharedPreferences("org.jakebot.blew.adapter_name", Context.MODE_PRIVATE)
-
-        override fun load(): AdapterNameLease.Borrow? {
-            val theirs = prefs.getString(KEY_THEIRS, null) ?: return null
-            val ours = prefs.getString(KEY_OURS, null) ?: return null
-            return AdapterNameLease.Borrow(theirs, ours)
-        }
-
-        // commit, not apply: the record exists for the process that dies right after writing it.
-        override fun save(borrow: AdapterNameLease.Borrow?) {
-            val editor = prefs.edit()
-            if (borrow == null) {
-                editor.remove(KEY_THEIRS).remove(KEY_OURS)
-            } else {
-                editor.putString(KEY_THEIRS, borrow.theirs).putString(KEY_OURS, borrow.ours)
-            }
-            editor.commit()
-        }
-
-        private companion object {
-            const val KEY_THEIRS = "theirs"
-            const val KEY_OURS = "ours"
-        }
     }
 
     private val gattCallback =
@@ -500,17 +467,18 @@ object BlePeripheralManager {
     /** Request id of the live [advertiseCallback], for [stopAdvertising]. */
     private var advertiseRequestId: Int = 0
 
-    /** The adapter-name hold of the live [advertiseCallback], if it advertises a name. */
-    private var advertiseNameTicket: AdapterNameLease.Ticket? = null
+    /** The adapter rename the live [advertiseCallback] waits for, if it advertises a name. */
+    private var advertiseRenameTicket: AdapterRename.Ticket? = null
 
     /**
      * Begin advertising. Returns [ADVERTISE_OK] when the request was handed to
      * the stack, or a failure code for something that went wrong before that.
      *
      * A non-null [name] is permission to rename the adapter, which is the only
-     * name Android can advertise. The stack only sees the request once the
-     * rename has landed, and the previous name is given back afterwards on a
-     * best-effort basis; see [AdapterNameLease].
+     * name Android can advertise. The rename is left in place afterwards. The
+     * stack only sees the request once the rename has landed; if it doesn't
+     * land, the start fails through [nativeOnAdvertisingResult] with
+     * [ADVERTISE_FAILED_RENAME_UNCONFIRMED]. See [AdapterRename].
      *
      * Success is *not* confirmed by the return value — the stack reports that
      * asynchronously through [nativeOnAdvertisingResult].
@@ -586,7 +554,7 @@ object BlePeripheralManager {
                     synchronized(advertiseLock) {
                         if (advertiseRequestId == requestId) {
                             advertiseCallback = null
-                            releaseNameLocked()
+                            advertiseRenameTicket = null
                         }
                     }
                     // Outside the monitor: this crosses into Rust, which takes
@@ -600,26 +568,37 @@ object BlePeripheralManager {
             adv.startAdvertising(settings, data, scanResponse, callback)
             return ADVERTISE_OK
         }
-        val lease =
-            nameLease ?: run {
+        val rename =
+            adapterRename ?: run {
                 advertiseCallback = null
                 return ADVERTISE_UNAVAILABLE
             }
-        // Possibly after this returns, from the name broadcast. Stop releases
-        // the ticket before touching the advertiser, which drops a start that
-        // hasn't run yet, so a late one can't outlive it.
+        // onReady may run after this returns, from the name broadcast. Stop
+        // cancels the ticket before touching the advertiser, which drops a
+        // start that hasn't run yet, so a late one can't outlive it.
         val ticket =
-            lease.acquire(name) { adv.startAdvertising(settings, data, scanResponse, callback) } ?: run {
+            rename.request(
+                name,
+                onReady = { adv.startAdvertising(settings, data, scanResponse, callback) },
+                onFailed = { renameUnconfirmed(requestId) },
+            ) ?: run {
                 advertiseCallback = null
                 return ADVERTISE_NAME_REJECTED
             }
-        advertiseNameTicket = ticket
+        advertiseRenameTicket = ticket
         return ADVERTISE_OK
     }
 
-    private fun releaseNameLocked() {
-        advertiseNameTicket?.let { nameLease?.release(it) }
-        advertiseNameTicket = null
+    private fun renameUnconfirmed(requestId: Int) {
+        synchronized(advertiseLock) {
+            // Nothing started, so there is nothing to stop; just free the slot.
+            if (advertiseRequestId == requestId) {
+                advertiseCallback = null
+                advertiseRenameTicket = null
+            }
+        }
+        // Outside the monitor, as in onStartFailure. A stale id is ignored by Rust.
+        nativeOnAdvertisingResult(requestId, false, ADVERTISE_FAILED_RENAME_UNCONFIRMED)
     }
 
     /**
@@ -641,7 +620,8 @@ object BlePeripheralManager {
             if (cb == null || advertiseRequestId != requestId) {
                 return
             }
-            releaseNameLocked()
+            advertiseRenameTicket?.let { adapterRename?.cancel(it) }
+            advertiseRenameTicket = null
             advertiser?.stopAdvertising(cb)
             advertiseCallback = null
         }

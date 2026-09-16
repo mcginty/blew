@@ -103,7 +103,7 @@ crates/blew/src/
 crates/blew/android/                  # Co-located Kotlin/Gradle module for the Android backend
 ├── src/main/java/org/jakebot/blew/   # BleCentralManager.kt, BlePeripheralManager.kt,
 │                                     #   GattOperationQueue.kt, L2capSocketManager.kt,
-│                                     #   AdapterNameLease.kt, BlewPlugin.kt (Tauri entry point)
+│                                     #   AdapterRename.kt, BlewPlugin.kt (Tauri entry point)
 └── AndroidManifest.xml               # Runtime permission declarations (merged into host app)
 ```
 
@@ -319,26 +319,28 @@ rx.await?; // safe to await now
 **Local-name invariant.** `AdvertisingConfig::local_name` (`LocalName`) is a
 permission, not just a value. Android has no per-advertisement name, so
 `AllowPermanent` is the only variant that reaches `BluetoothAdapter.setName`,
-and a rename is device-global, persistent, and only best-effort reversible.
-**Do not** make `Temporary` fall back to renaming the adapter on Android to
-avoid `BlewError::LocalNameUnsupported` — the point is that the device-wide
-mutation is unreachable without asking for it. **Do not** read `AllowPermanent`
-as permission to skip the restore either: it only accepts that the restore can
-fail.
+and that rename is device-global and persistent. **Do not** make `Temporary`
+fall back to renaming the adapter on Android to avoid
+`BlewError::LocalNameUnsupported` — the point is that the device-wide mutation
+is unreachable without asking for it.
 
-The restore lives in `AdapterNameLease.kt` and follows one rule: *when nothing
-holds the lease and the adapter carries the name we gave it, put back the one
-we replaced.* Any other name belongs to the user or another app and is left
-alone. The borrowed name is persisted (SharedPreferences, `commit`) and
-reconciled on `init`, on `STATE_ON`, and on every `ACTION_LOCAL_NAME_CHANGED`.
-None of that makes it correct — two apps each saving the other's borrowed name,
-or an uninstall mid-advertisement, defeat it from inside one app — so keep the
-docs saying *best-effort*. A held name only starts advertising once its rename
-has landed, since the scan response snapshots whatever name is in place. Stop
-releases the ticket **before** touching the advertiser: a start still waiting
-for its name is dropped under the lease monitor, and reversing the order lets
-it begin an advertisement nothing can stop. `ci:test-kotlin` exercises the
-lease with a fake adapter and virtual time.
+blew deliberately does **not** restore the previous adapter name. A restore
+can't be made correct from inside one app: an uninstall mid-advertisement, a
+process that never relaunches, or two apps each saving the other's borrowed
+name all defeat it. Restoring is left to the application; don't add a
+best-effort restore back.
+
+`AdapterRename.kt` does handle the race: a rename lands asynchronously and the
+scan response snapshots whatever name is in place at start, so a named start
+waits for `ACTION_LOCAL_NAME_CHANGED`. After one second it reads the name back
+and **fails** the start (`ADVERTISE_FAILED_RENAME_UNCONFIRMED`) if the rename
+hasn't landed — never advertise anyway, that puts the previous name on air.
+`onReady` runs under the class's monitor so `cancel` can't slip between
+deciding to advertise and advertising; `onFailed` runs after the monitor is
+released, because it takes `advertiseLock`, which callers hold while calling
+in. Stop cancels the ticket **before** touching the advertiser; reversing the
+order lets a waiting start begin an advertisement nothing can stop.
+`ci:test-kotlin` exercises it with a fake adapter and virtual time.
 
 **JNI data marshalling:** Complex data (GATT services, UUID lists) passed as flat arrays or JSON strings to avoid complex JNI type construction. Service characteristics use parallel arrays (uuids, properties, permissions, values).
 

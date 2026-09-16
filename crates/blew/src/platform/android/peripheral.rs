@@ -32,6 +32,9 @@ const ADVERTISE_OK: i32 = 0;
 const ADVERTISE_ALREADY: i32 = 2;
 /// Kotlin's `BlePeripheralManager.ADVERTISE_NAME_REJECTED`.
 const ADVERTISE_NAME_REJECTED: i32 = 3;
+/// Kotlin's `BlePeripheralManager.ADVERTISE_FAILED_RENAME_UNCONFIRMED`, reported
+/// through `nativeOnAdvertisingResult` in place of an `AdvertiseCallback` error.
+pub(super) const ADVERTISE_FAILED_RENAME_UNCONFIRMED: i32 = -1;
 
 struct PeripheralState {
     request_tx: mpsc::UnboundedSender<PeripheralRequest>,

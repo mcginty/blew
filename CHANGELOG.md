@@ -46,36 +46,26 @@ All notable changes to `blew` are documented here. Format follows
   naming variants identically. Android refuses `Temporary` with the new
   `BlewError::LocalNameUnsupported` rather than quietly advertising no name,
   so the device-wide rename can't be reached without asking for it by name.
-  0.4.0-beta.5 and beta.6 had an interim `Option<String>` here, where `Some`
-  renamed the Android adapter unconditionally.
+  The rename is left in place: blew doesn't restore the previous name, which
+  can't be done reliably from inside one app, so that is up to the
+  application. 0.4.0-beta.5 and beta.6 had an interim `Option<String>` here,
+  where `Some` renamed the Android adapter.
 
 ### Fixed
 
-- **Android: a borrowed adapter name is given back.**
-  ([#21](https://github.com/mcginty/blew/pull/21), reported by
-  @Resilum-owner) Advertising a name renamed the Bluetooth adapter and nothing
-  ever restored it, so the beacon name outlived the process and the handset
-  kept answering to it everywhere. Under `LocalName::AllowPermanent` the
-  previous name is now recorded — persistently, so a crash or reboot doesn't
-  lose it — and restored once advertising stops or fails to start, when
-  Bluetooth next comes on if it was off, or when the peripheral next
-  initializes after the process died. It is only restored while the adapter
-  still carries the name blew set, so a name the user or another app chose in
-  the meantime is left alone. The restore is best-effort and the variant is
-  named for that: an uninstall while the name is borrowed leaves nothing behind
-  to restore it.
 - **Android: a named advertisement no longer goes out under the previous
-  name.** ([#21](https://github.com/mcginty/blew/pull/21)) The adapter applies a
-  rename asynchronously, but the scan response carries whichever name is in
-  place when advertising starts. Renaming and advertising back to back
-  therefore advertised the *old* name, and an old name too long for the 31-byte
-  scan response — thirty Cyrillic characters is about fifty UTF-8 bytes —
-  failed the advertisement with `ADVERTISE_FAILED_DATA_TOO_LARGE`. It used to
-  strike only the first session, since the unrestored beacon name was in place
-  from then on; restoring the name would have made it every session.
-  Advertising now waits for `ACTION_LOCAL_NAME_CHANGED`, with a one-second
-  backstop. A stop that lands during that wait cancels the start, so it can't
-  begin an advertisement nothing is left to stop.
+  name.** ([#21](https://github.com/mcginty/blew/pull/21), reported by
+  @Resilum-owner) The adapter applies a rename asynchronously, but the scan
+  response carries whichever name is in place when advertising starts.
+  Renaming and advertising back to back therefore advertised the *old* name,
+  and an old name too long for the 31-byte scan response — thirty Cyrillic
+  characters is about fifty UTF-8 bytes — failed the advertisement with
+  `ADVERTISE_FAILED_DATA_TOO_LARGE`. That struck whenever the adapter's name
+  changed: the first session after install, or after the app picked a new name.
+  Advertising now waits for `ACTION_LOCAL_NAME_CHANGED`; if the name hasn't
+  taken effect within a second, `start_advertising` fails instead of
+  advertising the previous name. A stop that lands during the wait cancels
+  the start, so it can't begin an advertisement nothing is left to stop.
 - **Linux: a discovered device's name, UUIDs, manufacturer data and service
   data are no longer read too early.** BlueZ announces a device the moment its
   first advertisement lands and fills the rest of the properties as later
@@ -910,9 +900,9 @@ let config = AdvertisingConfig {
 };
 ```
 
-`AllowPermanent` is what a bare name always meant on Android. blew now restores
-the adapter's previous name afterwards, but can't guarantee it; prefer `None`
-unless peers genuinely need the name.
+`AllowPermanent` is what a bare name always meant on Android: the adapter is
+renamed and stays renamed, and blew doesn't restore the previous name. Prefer
+`None` unless peers genuinely need the name.
 
 ---
 

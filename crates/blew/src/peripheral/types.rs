@@ -190,7 +190,7 @@ pub struct AdvertisingConfig {
 /// |---|---|---|---|
 /// | Apple | no `CBAdvertisementDataLocalNameKey` | `CBAdvertisementDataLocalNameKey` | as `Temporary` |
 /// | Linux | no BlueZ `LocalName` | BlueZ `LocalName` | as `Temporary` |
-/// | Android | `setIncludeDeviceName(false)` | unsupported | adapter rename, restored after |
+/// | Android | `setIncludeDeviceName(false)` | unsupported | adapter rename, left in place |
 ///
 /// On Apple and Linux, `AllowPermanent` behaves exactly like `Temporary`.
 ///
@@ -215,27 +215,20 @@ pub enum LocalName {
     Temporary(String),
 
     /// Advertise the name, even if a platform has to rename the whole device
-    /// to do it, and accept that the rename might not be undone.
+    /// to do it, and leave that rename in place.
     ///
     /// On Android this sets the Bluetooth adapter's name, which every app and
-    /// paired device sees. blew still treats the rename as a loan: it records
-    /// the previous name (persistently, so a crash or reboot doesn't lose it)
-    /// and puts it back once advertising stops or fails to start. The rule it
-    /// follows is narrow on purpose -- *when blew isn't advertising and the
-    /// adapter carries the name blew gave it, blew restores the one it
-    /// replaced* -- so a name the user or another app chose in the meantime is
-    /// left alone.
+    /// paired device sees, and it stays set after advertising stops and after
+    /// the app exits. blew doesn't record or restore the previous name: a
+    /// restore can't be made reliable from inside one app (an uninstall, a
+    /// killed process, or another app renaming the adapter in the meantime
+    /// all defeat it), so putting a name back is left to the application.
     ///
-    /// That rule can't always be applied, which is why this variant says
-    /// *permanent*. The name stays renamed if:
-    ///
-    /// - the app is uninstalled while the name is borrowed, since nothing of it
-    ///   remains to restore anything;
-    /// - the app is killed and never launched again (a relaunch restores it as
-    ///   soon as the peripheral initializes);
-    /// - another app renames the adapter while blew advertises and never puts
-    ///   blew's name back, because blew won't overwrite that app's name;
-    /// - the Bluetooth permission is revoked.
+    /// Android applies a rename asynchronously, and an advertisement carries
+    /// whichever name is in place when it starts, so blew only starts
+    /// advertising once the new name has taken effect. If it hasn't within a
+    /// second, [`Peripheral::start_advertising`](crate::Peripheral::start_advertising)
+    /// fails rather than advertising the previous name.
     ///
     /// On Apple and Linux this is identical to [`Temporary`](Self::Temporary).
     AllowPermanent(String),
