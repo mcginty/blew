@@ -28,7 +28,7 @@ mise run fmt                             # format
 mise run fmt:check                       # check formatting
 mise run deny                            # license/vulnerability audit
 mise run ci:compile-kotlin               # compile the Android Kotlin sources
-mise run ci:test-kotlin                  # deterministic JVM GATT ownership tests
+mise run ci:test-kotlin                  # JVM tests: GATT ownership + Rust/Kotlin JNI contract
 cargo run --example scan -p blew         # scan for 10s
 cargo run --example advertise -p blew    # advertise GATT service
 ```
@@ -296,6 +296,20 @@ Uses `jni 0.22` and `ndk-context 0.1`. The Android BLE API is Java/Kotlin-only, 
 - **Kotlin singletons** (`BleCentralManager`, `BlePeripheralManager`) live in `crates/blew/android/` (co-located with the Rust JNI hooks so they link-time version together). They wrap `BluetoothLeScanner`, `BluetoothGatt`, `BluetoothGattServer`, and `BluetoothLeAdvertiser`.
 - **Rust → Kotlin**: `jvm().attach_current_thread()` then `call_static_method` on Kotlin object singletons.
 - **Kotlin → Rust**: `@JvmStatic external fun` declarations in Kotlin, implemented as `#[unsafe(no_mangle)] extern "C"` in `jni_hooks.rs`.
+
+**JNI contract test.** cargo and Gradle never read each other's method tables,
+so a missing `@JvmStatic` (which on a Kotlin `object` publishes no static of
+that name) or a stale `jni_sig!` is a runtime `MethodNotFound` behind entirely
+green CI — 0.4.0-beta.2 shipped that and aborted on launch.
+`JniContractTest` (run by `ci:test-kotlin`) parses every `call_static_method`
+site in `platform/android/*.rs` and asserts each method resolves to a *static*
+method with that exact descriptor, so the contract is derived from the Rust
+rather than restated. Two rules keep it working: the class at a call site must
+be a single expression the test can resolve (`central_class()`,
+`socket_class(is_server)`, …) — a local binding fails the test, which is why
+`socket_class` exists — and the site must keep the
+`call_static_method(class, jni_str!("…"), jni_sig!("…"), …)` shape, since the
+test cross-checks its match count against the number of call sites.
 
 **Classloader gotcha:** Rust background threads use the system classloader, which cannot find APK classes. `init_jvm()` caches `GlobalRef`s to both Kotlin classes on the main thread (which has the app classloader). All JNI calls use `central_class()` / `peripheral_class()` from `jni_globals.rs` instead of string class names.
 

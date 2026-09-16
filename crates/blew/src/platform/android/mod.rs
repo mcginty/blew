@@ -111,9 +111,9 @@ pub fn request_ble_permissions() {
                 &[JValue::Object(&class_name)],
             )?
             .l()?;
-        let class = unsafe { jni::objects::JClass::from_raw(env, class_obj.as_raw()) };
+        let plugin_class = unsafe { jni::objects::JClass::from_raw(env, class_obj.as_raw()) };
         env.call_static_method(
-            &class,
+            &plugin_class,
             jni_str!("requestBlePermissions"),
             jni_sig!("()V"),
             &[],

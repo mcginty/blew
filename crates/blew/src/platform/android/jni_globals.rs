@@ -65,9 +65,9 @@ pub fn init_jvm(vm: JavaVM) {
             .expect("getApplicationContext failed")
             .l()
             .expect("not an object");
-        for class in [&central_ref, &peripheral_ref] {
+        for manager_class in [&central_ref, &peripheral_ref] {
             env.call_static_method(
-                class,
+                manager_class,
                 jni_str!("init"),
                 jni_sig!("(Landroid/content/Context;)V"),
                 &[JValue::Object(&app_context)],

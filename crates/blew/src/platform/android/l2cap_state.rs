@@ -12,6 +12,8 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+use jni::objects::JClass;
+use jni::refs::Global;
 use jni::{jni_sig, jni_str};
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -84,6 +86,22 @@ pub(crate) fn init_statics() {
     let _ = TOKIO_HANDLE.set(tokio::runtime::Handle::current());
 }
 
+/// The manager class that owns the socket, which is whichever role opened it.
+///
+/// Both classes declare the whole L2CAP data-path surface, so the choice is
+/// only about which half's socket table to look the id up in. Kept as one
+/// function rather than three inline `if`s so the class at each
+/// `call_static_method` site below is a single expression: `JniContractTest`
+/// on the Kotlin side reads these sites to derive the JNI contract and cannot
+/// resolve a local binding.
+fn socket_class(is_server: bool) -> &'static Global<JClass<'static>> {
+    if is_server {
+        peripheral_class()
+    } else {
+        central_class()
+    }
+}
+
 /// Tell Kotlin how large its socket reads should be.
 ///
 /// The read loop lives on the Kotlin side, so `read_chunk_size` has to cross
@@ -93,13 +111,8 @@ pub(crate) fn init_statics() {
 fn push_read_buffer_size(config: &L2capConfig, is_server: bool) {
     let bytes = i32::try_from(config.effective_read_chunk_size()).unwrap_or(i32::MAX);
     let result = jvm().attach_current_thread(|env| {
-        let class = if is_server {
-            peripheral_class()
-        } else {
-            central_class()
-        };
         env.call_static_method(
-            class,
+            socket_class(is_server),
             jni_str!("setL2capReadBufferSize"),
             jni_sig!("(I)V"),
             &[bytes.into()],
@@ -163,13 +176,8 @@ pub(crate) fn set_pending_open(addr: String, tx: oneshot::Sender<BlewResult<L2ca
 
 fn close_socket(socket_id: i32, is_server: bool) {
     let _ = jvm().attach_current_thread(|env| {
-        let class = if is_server {
-            peripheral_class()
-        } else {
-            central_class()
-        };
         let _ = env.call_static_method(
-            class,
+            socket_class(is_server),
             jni_str!("closeL2cap"),
             jni_sig!("(I)V"),
             &[socket_id.into()],
@@ -233,13 +241,8 @@ pub(crate) fn on_channel_opened(device_addr: &str, socket_id: i32, from_server: 
                     let result = tokio::task::spawn_blocking(move || {
                         jvm().attach_current_thread(|env| {
                             let j_data = env.byte_array_from_slice(&data)?;
-                            let class = if is_server {
-                                peripheral_class()
-                            } else {
-                                central_class()
-                            };
                             env.call_static_method(
-                                class,
+                                socket_class(is_server),
                                 jni_str!("writeL2cap"),
                                 jni_sig!("(I[B)V"),
                                 &[socket_id.into(), (&j_data).into()],
