@@ -120,10 +120,7 @@ async fn evict_stale_cache_entries(adapter: &Adapter) {
     }
 }
 
-async fn what_the_device_advertises_so_far(
-    adapter: &Adapter,
-    addr: bluer::Address,
-) -> Option<BleDevice> {
+async fn snapshot_advertisement(adapter: &Adapter, addr: bluer::Address) -> Option<BleDevice> {
     let device = adapter.device(addr).ok()?;
     Some(BleDevice {
         id: DeviceId(addr.to_string()),
@@ -152,7 +149,7 @@ async fn what_the_device_advertises_so_far(
     })
 }
 
-async fn follow_the_air(
+async fn run_discovery_loop(
     handle: Arc<CentralInner>,
     discovery: impl Stream<Item = AdapterEvent> + Send,
 ) {
@@ -168,7 +165,7 @@ async fn follow_the_air(
                     // Subscribe before snapshotting: `Device::events()` replays no
                     // current state, so a change arriving during the snapshot's D-Bus
                     // round trips would be lost with no way to recover it.
-                    match watch_the_advertisement(&handle.adapter, addr).await {
+                    match watch_device_properties(&handle.adapter, addr).await {
                         Ok(changes) => {
                             watched_advertisements.insert(addr, changes);
                         }
@@ -177,7 +174,7 @@ async fn follow_the_air(
                         }
                     }
                     let Some(device) =
-                        what_the_device_advertises_so_far(&handle.adapter, addr).await
+                        snapshot_advertisement(&handle.adapter, addr).await
                     else {
                         continue;
                     };
@@ -206,7 +203,7 @@ async fn follow_the_air(
                 let Some(known) = discovered.get_mut(&device_id) else {
                     continue;
                 };
-                if !changes_the_advertised_payload(known, property) {
+                if !apply_advertised_property(known, property) {
                     continue;
                 }
                 let device = known.clone();
@@ -220,7 +217,7 @@ async fn follow_the_air(
     }
 }
 
-async fn watch_the_advertisement(
+async fn watch_device_properties(
     adapter: &Adapter,
     addr: bluer::Address,
 ) -> bluer::Result<Pin<Box<dyn Stream<Item = DeviceEvent> + Send>>> {
@@ -228,7 +225,7 @@ async fn watch_the_advertisement(
     Ok(Box::pin(changes))
 }
 
-fn changes_the_advertised_payload(device: &mut BleDevice, property: DeviceProperty) -> bool {
+fn apply_advertised_property(device: &mut BleDevice, property: DeviceProperty) -> bool {
     match property {
         DeviceProperty::Name(name) => device.name = Some(name),
         DeviceProperty::Uuids(services) => device.services = services.into_iter().collect(),
@@ -523,7 +520,7 @@ impl CentralBackend for LinuxCentral {
                 old.abort();
             }
 
-            let task = tokio::spawn(follow_the_air(Arc::clone(&handle), discovery));
+            let task = tokio::spawn(run_discovery_loop(Arc::clone(&handle), discovery));
 
             *handle.scan_task.lock() = Some(task);
             Ok(())
@@ -941,13 +938,13 @@ fn check_bluez_config() {
 
 #[cfg(test)]
 mod tests {
-    use super::changes_the_advertised_payload;
+    use super::apply_advertised_property;
     use crate::types::{BleDevice, DeviceId};
     use bluer::DeviceProperty;
     use std::collections::HashMap;
     use uuid::Uuid;
 
-    fn seen_once() -> BleDevice {
+    fn initial_snapshot() -> BleDevice {
         BleDevice {
             id: DeviceId::from("11:22:33:44:55:66"),
             name: None,
@@ -959,12 +956,12 @@ mod tests {
     }
 
     #[test]
-    fn service_data_arriving_late_is_worth_announcing() {
+    fn late_service_data_emits_discovery() {
         let service = Uuid::from_u128(0x0000_180f_0000_1000_8000_0080_5f9b_34fb);
-        let mut device = seen_once();
+        let mut device = initial_snapshot();
         let arrived = HashMap::from([(service, vec![0x64])]);
 
-        assert!(changes_the_advertised_payload(
+        assert!(apply_advertised_property(
             &mut device,
             DeviceProperty::ServiceData(arrived.clone())
         ));
@@ -972,10 +969,10 @@ mod tests {
     }
 
     #[test]
-    fn a_moving_rssi_is_not_something_new_to_announce() {
-        let mut device = seen_once();
+    fn rssi_change_does_not_emit_discovery() {
+        let mut device = initial_snapshot();
 
-        assert!(!changes_the_advertised_payload(
+        assert!(!apply_advertised_property(
             &mut device,
             DeviceProperty::Rssi(-70)
         ));
