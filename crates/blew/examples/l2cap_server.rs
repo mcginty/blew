@@ -13,7 +13,7 @@
 use blew::Peripheral;
 use blew::gatt::props::{AttributePermissions, CharacteristicProperties};
 use blew::gatt::service::{GattCharacteristic, GattService};
-use blew::peripheral::{AdvertisingConfig, PeripheralRequest};
+use blew::peripheral::{AdvertisingConfig, LocalName, PeripheralRequest};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_stream::StreamExt as _;
@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     peripheral
         .start_advertising(&AdvertisingConfig {
-            local_name: Some("blew-l2cap".into()),
+            local_name: LocalName::Temporary("blew-l2cap".into()),
             service_uuids: vec![SVC_UUID],
         })
         .await?;

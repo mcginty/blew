@@ -412,7 +412,7 @@ impl PeripheralBackend for LinuxPeripheral {
             // doesn't support extended advertising (BLE 4.x adapters).
             let make_adv = |secondary_channel| Advertisement {
                 advertisement_type: AdvType::Peripheral,
-                local_name: config.local_name.clone(),
+                local_name: config.local_name.name().map(str::to_owned),
                 service_uuids: config.service_uuids.clone().into_iter().collect(),
                 secondary_channel,
                 ..Default::default()

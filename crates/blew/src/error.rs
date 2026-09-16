@@ -108,6 +108,13 @@ pub enum BlewError {
         reason: &'static str,
     },
 
+    /// The configured [`LocalName`](crate::peripheral::LocalName) can't be
+    /// advertised on this platform. The backend refuses rather than advertising
+    /// no name, which would leave a peer matching on the name unable to find
+    /// the peripheral.
+    #[error("advertising this local name is unavailable here: {reason}")]
+    LocalNameUnsupported { reason: &'static str },
+
     #[error("internal error: {0}")]
     Internal(String),
 }

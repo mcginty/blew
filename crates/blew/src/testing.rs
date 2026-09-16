@@ -288,7 +288,7 @@ impl CentralBackend for MockCentral {
         let tx = self.event_tx.clone();
         async move {
             if advertising {
-                let name = adv_config.and_then(|c| c.local_name);
+                let name = adv_config.and_then(|c| c.local_name.name().map(str::to_owned));
                 let _ = tx.send(CentralEvent::DeviceDiscovered(BleDevice {
                     id: DeviceId::from("mock-peripheral"),
                     name,
@@ -838,7 +838,7 @@ mod tests {
     use crate::central::Central;
     use crate::gatt::props::{AttributePermissions, CharacteristicProperties};
     use crate::gatt::service::GattCharacteristic;
-    use crate::peripheral::Peripheral;
+    use crate::peripheral::{LocalName, Peripheral};
     use tokio_stream::StreamExt;
 
     #[tokio::test]
@@ -859,7 +859,7 @@ mod tests {
 
         peripheral
             .start_advertising(&AdvertisingConfig {
-                local_name: Some("test".into()),
+                local_name: LocalName::Temporary("test".into()),
                 service_uuids: vec![svc_uuid],
             })
             .await
@@ -907,6 +907,35 @@ mod tests {
 
         match events.next().await.expect("should get discovery event") {
             CentralEvent::DeviceDiscovered(device) => assert_eq!(device.name, None),
+            other => panic!("expected DeviceDiscovered, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mock_link_discovery_with_permanent_name() {
+        let (c, p) = MockLink::pair();
+        let central = Central::from_backend(c.central);
+        let peripheral = Peripheral::from_backend(p.peripheral);
+
+        peripheral
+            .start_advertising(&AdvertisingConfig {
+                local_name: LocalName::AllowPermanent("lent".into()),
+                service_uuids: vec![Uuid::from_u128(0x1234)],
+            })
+            .await
+            .unwrap();
+
+        let mut events = central.events();
+        assert!(matches!(
+            events.next().await.unwrap(),
+            CentralEvent::AdapterStateChanged { powered: true }
+        ));
+        central.start_scan(ScanFilter::default()).await.unwrap();
+
+        match events.next().await.expect("should get discovery event") {
+            CentralEvent::DeviceDiscovered(device) => {
+                assert_eq!(device.name.as_deref(), Some("lent"));
+            }
             other => panic!("expected DeviceDiscovered, got {other:?}"),
         }
     }
@@ -1189,7 +1218,7 @@ mod tests {
         let peripheral = Peripheral::from_backend(p.peripheral);
 
         let config = AdvertisingConfig {
-            local_name: Some("test".into()),
+            local_name: LocalName::Temporary("test".into()),
             service_uuids: vec![],
         };
 
@@ -1555,7 +1584,7 @@ mod tests {
         let peripheral = Peripheral::from_backend(p.peripheral);
 
         let config = AdvertisingConfig {
-            local_name: Some("test".into()),
+            local_name: LocalName::Temporary("test".into()),
             service_uuids: vec![],
         };
 
