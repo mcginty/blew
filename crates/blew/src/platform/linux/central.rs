@@ -120,32 +120,33 @@ async fn evict_stale_cache_entries(adapter: &Adapter) {
     }
 }
 
+fn addr_to_device_id(addr: bluer::Address) -> DeviceId {
+    DeviceId(addr.to_string())
+}
+
 async fn snapshot_advertisement(adapter: &Adapter, addr: bluer::Address) -> Option<BleDevice> {
     let device = adapter.device(addr).ok()?;
+    // Independent D-Bus round trips, and discover_devices() replays the whole
+    // cache as DeviceAdded, so this runs once per known device at scan start.
+    let (name, rssi, services, manufacturer_data, service_data) = tokio::join!(
+        device.name(),
+        device.rssi(),
+        device.uuids(),
+        device.manufacturer_data(),
+        device.service_data(),
+    );
     Some(BleDevice {
-        id: DeviceId(addr.to_string()),
-        name: device.name().await.ok().flatten(),
-        rssi: device.rssi().await.ok().flatten(),
-        services: device
-            .uuids()
-            .await
+        id: addr_to_device_id(addr),
+        name: name.ok().flatten(),
+        rssi: rssi.ok().flatten(),
+        services: services
             .ok()
             .flatten()
             .unwrap_or_default()
             .into_iter()
             .collect(),
-        manufacturer_data: device
-            .manufacturer_data()
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default(),
-        service_data: device
-            .service_data()
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default(),
+        manufacturer_data: manufacturer_data.ok().flatten().unwrap_or_default(),
+        service_data: service_data.ok().flatten().unwrap_or_default(),
     })
 }
 
@@ -184,13 +185,19 @@ async fn run_discovery_loop(
                     let _ = handle.event_tx.send(CentralEvent::DeviceDiscovered(device));
                 }
                 Some(AdapterEvent::DeviceRemoved(addr)) => {
-                    let device_id = DeviceId(addr.to_string());
+                    let device_id = addr_to_device_id(addr);
                     debug!(device_id = %device_id, "device removed");
                     watched_advertisements.remove(&addr);
                     handle.discovered.lock().remove(&device_id);
                     handle.abort_connection_watcher(&device_id);
-                    let cause = handle.involuntary_cause().await;
-                    handle.emit_disconnect(&device_id, cause);
+                    // involuntary_cause() is a D-Bus round trip, and emit_disconnect
+                    // discards it for a device that was never connected -- which is
+                    // most of them during a scan.
+                    let was_connected = handle.connected.lock().contains(&device_id);
+                    if was_connected {
+                        let cause = handle.involuntary_cause().await;
+                        handle.emit_disconnect(&device_id, cause);
+                    }
                 }
                 Some(AdapterEvent::PropertyChanged(_)) => {}
                 None => break,
@@ -198,7 +205,7 @@ async fn run_discovery_loop(
             Some((addr, DeviceEvent::PropertyChanged(property))) = watched_advertisements.next(),
                 if !watched_advertisements.is_empty() =>
             {
-                let device_id = DeviceId(addr.to_string());
+                let device_id = addr_to_device_id(addr);
                 let mut discovered = handle.discovered.lock();
                 let Some(known) = discovered.get_mut(&device_id) else {
                     continue;
