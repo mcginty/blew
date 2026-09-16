@@ -42,6 +42,13 @@ struct L2capState {
     close_reasons: Mutex<HashMap<i32, CloseReasonSlot>>,
     /// Central and peripheral can be configured independently; `from_server`
     /// on the open callback says which side a socket belongs to.
+    ///
+    /// **Never read `encryption` from these.** They are process-global and the
+    /// last role constructed wins, so a second default-configured `Central`
+    /// would silently relax a first one that asked for `RequireEncryption`.
+    /// The buffer sizes tolerate that (wrong size is a tuning bug); a security
+    /// level does not. Each backend instance owns its own level — see
+    /// `AndroidCentral::l2cap_encryption` — and passes it to [`secure_flag`].
     client_config: Mutex<L2capConfig>,
     server_config: Mutex<L2capConfig>,
 }
@@ -124,23 +131,14 @@ pub(crate) fn set_server_config(config: L2capConfig) {
 /// require an authenticated, encrypted link; the `Insecure` variants require
 /// neither. There is no middle setting, so `RequireEncryption` gets the secure
 /// socket too — stronger than asked for, which is the safe direction to round.
-fn secure_flag(config: &L2capConfig) -> bool {
-    match config.encryption {
+///
+/// Takes the level by value rather than reading it out of [`L2capState`]: see
+/// the warning on `client_config`.
+pub(crate) fn secure_flag(encryption: L2capEncryption) -> bool {
+    match encryption {
         L2capEncryption::Insecure => false,
         L2capEncryption::RequireEncryption | L2capEncryption::RequireAuthentication => true,
     }
-}
-
-pub(crate) fn client_secure() -> bool {
-    STATE
-        .get()
-        .is_some_and(|s| secure_flag(&s.client_config.lock()))
-}
-
-pub(crate) fn server_secure() -> bool {
-    STATE
-        .get()
-        .is_some_and(|s| secure_flag(&s.server_config.lock()))
 }
 
 pub(crate) fn set_pending_server(tx: oneshot::Sender<BlewResult<Psm>>) {

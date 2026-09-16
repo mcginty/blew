@@ -185,6 +185,15 @@ Rounding *up* is fine (Android's single secure socket serves `RequireEncryption`
 The default is `Insecure`, matching what every backend hardcoded before 0.4.0;
 don't raise it without a major bump.
 
+**The Android level lives on the backend instance, not in `l2cap_state`.** Every
+other L2CAP setting there is process-global and last-writer-wins, which is
+survivable for buffer sizes and not for a security level: `AndroidCentral::new()`
+routes through `with_config(default)`, so a bare second `Central::new()` would
+otherwise reset a first one that asked for `RequireEncryption` and silently open
+it an insecure socket. `AndroidCentral`/`AndroidPeripheral` each own an
+`l2cap_encryption` field and pass it to `l2cap_state::secure_flag`. **Don't move
+it back into `L2capState`** — there is deliberately no global accessor for it.
+
 The setting is meaningful on *both* paths and the two enforce it differently:
 the listener refuses a `LE_CREDIT_BASED_CONNECTION_REQ` whose link doesn't meet
 its requirement (the request PDU carries no security field), while the opener

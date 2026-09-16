@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::error::{BlewError, BlewResult};
 use crate::gatt::props::CharacteristicProperties;
 use crate::gatt::service::GattService;
-use crate::l2cap::{L2capChannel, types::Psm};
+use crate::l2cap::{L2capChannel, L2capEncryption, types::Psm};
 use crate::peripheral::backend::{self, PeripheralBackend};
 use crate::peripheral::types::{
     AdvertisingConfig, PeripheralConfig, PeripheralRequest, PeripheralStateEvent,
@@ -171,12 +171,19 @@ pub(crate) fn send_state_event(event: PeripheralStateEvent) {
     }
 }
 
-pub struct AndroidPeripheral;
+pub struct AndroidPeripheral {
+    /// Owned per instance, not stored in the process-global L2CAP state: a
+    /// second `Peripheral` constructed with a different config must not be
+    /// able to relax a listener this one published. See the warning on
+    /// `l2cap_state::L2capState::client_config`.
+    l2cap_encryption: L2capEncryption,
+}
 
 impl AndroidPeripheral {
     pub async fn with_config(config: PeripheralConfig) -> BlewResult<Self> {
-        let this = <Self as PeripheralBackend>::new().await?;
+        let mut this = <Self as PeripheralBackend>::new().await?;
         super::l2cap_state::set_server_config(config.l2cap.clone());
+        this.l2cap_encryption = config.l2cap.encryption;
         Ok(this)
     }
 }
@@ -283,7 +290,9 @@ impl PeripheralBackend for AndroidPeripheral {
         // builds both roles is unaffected.
         super::l2cap_state::init_statics();
         debug!("AndroidPeripheral initialized");
-        Ok(AndroidPeripheral)
+        Ok(AndroidPeripheral {
+            l2cap_encryption: L2capEncryption::default(),
+        })
     }
 
     async fn is_powered(&self) -> BlewResult<bool> {
@@ -462,7 +471,7 @@ impl PeripheralBackend for AndroidPeripheral {
         let (accept_tx, accept_rx) = mpsc::unbounded_channel();
         super::l2cap_state::set_accept_tx(accept_tx);
 
-        let secure = super::l2cap_state::server_secure();
+        let secure = super::l2cap_state::secure_flag(self.l2cap_encryption);
         jvm()
             .attach_current_thread(|env| {
                 env.call_static_method(
