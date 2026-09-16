@@ -94,6 +94,11 @@ jobs:
       - run: mise install --force rust
       - uses: Swatinem/rust-cache@v2
       - uses: android-actions/setup-android@v3
+        with:
+          # The action still defaults to 'tools platform-tools', but the
+          # obsolete 'tools' package was removed from the SDK repository and
+          # sdkmanager now fails on it. cmdline-tools replaces it.
+          packages: platform-tools
       - name: Install Linux system dependencies
         run: sudo apt-get update && sudo apt-get install -y $LINUX_APT_DEPS
       - run: mise run ci:test-kotlin
