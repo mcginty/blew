@@ -103,7 +103,7 @@ crates/blew/src/
 crates/blew/android/                  # Co-located Kotlin/Gradle module for the Android backend
 ├── src/main/java/org/jakebot/blew/   # BleCentralManager.kt, BlePeripheralManager.kt,
 │                                     #   GattOperationQueue.kt, L2capSocketManager.kt,
-│                                     #   BlewPlugin.kt (Tauri entry point)
+│                                     #   AdapterRename.kt, BlewPlugin.kt (Tauri entry point)
 └── AndroidManifest.xml               # Runtime permission declarations (merged into host app)
 ```
 
@@ -338,6 +338,32 @@ rx.await?; // safe to await now
 - `AndroidCentral`: uses `tokio::sync::broadcast` for events and generation-qualified pending GATT operations. `ConnectAttempts` retains identity through connected/disconnecting states. Register waiters and apply callback effects under its mutex, but **never hold that mutex across JNI**: Kotlin delivers callbacks while holding its lifecycle monitor.
 - `GattConnections` owns each attempt's callback, handle, queue, nonces and MTU. Its monitor orders callbacks, operation kicks, retirement and delivery to Rust; `GattFactory.open` runs outside the monitor so an unpublished handle can be retired. The callback captures its attempt before factory entry. All lifecycle/GATT JNI requests and results carry a generation (except read-only `refresh`/`getMtu`). Disconnect fallback and cancellation target exact generations; there is no wildcard close. `ci:test-kotlin` exercises the production controller with a fake factory and virtual coroutine time.
 - `AndroidPeripheral`: state events fan out through `tokio::sync::broadcast` (`PeripheralStateEvent` is `Clone`). GATT reads/writes are delivered as `PeripheralRequest` over an `mpsc::UnboundedSender`, handed out once via `take_requests()`. For each request, a tokio task awaits the responder's oneshot then calls Kotlin `respondToRead`/`respondToWrite` via JNI. All Rust-side synchronization uses `parking_lot::Mutex`.
+
+**Local-name invariant.** `AdvertisingConfig::local_name` (`LocalName`) is a
+permission, not just a value. Android has no per-advertisement name, so
+`AllowPermanent` is the only variant that reaches `BluetoothAdapter.setName`,
+and that rename is device-global and persistent. **Do not** make `Temporary`
+fall back to renaming the adapter on Android to avoid
+`BlewError::LocalNameUnsupported` — the point is that the device-wide mutation
+is unreachable without asking for it.
+
+blew deliberately does **not** restore the previous adapter name. A restore
+can't be made correct from inside one app: an uninstall mid-advertisement, a
+process that never relaunches, or two apps each saving the other's borrowed
+name all defeat it. Restoring is left to the application; don't add a
+best-effort restore back.
+
+`AdapterRename.kt` does handle the race: a rename lands asynchronously and the
+scan response snapshots whatever name is in place at start, so a named start
+waits for `ACTION_LOCAL_NAME_CHANGED`. After one second it reads the name back
+and **fails** the start (`ADVERTISE_FAILED_RENAME_UNCONFIRMED`) if the rename
+hasn't landed — never advertise anyway, that puts the previous name on air.
+`onReady` runs under the class's monitor so `cancel` can't slip between
+deciding to advertise and advertising; `onFailed` runs after the monitor is
+released, because it takes `advertiseLock`, which callers hold while calling
+in. Stop cancels the ticket **before** touching the advertiser; reversing the
+order lets a waiting start begin an advertisement nothing can stop.
+`ci:test-kotlin` exercises it with a fake adapter and virtual time.
 
 **JNI data marshalling:** Complex data (GATT services, UUID lists) passed as flat arrays or JSON strings to avoid complex JNI type construction. Service characteristics use parallel arrays (uuids, properties, permissions, values).
 

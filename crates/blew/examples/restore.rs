@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use blew::central::{Central, CentralConfig};
     use blew::gatt::props::{AttributePermissions, CharacteristicProperties};
     use blew::gatt::service::{GattCharacteristic, GattService};
-    use blew::peripheral::{AdvertisingConfig, Peripheral, PeripheralConfig};
+    use blew::peripheral::{AdvertisingConfig, LocalName, Peripheral, PeripheralConfig};
     use uuid::Uuid;
 
     // The restore identifier must be stable across launches; the OS matches on it.
@@ -120,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             peripheral
                 .start_advertising(&AdvertisingConfig {
-                    local_name: Some("blew-restore".into()),
+                    local_name: LocalName::Temporary("blew-restore".into()),
                     service_uuids: vec![SVC_UUID],
                 })
                 .await?;

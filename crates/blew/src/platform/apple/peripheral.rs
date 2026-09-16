@@ -887,7 +887,7 @@ impl PeripheralBackend for ApplePeripheral {
             debug!(local_name = ?config.local_name, "starting advertising");
 
             let rx = {
-                let local_name = config.local_name.as_deref().map(NSString::from_str);
+                let local_name = config.local_name.name().map(NSString::from_str);
 
                 let service_uuids: Vec<Retained<CBUUID>> = config
                     .service_uuids

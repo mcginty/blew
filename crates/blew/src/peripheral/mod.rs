@@ -2,8 +2,8 @@ pub mod backend;
 pub mod types;
 
 pub use types::{
-    AdvertisingConfig, PeripheralConfig, PeripheralRequest, PeripheralStateEvent, ReadResponder,
-    WriteResponder,
+    AdvertisingConfig, LocalName, PeripheralConfig, PeripheralRequest, PeripheralStateEvent,
+    ReadResponder, WriteResponder,
 };
 
 use crate::error::{BlewError, BlewResult};

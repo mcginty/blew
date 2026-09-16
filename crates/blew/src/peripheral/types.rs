@@ -164,17 +164,86 @@ impl WriteResponder {
 /// is available on [`BleDevice::manufacturer_data`](crate::BleDevice).
 #[derive(Debug, Clone, Default)]
 pub struct AdvertisingConfig {
-    /// Name to advertise. `None`, the default, puts no name in the advertising
-    /// data, leaving its byte budget to the service UUIDs; peers identify the
-    /// peripheral by those instead. The OS may still expose the device name
-    /// through the GAP Device Name characteristic once a peer connects.
-    ///
-    /// **Android:** `Some` renames the device's Bluetooth adapter, because
-    /// `AdvertiseData` can only include the adapter's own name. The rename is
-    /// device-global and persistent -- it appears in system Settings and to
-    /// every Bluetooth peer -- and is not undone by `stop_advertising`.
-    pub local_name: Option<String>,
+    /// Name to advertise, and how long it may last. See [`LocalName`].
+    pub local_name: LocalName,
     pub service_uuids: Vec<Uuid>,
+}
+
+/// Name to advertise, and how long its effects may last.
+///
+/// Apple and Linux put the name in the advertisement itself, so it lasts only
+/// as long as the advertisement. Android can't do that: `AdvertiseData` offers
+/// only `setIncludeDeviceName(boolean)`, which reads `BluetoothAdapter.getName()`.
+/// The only way to advertise a chosen name there is to rename the adapter. That
+/// name is device-wide: the car, the headphones and every pairing dialog show
+/// it. A rename also persists until something changes it back, so the variants
+/// differ in how long the name is allowed to last.
+///
+/// A backend that can't provide the requested variant returns
+/// [`BlewError::LocalNameUnsupported`](crate::error::BlewError::LocalNameUnsupported).
+/// It never quietly advertises no name, because a peer matching on the name
+/// would then never find this peripheral.
+///
+/// # Platform mapping
+///
+/// | | `None` | `Temporary` | `AllowPermanent` |
+/// |---|---|---|---|
+/// | Apple | no `CBAdvertisementDataLocalNameKey` | `CBAdvertisementDataLocalNameKey` | as `Temporary` |
+/// | Linux | no BlueZ `LocalName` | BlueZ `LocalName` | as `Temporary` |
+/// | Android | `setIncludeDeviceName(false)` | unsupported | adapter rename, left in place |
+///
+/// On Apple and Linux, `AllowPermanent` behaves exactly like `Temporary`.
+///
+/// **iOS:** CoreBluetooth drops the local name from advertisements while the
+/// app is in the background, whichever variant is used.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum LocalName {
+    /// No name in the advertising data, which leaves its bytes for the service
+    /// UUIDs; peers identify the peripheral by those. After connecting, a peer
+    /// may still read the OS's device name from the GAP Device Name
+    /// characteristic.
+    #[default]
+    None,
+
+    /// Advertise the name only in the advertisement, with no effect beyond it.
+    /// It stops appearing when advertising stops, and nothing else on the
+    /// device changes.
+    ///
+    /// Unsupported on Android, which has no way to name a single advertisement.
+    /// Use [`AllowPermanent`](Self::AllowPermanent) there if a device-wide
+    /// rename is acceptable.
+    Temporary(String),
+
+    /// Advertise the name, even if a platform has to rename the whole device
+    /// to do it, and leave that rename in place.
+    ///
+    /// On Android this sets the Bluetooth adapter's name, which every app and
+    /// paired device sees, and it stays set after advertising stops and after
+    /// the app exits. blew doesn't record or restore the previous name: a
+    /// restore can't be made reliable from inside one app (an uninstall, a
+    /// killed process, or another app renaming the adapter in the meantime
+    /// all defeat it), so putting a name back is left to the application.
+    ///
+    /// Android applies a rename asynchronously, and an advertisement carries
+    /// whichever name is in place when it starts, so blew only starts
+    /// advertising once the new name has taken effect. If it hasn't within a
+    /// second, [`Peripheral::start_advertising`](crate::Peripheral::start_advertising)
+    /// fails rather than advertising the previous name.
+    ///
+    /// On Apple and Linux this is identical to [`Temporary`](Self::Temporary).
+    AllowPermanent(String),
+}
+
+impl LocalName {
+    /// The name to put on air, for backends where both naming variants mean
+    /// the same thing. Android distinguishes them, so it doesn't use this.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
+    pub(crate) fn name(&self) -> Option<&str> {
+        match self {
+            Self::None => None,
+            Self::Temporary(name) | Self::AllowPermanent(name) => Some(name),
+        }
+    }
 }
 
 #[cfg(test)]

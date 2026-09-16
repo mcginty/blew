@@ -41,6 +41,16 @@ object BlePeripheralManager {
     /** An advertisement is already running or starting. */
     const val ADVERTISE_ALREADY = 2
 
+    /** The stack refused to rename the adapter for a named advertisement. */
+    const val ADVERTISE_NAME_REJECTED = 3
+
+    /**
+     * Error code reported through [nativeOnAdvertisingResult] when the adapter
+     * rename a named advertisement waits for never took effect. Negative, so it
+     * can't collide with an `AdvertiseCallback` error.
+     */
+    const val ADVERTISE_FAILED_RENAME_UNCONFIRMED = -1
+
     private var context: Context? = null
     private var bluetoothManager: BluetoothManager? = null
 
@@ -178,11 +188,17 @@ object BlePeripheralManager {
                 context: Context,
                 intent: Intent,
             ) {
-                if (intent.action == BluetoothAdapter.ACTION_STATE_CHANGED) {
-                    val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
-                    when (state) {
-                        BluetoothAdapter.STATE_ON -> nativeOnAdapterStateChanged(true)
-                        BluetoothAdapter.STATE_OFF -> nativeOnAdapterStateChanged(false)
+                when (intent.action) {
+                    BluetoothAdapter.ACTION_STATE_CHANGED -> {
+                        val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
+                        when (state) {
+                            BluetoothAdapter.STATE_ON -> nativeOnAdapterStateChanged(true)
+                            BluetoothAdapter.STATE_OFF -> nativeOnAdapterStateChanged(false)
+                        }
+                    }
+
+                    BluetoothAdapter.ACTION_LOCAL_NAME_CHANGED -> {
+                        adapterRename?.onNameChanged(intent.getStringExtra(BluetoothAdapter.EXTRA_LOCAL_NAME))
                     }
                 }
             }
@@ -200,15 +216,39 @@ object BlePeripheralManager {
         // returns null while Bluetooth is off, and nothing refreshes a cached
         // null when it comes back on. It is resolved per startAdvertising call.
         Log.d(TAG, "initialized, adapter=${adapter != null}")
+        if (adapterRename == null) {
+            adapterRename = AdapterRename(AndroidAdapterNames(), scope)
+        }
         // Registering the same receiver twice delivers every adapter state
         // change twice. init() runs again whenever the host activity is
         // recreated -- a rotation or a dark-mode toggle is enough -- and
         // nothing ever unregisters, so the duplicates would accumulate.
         if (!receiverRegistered) {
             val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+            filter.addAction(BluetoothAdapter.ACTION_LOCAL_NAME_CHANGED)
             ctx.registerReceiver(adapterStateReceiver, filter)
             receiverRegistered = true
         }
+    }
+
+    /** Renames the adapter for named advertisements; see [AdapterRename]. */
+    @Volatile
+    private var adapterRename: AdapterRename? = null
+
+    private class AndroidAdapterNames : AdapterNames {
+        override fun get(): String? =
+            try {
+                bluetoothManager?.adapter?.name
+            } catch (e: SecurityException) {
+                null
+            }
+
+        override fun set(name: String): Boolean =
+            try {
+                bluetoothManager?.adapter?.setName(name) == true
+            } catch (e: SecurityException) {
+                false
+            }
     }
 
     private val gattCallback =
@@ -427,9 +467,18 @@ object BlePeripheralManager {
     /** Request id of the live [advertiseCallback], for [stopAdvertising]. */
     private var advertiseRequestId: Int = 0
 
+    /** The adapter rename the live [advertiseCallback] waits for, if it advertises a name. */
+    private var advertiseRenameTicket: AdapterRename.Ticket? = null
+
     /**
      * Begin advertising. Returns [ADVERTISE_OK] when the request was handed to
      * the stack, or a failure code for something that went wrong before that.
+     *
+     * A non-null [name] is permission to rename the adapter, which is the only
+     * name Android can advertise. The rename is left in place afterwards. The
+     * stack only sees the request once the rename has landed; if it doesn't
+     * land, the start fails through [nativeOnAdvertisingResult] with
+     * [ADVERTISE_FAILED_RENAME_UNCONFIRMED]. See [AdapterRename].
      *
      * Success is *not* confirmed by the return value — the stack reports that
      * asynchronously through [nativeOnAdvertisingResult].
@@ -464,13 +513,6 @@ object BlePeripheralManager {
         // Remembered so stopAdvertising passes the same instance back.
         advertiser = adv
         advertiseRequestId = requestId
-
-        // AdvertiseData can only carry the adapter's own name, so a custom
-        // name means renaming the adapter device-wide. Only do that when the
-        // caller asked for a name.
-        if (name != null) {
-            bluetoothManager?.adapter?.name = name
-        }
 
         val settings =
             AdvertiseSettings
@@ -512,6 +554,7 @@ object BlePeripheralManager {
                     synchronized(advertiseLock) {
                         if (advertiseRequestId == requestId) {
                             advertiseCallback = null
+                            advertiseRenameTicket = null
                         }
                     }
                     // Outside the monitor: this crosses into Rust, which takes
@@ -520,8 +563,42 @@ object BlePeripheralManager {
                 }
             }
 
-        adv.startAdvertising(settings, data, scanResponse, advertiseCallback)
+        val callback = advertiseCallback
+        if (name == null) {
+            adv.startAdvertising(settings, data, scanResponse, callback)
+            return ADVERTISE_OK
+        }
+        val rename =
+            adapterRename ?: run {
+                advertiseCallback = null
+                return ADVERTISE_UNAVAILABLE
+            }
+        // onReady may run after this returns, from the name broadcast. Stop
+        // cancels the ticket before touching the advertiser, which drops a
+        // start that hasn't run yet, so a late one can't outlive it.
+        val ticket =
+            rename.request(
+                name,
+                onReady = { adv.startAdvertising(settings, data, scanResponse, callback) },
+                onFailed = { renameUnconfirmed(requestId) },
+            ) ?: run {
+                advertiseCallback = null
+                return ADVERTISE_NAME_REJECTED
+            }
+        advertiseRenameTicket = ticket
         return ADVERTISE_OK
+    }
+
+    private fun renameUnconfirmed(requestId: Int) {
+        synchronized(advertiseLock) {
+            // Nothing started, so there is nothing to stop; just free the slot.
+            if (advertiseRequestId == requestId) {
+                advertiseCallback = null
+                advertiseRenameTicket = null
+            }
+        }
+        // Outside the monitor, as in onStartFailure. A stale id is ignored by Rust.
+        nativeOnAdvertisingResult(requestId, false, ADVERTISE_FAILED_RENAME_UNCONFIRMED)
     }
 
     /**
@@ -543,6 +620,8 @@ object BlePeripheralManager {
             if (cb == null || advertiseRequestId != requestId) {
                 return
             }
+            advertiseRenameTicket?.let { adapterRename?.cancel(it) }
+            advertiseRenameTicket = null
             advertiser?.stopAdvertising(cb)
             advertiseCallback = null
         }

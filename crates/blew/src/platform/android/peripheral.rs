@@ -12,7 +12,7 @@ use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, L2capEncryption, types::Psm};
 use crate::peripheral::backend::{self, PeripheralBackend};
 use crate::peripheral::types::{
-    AdvertisingConfig, PeripheralConfig, PeripheralRequest, PeripheralStateEvent,
+    AdvertisingConfig, LocalName, PeripheralConfig, PeripheralRequest, PeripheralStateEvent,
 };
 use crate::types::DeviceId;
 use crate::util::BroadcastEventStream;
@@ -30,6 +30,11 @@ const ADVERTISE_OK: i32 = 0;
 /// Kotlin's `BlePeripheralManager.ADVERTISE_ALREADY`. Kotlin guards
 /// independently of the Rust slot, so this can still come back.
 const ADVERTISE_ALREADY: i32 = 2;
+/// Kotlin's `BlePeripheralManager.ADVERTISE_NAME_REJECTED`.
+const ADVERTISE_NAME_REJECTED: i32 = 3;
+/// Kotlin's `BlePeripheralManager.ADVERTISE_FAILED_RENAME_UNCONFIRMED`, reported
+/// through `nativeOnAdvertisingResult` in place of an `AdvertiseCallback` error.
+pub(super) const ADVERTISE_FAILED_RENAME_UNCONFIRMED: i32 = -1;
 
 struct PeripheralState {
     request_tx: mpsc::UnboundedSender<PeripheralRequest>,
@@ -188,9 +193,22 @@ impl AndroidPeripheral {
     }
 }
 
+/// The name Kotlin may rename the adapter to, or `None` to leave it alone.
+fn adapter_name(local_name: &LocalName) -> BlewResult<Option<&str>> {
+    match local_name {
+        LocalName::None => Ok(None),
+        LocalName::AllowPermanent(name) => Ok(Some(name)),
+        LocalName::Temporary(_) => Err(BlewError::LocalNameUnsupported {
+            reason: "Android can only advertise the adapter's own name; \
+                     LocalName::AllowPermanent renames the adapter to do it",
+        }),
+    }
+}
+
 /// Issue one advertising request and wait for the stack's verdict.
 async fn drive_advertising(
     config: &AdvertisingConfig,
+    adapter_name: Option<&str>,
     request_id: i32,
     rx: oneshot::Receiver<BlewResult<()>>,
 ) -> BlewResult<()> {
@@ -199,7 +217,7 @@ async fn drive_advertising(
 
     let code: i32 = jvm()
         .attach_current_thread(|env| {
-            let name = match &config.local_name {
+            let name = match adapter_name {
                 Some(name) => JObject::from(env.new_string(name)?),
                 None => JObject::null(),
             };
@@ -225,6 +243,11 @@ async fn drive_advertising(
     match code {
         ADVERTISE_OK => {}
         ADVERTISE_ALREADY => return Err(BlewError::AlreadyAdvertising),
+        ADVERTISE_NAME_REJECTED => {
+            return Err(BlewError::Peripheral {
+                source: "Android refused to rename the Bluetooth adapter".into(),
+            });
+        }
         _ => {
             return Err(BlewError::Peripheral {
                 source: "advertiser unavailable (is Bluetooth on?)".into(),
@@ -367,12 +390,13 @@ impl PeripheralBackend for AndroidPeripheral {
     }
 
     async fn start_advertising(&self, config: &AdvertisingConfig) -> BlewResult<()> {
+        let adapter_name = adapter_name(&config.local_name)?;
         // Claimed before the JNI call: AdvertiseCallback can fire before the
         // call has even returned.
         let (request_id, rx) = register_advertise()?;
         // Covers every way out, including this future being dropped mid-await.
         let mut guard = AdvertiseGuard::new(request_id);
-        let result = drive_advertising(config, request_id, rx).await;
+        let result = drive_advertising(config, adapter_name, request_id, rx).await;
         if result.is_ok() {
             // `complete_advertise` already moved the slot to Active.
             guard.disarm();

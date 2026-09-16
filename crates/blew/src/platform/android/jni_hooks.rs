@@ -725,6 +725,12 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnAdve
     guard("nativeOnAdvertisingResult", || {
         let result = if success {
             Ok(())
+        } else if error_code == super::peripheral::ADVERTISE_FAILED_RENAME_UNCONFIRMED {
+            Err(crate::error::BlewError::Peripheral {
+                source: "the Bluetooth adapter rename didn't take effect, so advertising \
+                         would have carried the previous name"
+                    .into(),
+            })
         } else {
             Err(crate::error::BlewError::Peripheral {
                 source: format!("advertising failed (AdvertiseCallback error {error_code})").into(),
