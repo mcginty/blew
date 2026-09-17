@@ -29,12 +29,16 @@ use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, types::Psm};
 use crate::peripheral::backend::{self as periph_backend, PeripheralBackend};
 use crate::peripheral::types::{
-    AdvertisingConfig, PeripheralRequest, PeripheralStateEvent, ReadResponder, WriteResponder,
+    AdvertisingConfig, LocalName, PeripheralRequest, PeripheralStateEvent, ReadResponder,
+    WriteResponder,
 };
 use crate::types::{BleDevice, DeviceId};
 use crate::util::BroadcastEventStream;
 
 const MOCK_MTU: u16 = 512;
+
+/// The name a mock peripheral's adapter starts with.
+pub const MOCK_ADAPTER_NAME: &str = "blew mock adapter";
 /// Policy for injecting L2CAP failures in mock tests.
 #[derive(Debug, Clone, Default)]
 pub struct MockL2capPolicy {
@@ -140,6 +144,7 @@ impl MockLink {
             central_sender_keepalive: central_event_tx.clone(),
             powered: Arc::new(Mutex::new(true)),
             restored: Arc::new(Mutex::new(None)),
+            adapter_name: Arc::new(Mutex::new(Some(MOCK_ADAPTER_NAME.into()))),
         };
 
         (
@@ -597,6 +602,7 @@ pub struct MockPeripheral {
     central_sender_keepalive: mpsc::UnboundedSender<CentralEvent>,
     powered: Arc<Mutex<bool>>,
     restored: Arc<Mutex<Option<Vec<Uuid>>>>,
+    adapter_name: Arc<Mutex<Option<String>>>,
 }
 
 impl Clone for MockPeripheral {
@@ -609,6 +615,7 @@ impl Clone for MockPeripheral {
             central_sender_keepalive: self.central_sender_keepalive.clone(),
             powered: Arc::clone(&self.powered),
             restored: Arc::clone(&self.restored),
+            adapter_name: Arc::clone(&self.adapter_name),
         }
     }
 }
@@ -643,6 +650,7 @@ impl MockPeripheral {
             central_sender_keepalive: central_event_tx,
             powered: Arc::new(Mutex::new(powered)),
             restored: Arc::new(Mutex::new(None)),
+            adapter_name: Arc::new(Mutex::new(Some(MOCK_ADAPTER_NAME.into()))),
         })
     }
 
@@ -707,6 +715,10 @@ impl PeripheralBackend for MockPeripheral {
         }
         link.advertising = true;
         link.adv_config = Some(config.clone());
+        // Modelled on Android, where a permanent name renames the adapter.
+        if let LocalName::AllowPermanent(name) = &config.local_name {
+            *self.adapter_name.lock() = Some(name.clone());
+        }
         std::future::ready(Ok(()))
     }
 
@@ -831,6 +843,24 @@ impl crate::peripheral::Peripheral<MockPeripheral> {
     pub fn take_restored(&self) -> Option<Vec<Uuid>> {
         self.backend.take_restored()
     }
+
+    /// Mirrors the Android-only `Peripheral::adapter_name`. Starts as
+    /// [`MOCK_ADAPTER_NAME`], and advertising under
+    /// [`LocalName::AllowPermanent`] renames it, as on Android.
+    pub fn adapter_name(&self) -> BlewResult<Option<String>> {
+        Ok(self.backend.adapter_name.lock().clone())
+    }
+
+    /// Mirrors the Android-only `Peripheral::set_adapter_name`, including
+    /// renaming nothing until the returned future is polled.
+    pub fn set_adapter_name(&self, name: &str) -> impl Future<Output = BlewResult<()>> + Send {
+        let adapter_name = Arc::clone(&self.backend.adapter_name);
+        let name = name.to_owned();
+        async move {
+            *adapter_name.lock() = Some(name);
+            Ok(())
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -938,6 +968,47 @@ mod tests {
             }
             other => panic!("expected DeviceDiscovered, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_mock_permanent_name_renames_adapter_until_the_app_restores_it() {
+        let (_c, p) = MockLink::pair();
+        let peripheral = Peripheral::from_backend(p.peripheral);
+
+        let theirs = peripheral.adapter_name().unwrap();
+        assert_eq!(theirs.as_deref(), Some(MOCK_ADAPTER_NAME));
+
+        peripheral
+            .start_advertising(&AdvertisingConfig {
+                local_name: LocalName::AllowPermanent("RO3JHAAY".into()),
+                service_uuids: vec![],
+            })
+            .await
+            .unwrap();
+        peripheral.stop_advertising().await.unwrap();
+        assert_eq!(
+            peripheral.adapter_name().unwrap().as_deref(),
+            Some("RO3JHAAY"),
+            "blew leaves the rename in place"
+        );
+
+        peripheral
+            .set_adapter_name(theirs.as_deref().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(peripheral.adapter_name().unwrap(), theirs);
+    }
+
+    #[tokio::test]
+    async fn test_mock_set_adapter_name_renames_nothing_until_polled() {
+        let (_c, p) = MockLink::pair();
+        let peripheral = Peripheral::from_backend(p.peripheral);
+
+        drop(peripheral.set_adapter_name("never-awaited"));
+        assert_eq!(
+            peripheral.adapter_name().unwrap().as_deref(),
+            Some(MOCK_ADAPTER_NAME)
+        );
     }
 
     #[tokio::test]

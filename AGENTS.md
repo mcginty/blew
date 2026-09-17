@@ -351,13 +351,24 @@ blew deliberately does **not** restore the previous adapter name. A restore
 can't be made correct from inside one app: an uninstall mid-advertisement, a
 process that never relaunches, or two apps each saving the other's borrowed
 name all defeat it. Restoring is left to the application; don't add a
-best-effort restore back.
+best-effort restore back. What blew provides instead is the read and the write:
+`Peripheral::adapter_name` / `set_adapter_name`, Android-only inherent methods
+in the same style as `take_restored` (not on `PeripheralBackend`, mirrored on
+the mock).
 
 `AdapterRename.kt` does handle the race: a rename lands asynchronously and the
 scan response snapshots whatever name is in place at start, so a named start
 waits for `ACTION_LOCAL_NAME_CHANGED`. After one second it reads the name back
 and **fails** the start (`ADVERTISE_FAILED_RENAME_UNCONFIRMED`) if the rename
 hasn't landed — never advertise anyway, that puts the previous name on air.
+One rename waits at a time. A second request while one waits — a named start
+and `set_adapter_name`, or two sets — is **refused** (`Outcome.Busy`, surfacing
+as `ADVERTISE_RENAME_BUSY` / `RENAME_BUSY`), not queued and not allowed to
+replace the first: overwriting a waiter strands its caller until the Rust-side
+timeout, and resolving overlaps in order is machinery for a case the app
+creates itself. Only the last name asked for is tracked; a broadcast for any
+other name is ignored, which can't put a wrong name on air because an
+advertisement takes the name in place when it starts.
 `onReady` runs under the class's monitor so `cancel` can't slip between
 deciding to advertise and advertising; `onFailed` runs after the monitor is
 released, because it takes `advertiseLock`, which callers hold while calling

@@ -28,6 +28,17 @@ All notable changes to `blew` are documented here. Format follows
   no security argument at all, so the Apple central role refuses anything but
   `Insecure`.
 
+- **Android: `Peripheral::adapter_name` and `Peripheral::set_adapter_name`.**
+  blew leaves the rename `LocalName::AllowPermanent` makes in place, and
+  restoring the previous name is the application's call — but from Rust there
+  was no way to read the adapter's name before advertising, or to write it
+  back afterwards. These Android-only methods do both. `set_adapter_name`
+  returns once the new name has taken effect, and fails if the stack refuses
+  it or it hasn't landed within a second. One rename waits at a time: while
+  one is waiting, a second `set_adapter_name` or a named `start_advertising`
+  fails immediately instead of queueing. The `testing` mock mirrors both, and advertising under
+  `AllowPermanent` renames its adapter as Android does.
+
 ### Changed
 
 - **`AdvertisingConfig::local_name` is now a `LocalName`, defaulting to no
@@ -902,7 +913,10 @@ let config = AdvertisingConfig {
 
 `AllowPermanent` is what a bare name always meant on Android: the adapter is
 renamed and stays renamed, and blew doesn't restore the previous name. Prefer
-`None` unless peers genuinely need the name.
+`None` unless peers genuinely need the name. To put the name back yourself,
+read it with `Peripheral::adapter_name` before advertising and write it with
+`Peripheral::set_adapter_name` afterwards — checking first that the adapter
+still carries your name, so one the user chose in the meantime survives.
 
 ---
 
