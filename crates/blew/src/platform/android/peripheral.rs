@@ -1,7 +1,10 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use jni::objects::{JObject, JObjectArray};
 use jni::{jni_sig, jni_str};
 use parking_lot::Mutex;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -12,7 +15,8 @@ use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, L2capEncryption, types::Psm};
 use crate::peripheral::backend::{self, PeripheralBackend};
 use crate::peripheral::types::{
-    AdvertisingConfig, LocalName, PeripheralConfig, PeripheralRequest, PeripheralStateEvent,
+    AdvertisingConfig, Delivery, LocalName, PeripheralConfig, PeripheralRequest,
+    PeripheralStateEvent,
 };
 use crate::types::DeviceId;
 use crate::util::BroadcastEventStream;
@@ -36,11 +40,115 @@ const ADVERTISE_NAME_REJECTED: i32 = 3;
 /// through `nativeOnAdvertisingResult` in place of an `AdvertiseCallback` error.
 pub(super) const ADVERTISE_FAILED_RENAME_UNCONFIRMED: i32 = -1;
 
+/// Kotlin's `BlePeripheralManager.NOTIFY_*` results from `notifyCharacteristic`.
+const NOTIFY_SENT: i32 = 0;
+const NOTIFY_INDICATED: i32 = 1;
+const NOTIFY_NOT_SUBSCRIBED: i32 = 2;
+const NOTIFY_CHAR_NOT_FOUND: i32 = 3;
+const NOTIFY_REJECTED: i32 = 4;
+
+/// How long a send may wait for `onNotificationSent`. Past the ATT transaction
+/// timeout, so a central that never confirms normally ends the wait itself by
+/// losing the link; this only bounds a stack that never reports at all.
+const NOTIFY_COMPLETE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
+
 struct PeripheralState {
     request_tx: mpsc::UnboundedSender<PeripheralRequest>,
     request_rx: Mutex<Option<mpsc::UnboundedReceiver<PeripheralRequest>>>,
     state_tx: broadcast::Sender<PeripheralStateEvent>,
     advertise: Mutex<AdvertiseState>,
+    notifies: Mutex<Notifies>,
+}
+
+/// Per-device notification sends.
+///
+/// The stack takes one value per device until `onNotificationSent`; a second
+/// sent before then is dropped or refused as busy. `gates` admits one send per
+/// device, and `in_flight` is the send the next `onNotificationSent` for that
+/// device belongs to.
+#[derive(Default)]
+struct Notifies {
+    gates: HashMap<String, Arc<Semaphore>>,
+    in_flight: HashMap<String, InFlightNotify>,
+    next_token: u64,
+}
+
+struct InFlightNotify {
+    /// Lets the sending task withdraw exactly its own entry. It never crosses
+    /// JNI: the stack's callback names only the device.
+    token: u64,
+    done: oneshot::Sender<BlewResult<()>>,
+    /// Released when the stack reports, not when the caller stops waiting: a
+    /// caller dropped mid-send must not admit the next send while this one is
+    /// still in the stack.
+    _permit: OwnedSemaphorePermit,
+}
+
+fn with_notifies<T>(f: impl FnOnce(&mut Notifies) -> T) -> Option<T> {
+    let guard = STATE.lock();
+    let s = guard.as_ref()?;
+    let mut notifies = s.notifies.lock();
+    Some(f(&mut notifies))
+}
+
+/// Register `addr`'s send before handing it to Kotlin, which can report
+/// `onNotificationSent` before the JNI call returns.
+fn begin_notify(
+    addr: &str,
+    permit: OwnedSemaphorePermit,
+) -> BlewResult<(u64, oneshot::Receiver<BlewResult<()>>)> {
+    let (done, rx) = oneshot::channel();
+    let token = with_notifies(|n| {
+        let token = n.next_token;
+        n.next_token += 1;
+        n.in_flight.insert(
+            addr.to_owned(),
+            InFlightNotify {
+                token,
+                done,
+                _permit: permit,
+            },
+        );
+        token
+    })
+    .ok_or(BlewError::NotInitialized)?;
+    Ok((token, rx))
+}
+
+/// Resolve `addr`'s in-flight send with the stack's verdict and admit the
+/// next one.
+pub(crate) fn finish_notify(addr: &str, result: BlewResult<()>) {
+    with_notifies(|n| {
+        if let Some(entry) = n.in_flight.remove(addr) {
+            let _ = entry.done.send(result);
+        }
+        n.forget_idle_gate(addr);
+    });
+}
+
+/// Withdraw a send the stack never accepted, or gave up on, if it is still
+/// the one registered for `addr`.
+fn abandon_notify(addr: &str, token: u64) {
+    with_notifies(|n| {
+        if n.in_flight.get(addr).is_some_and(|e| e.token == token) {
+            n.in_flight.remove(addr);
+        }
+        n.forget_idle_gate(addr);
+    });
+}
+
+impl Notifies {
+    /// Forget `addr`'s gate once nobody holds or awaits it, so devices that
+    /// come and go don't accumulate. Clones are only taken under the same lock.
+    fn forget_idle_gate(&mut self, addr: &str) {
+        if self
+            .gates
+            .get(addr)
+            .is_some_and(|g| Arc::strong_count(g) == 1)
+        {
+            self.gates.remove(addr);
+        }
+    }
 }
 
 /// Run `f` against the advertising state, if the backend is initialised.
@@ -305,6 +413,7 @@ impl PeripheralBackend for AndroidPeripheral {
             request_rx: Mutex::new(Some(request_rx)),
             state_tx,
             advertise: Mutex::new(AdvertiseState::default()),
+            notifies: Mutex::new(Notifies::default()),
         });
         // The L2CAP statics are shared between the two roles but were only
         // initialised from the central path. A peripheral-only app would find
@@ -435,52 +544,73 @@ impl PeripheralBackend for AndroidPeripheral {
         device_id: &DeviceId,
         char_uuid: Uuid,
         value: Vec<u8>,
-    ) -> BlewResult<()> {
+    ) -> BlewResult<Delivery> {
         let device_addr = device_id.as_str().to_owned();
-        // Retry loop: Kotlin returns 1 ("busy") when the previous
-        // notification hasn't completed yet (onNotificationSent pending).
-        // We retry with async sleep so we don't block the tokio thread.
-        for attempt in 0..50_u32 {
-            let status: i32 = jvm()
-                .attach_current_thread(|env| {
-                    let addr_str = env.new_string(&device_addr)?;
-                    let uuid_str = env.new_string(char_uuid.to_string())?;
-                    let j_value = env.byte_array_from_slice(&value)?;
+        let gate = with_notifies(|n| {
+            Arc::clone(
+                n.gates
+                    .entry(device_addr.clone())
+                    .or_insert_with(|| Arc::new(Semaphore::new(1))),
+            )
+        })
+        .ok_or(BlewError::NotInitialized)?;
+        let permit = gate
+            .acquire_owned()
+            .await
+            .map_err(|_| BlewError::Internal("notification gate closed".into()))?;
+        let (token, rx) = begin_notify(&device_addr, permit)?;
 
-                    let ret = env.call_static_method(
-                        peripheral_class(),
-                        jni_str!("notifyCharacteristic"),
-                        jni_sig!("(Ljava/lang/String;Ljava/lang/String;[B)I"),
-                        &[(&addr_str).into(), (&uuid_str).into(), (&j_value).into()],
-                    )?;
-                    ret.i()
-                })
-                .map_err(|e| jni_err(&e))?;
+        let status = jvm()
+            .attach_current_thread(|env| {
+                let addr_str = env.new_string(&device_addr)?;
+                let uuid_str = env.new_string(char_uuid.to_string())?;
+                let j_value = env.byte_array_from_slice(&value)?;
 
-            match status {
-                // 0 = success; 2 = no subscribers (not an error).
-                0 | 2 => return Ok(()),
-                1 => {
-                    // Busy -- previous notification still in flight.
-                    // Yield to tokio and retry after a short delay.
-                    if attempt < 49 {
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                let ret = env.call_static_method(
+                    peripheral_class(),
+                    jni_str!("notifyCharacteristic"),
+                    jni_sig!("(Ljava/lang/String;Ljava/lang/String;[B)I"),
+                    &[(&addr_str).into(), (&uuid_str).into(), (&j_value).into()],
+                )?;
+                ret.i()
+            })
+            .map_err(|e| jni_err(&e));
+
+        let delivery = match status {
+            Ok(NOTIFY_SENT) => Delivery::Sent,
+            Ok(NOTIFY_INDICATED) => Delivery::Confirmed,
+            other => {
+                abandon_notify(&device_addr, token);
+                return match other? {
+                    NOTIFY_NOT_SUBSCRIBED => Ok(Delivery::NoSubscriber),
+                    NOTIFY_CHAR_NOT_FOUND => {
+                        Err(BlewError::LocalCharacteristicNotFound { char_uuid })
                     }
-                }
-                3 => {
-                    return Err(BlewError::LocalCharacteristicNotFound { char_uuid });
-                }
-                other => {
-                    return Err(BlewError::Peripheral {
-                        source: format!("notify returned unknown status {other}").into(),
-                    });
-                }
+                    NOTIFY_REJECTED => Err(BlewError::Peripheral {
+                        source: "the stack refused the notification".into(),
+                    }),
+                    unknown => Err(BlewError::Peripheral {
+                        source: format!("notify returned unknown status {unknown}").into(),
+                    }),
+                };
+            }
+        };
+
+        match tokio::time::timeout(NOTIFY_COMPLETE_TIMEOUT, rx).await {
+            Ok(Ok(result)) => result.map(|()| delivery),
+            Ok(Err(_)) => Err(BlewError::Internal(
+                "peripheral shut down before the notification completed".into(),
+            )),
+            Err(_) => {
+                abandon_notify(&device_addr, token);
+                Err(BlewError::Peripheral {
+                    source: format!(
+                        "stack did not report the notification within {NOTIFY_COMPLETE_TIMEOUT:?}"
+                    )
+                    .into(),
+                })
             }
         }
-        // Exhausted retries -- treat as transient error.
-        Err(BlewError::Peripheral {
-            source: "notification busy after retries".into(),
-        })
     }
 
     async fn l2cap_listener(

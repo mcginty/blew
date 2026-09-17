@@ -51,6 +51,21 @@ object BlePeripheralManager {
      */
     const val ADVERTISE_FAILED_RENAME_UNCONFIRMED = -1
 
+    /** notifyCharacteristic handed a notification to the stack; [nativeOnNotificationSent] follows. */
+    const val NOTIFY_SENT = 0
+
+    /** notifyCharacteristic handed an indication to the stack; [nativeOnNotificationSent] follows. */
+    const val NOTIFY_INDICATED = 1
+
+    /** The device is not connected, or not subscribed to the characteristic. */
+    const val NOTIFY_NOT_SUBSCRIBED = 2
+
+    /** No local characteristic has that UUID. */
+    const val NOTIFY_CHAR_NOT_FOUND = 3
+
+    /** The stack refused the value; no [nativeOnNotificationSent] will follow. */
+    const val NOTIFY_REJECTED = 4
+
     private var context: Context? = null
     private var bluetoothManager: BluetoothManager? = null
 
@@ -78,23 +93,6 @@ object BlePeripheralManager {
 
     // Latch to serialize addService calls (Android requires waiting for onServiceAdded).
     @Volatile private var serviceAddedLatch: CountDownLatch? = null
-
-    // Per-device semaphore to serialize notifyCharacteristicChanged calls.
-    // Android's BluetoothGattServer only allows one in-flight notification per
-    // device — subsequent calls before onNotificationSent are silently dropped.
-    private val notifySemaphores = ConcurrentHashMap<String, java.util.concurrent.Semaphore>()
-
-    private fun getNotifySemaphore(addr: String): java.util.concurrent.Semaphore =
-        notifySemaphores.getOrPut(addr) { java.util.concurrent.Semaphore(1) }
-
-    private fun acquireNotify(
-        addr: String,
-        timeoutMs: Long = 5000,
-    ): Boolean = getNotifySemaphore(addr).tryAcquire(timeoutMs, TimeUnit.MILLISECONDS)
-
-    private fun releaseNotify(addr: String) {
-        notifySemaphores[addr]?.release()
-    }
 
     // ── L2CAP state ──
     private val l2cap =
@@ -146,6 +144,16 @@ object BlePeripheralManager {
 
     @JvmStatic
     external fun nativeOnAdapterStateChanged(powered: Boolean)
+
+    /**
+     * Reports `onNotificationSent` for [deviceAddr]. Rust sends at most one
+     * value per device at a time, so the device alone identifies the send.
+     */
+    @JvmStatic
+    external fun nativeOnNotificationSent(
+        deviceAddr: String,
+        status: Int,
+    )
 
     // ── L2CAP JNI hooks ──
 
@@ -273,8 +281,6 @@ object BlePeripheralManager {
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     connectedDevices.remove(addr)
                     subscriptions.remove(addr)
-                    // Drain and remove the notify semaphore so a reconnect starts fresh.
-                    notifySemaphores.remove(addr)?.drainPermits()
                     nativeOnConnectionStateChanged(addr, false)
                 }
             }
@@ -283,7 +289,7 @@ object BlePeripheralManager {
                 device: BluetoothDevice,
                 status: Int,
             ) {
-                releaseNotify(device.address)
+                nativeOnNotificationSent(device.address, status)
             }
 
             override fun onCharacteristicReadRequest(
@@ -629,13 +635,11 @@ object BlePeripheralManager {
     }
 
     /**
-     * Send a notification on a characteristic to a single subscribed device.
+     * Send a value on a characteristic to a single subscribed device.
      *
-     * Returns:
-     *   0 = success
-     *   1 = busy (semaphore not available — caller should retry after a short delay)
-     *   2 = device not connected or not subscribed to this characteristic
-     *   3 = characteristic not found
+     * The stack takes one value per device until `onNotificationSent`, and
+     * drops or refuses a second. Rust serializes calls per device and waits for
+     * [nativeOnNotificationSent] after [NOTIFY_SENT] or [NOTIFY_INDICATED].
      */
     @JvmStatic
     fun notifyCharacteristic(
@@ -644,37 +648,46 @@ object BlePeripheralManager {
         value: ByteArray,
     ): Int {
         val uuid = UUID.fromString(charUuid)
-        val char = characteristics[uuid] ?: return 3
-        val device = connectedDevices[deviceAddr] ?: return 2
-        val subs = subscriptions[deviceAddr] ?: return 2
-        if (uuid !in subs) return 2
-        if (!acquireNotify(deviceAddr, timeoutMs = 50)) return 1
-        val sent = sendNotification(device, char, value)
-        if (!sent) {
-            releaseNotify(deviceAddr)
-            return 1
-        }
-        return 0
+        val char = characteristics[uuid] ?: return NOTIFY_CHAR_NOT_FOUND
+        val device = connectedDevices[deviceAddr] ?: return NOTIFY_NOT_SUBSCRIBED
+        val subs = subscriptions[deviceAddr] ?: return NOTIFY_NOT_SUBSCRIBED
+        if (uuid !in subs) return NOTIFY_NOT_SUBSCRIBED
+        val confirm = sendsIndication(deviceAddr, uuid)
+        if (!sendNotification(device, char, value, confirm)) return NOTIFY_REJECTED
+        return if (confirm) NOTIFY_INDICATED else NOTIFY_SENT
     }
 
     /**
-     * Send a single notification, handling the API 33+ / legacy split.
-     * On API < 33, synchronizes on [char] to prevent concurrent `char.value`
-     * races when multiple devices are notified from different threads.
+     * Whether a value for [charUuid] goes to [deviceAddr] as an indication.
+     * The only place that decides, because Rust reports an indication's
+     * completion as a confirmation.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    private fun sendsIndication(
+        deviceAddr: String,
+        charUuid: UUID,
+    ): Boolean = false
+
+    /**
+     * Send a single notification or indication, handling the API 33+ / legacy
+     * split. On API < 33, synchronizes on [char] to prevent concurrent
+     * `char.value` races when multiple devices are notified from different
+     * threads.
      */
     private fun sendNotification(
         device: BluetoothDevice,
         char: BluetoothGattCharacteristic,
         value: ByteArray,
+        confirm: Boolean,
     ): Boolean =
         if (Build.VERSION.SDK_INT >= 33) {
-            gattServer?.notifyCharacteristicChanged(device, char, false, value) ==
+            gattServer?.notifyCharacteristicChanged(device, char, confirm, value) ==
                 BluetoothStatusCodes.SUCCESS
         } else {
             @Suppress("DEPRECATION")
             synchronized(char) {
                 char.value = value
-                gattServer?.notifyCharacteristicChanged(device, char, false) ?: false
+                gattServer?.notifyCharacteristicChanged(device, char, confirm) ?: false
             }
         }
 

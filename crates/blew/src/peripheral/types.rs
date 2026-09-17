@@ -34,6 +34,39 @@ pub enum PeripheralStateEvent {
     },
 }
 
+/// How far a [`notify_characteristic`] value is known to have got.
+///
+/// Returned instead of a bare `Ok` because the platforms differ in what they
+/// can report, and a caller relying on delivery needs to know which guarantee
+/// it actually received.
+///
+/// | Backend | `Confirmed` | `Sent` |
+/// |---------|-------------|--------|
+/// | Android | an indication, once `onNotificationSent` reports success | a notification, once `onNotificationSent` reports success |
+/// | Linux   | every subscriber session is indicate-only and BlueZ relayed each confirmation | any other value BlueZ accepted |
+/// | Apple   | never: CoreBluetooth exposes no indication confirmation | CoreBluetooth accepted the value into its transmit queue |
+///
+/// Where a backend does report confirmations, it fails the call instead of
+/// returning when the central disconnects first or never confirms within the
+/// ATT transaction timeout. At present the Android backend always sends
+/// notifications and the Linux backend registers only notification sessions,
+/// so neither returns `Confirmed` yet.
+///
+/// [`notify_characteristic`]: crate::peripheral::Peripheral::notify_characteristic
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// The central's ATT layer acknowledged the value with a Handle Value
+    /// Confirmation.
+    Confirmed,
+    /// The value was handed to the platform stack, which reports no
+    /// acknowledgement from the central.
+    Sent,
+    /// Nothing was sent because the central is not (or no longer) subscribed
+    /// to the characteristic. Not an error: a subscriber can leave at any
+    /// moment between the caller's decision and the send.
+    NoSubscriber,
+}
+
 /// Inbound GATT requests from remote centrals.
 ///
 /// Each variant carries an owned responder that must be consumed exactly once,

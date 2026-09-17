@@ -1,4 +1,4 @@
-use super::types::{AdvertisingConfig, PeripheralRequest, PeripheralStateEvent};
+use super::types::{AdvertisingConfig, Delivery, PeripheralRequest, PeripheralStateEvent};
 use crate::error::BlewResult;
 use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, types::Psm};
@@ -50,12 +50,16 @@ pub trait PeripheralBackend: private::Sealed + Send + Sync + 'static {
     /// (Apple, Android). On Linux/BlueZ, BlueZ's `CharacteristicNotifier`
     /// callback does not expose the remote device identity, so this degrades
     /// to a broadcast to every subscribed notifier for that characteristic.
+    ///
+    /// Resolves with the strongest [`Delivery`] guarantee the platform can
+    /// report. A value awaiting an indication confirmation fails if the
+    /// central disconnects or never confirms, rather than reporting success.
     fn notify_characteristic(
         &self,
         device_id: &DeviceId,
         char_uuid: Uuid,
         value: Vec<u8>,
-    ) -> impl Future<Output = BlewResult<()>> + Send;
+    ) -> impl Future<Output = BlewResult<Delivery>> + Send;
 
     /// Publish an L2CAP CoC channel and return the OS-assigned PSM together with
     /// a stream of incoming [`L2capChannel`] connections.

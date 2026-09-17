@@ -2,8 +2,8 @@ pub mod backend;
 pub mod types;
 
 pub use types::{
-    AdvertisingConfig, LocalName, PeripheralConfig, PeripheralRequest, PeripheralStateEvent,
-    ReadResponder, WriteResponder,
+    AdvertisingConfig, Delivery, LocalName, PeripheralConfig, PeripheralRequest,
+    PeripheralStateEvent, ReadResponder, WriteResponder,
 };
 
 use crate::error::{BlewError, BlewResult};
@@ -84,14 +84,16 @@ impl<B: PeripheralBackend> Peripheral<B> {
 
     /// Push a characteristic value update to a single subscribed central.
     ///
-    /// See [`PeripheralBackend::notify_characteristic`] for the per-device
+    /// Resolves once the platform reports how far the value got; see
+    /// [`Delivery`] for what each backend can confirm. See
+    /// [`PeripheralBackend::notify_characteristic`] for the per-device
     /// semantics and the Linux-only broadcast fallback.
     pub async fn notify_characteristic(
         &self,
         device_id: &DeviceId,
         char_uuid: Uuid,
         value: Vec<u8>,
-    ) -> BlewResult<()> {
+    ) -> BlewResult<Delivery> {
         self.backend
             .notify_characteristic(device_id, char_uuid, value)
             .await
