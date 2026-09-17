@@ -52,8 +52,11 @@ pub trait PeripheralBackend: private::Sealed + Send + Sync + 'static {
     /// to a broadcast to every subscribed notifier for that characteristic.
     ///
     /// Resolves with the strongest [`Delivery`] guarantee the platform can
-    /// report. A value awaiting an indication confirmation fails if the
-    /// central disconnects or never confirms, rather than reporting success.
+    /// report. On Android a value awaiting an indication confirmation fails if
+    /// the central disconnects or never confirms, rather than reporting
+    /// success. Linux returns `Sent` or `NoSubscriber`: on an indicate-only
+    /// characteristic it waits until BlueZ finishes the indication, confirmed
+    /// or not, which it can't tell apart. See [`Delivery`] for each backend.
     fn notify_characteristic(
         &self,
         device_id: &DeviceId,

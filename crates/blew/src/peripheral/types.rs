@@ -43,13 +43,18 @@ pub enum PeripheralStateEvent {
 /// | Backend | `Confirmed` | `Sent` |
 /// |---------|-------------|--------|
 /// | Android | an indication (the central subscribed for indications only), once `onNotificationSent` reports success | a notification, once `onNotificationSent` reports success |
-/// | Linux   | every subscriber session is indicate-only and BlueZ relayed each confirmation | any other value BlueZ accepted |
+/// | Linux   | never: BlueZ's D-Bus API doesn't report whether an indication was confirmed | the value was handed to BlueZ |
 /// | Apple   | never: CoreBluetooth exposes no indication confirmation | CoreBluetooth accepted the value into its transmit queue |
 ///
-/// Where a backend does report confirmations, it fails the call instead of
-/// returning when the central disconnects first or never confirms within the
-/// ATT transaction timeout. At present the Linux backend registers only
-/// notification sessions, so it doesn't return `Confirmed` yet.
+/// Android fails the call instead of returning when the central disconnects
+/// first or never confirms within the ATT transaction timeout.
+///
+/// Linux never fails a value it handed to BlueZ. On an indicate-only
+/// characteristic the call waits until BlueZ has finished the indication,
+/// bounded by a 35 s backstop, which paces sends to what BlueZ can deliver.
+/// Finished means confirmed or timed out, and Linux can't tell which: BlueZ
+/// reports both the same way. A BlueZ ATT timeout also drops the link, which
+/// shows up as the central disconnecting.
 ///
 /// [`notify_characteristic`]: crate::peripheral::Peripheral::notify_characteristic
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

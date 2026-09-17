@@ -32,9 +32,11 @@ use uuid::Uuid;
 /// across the await point.
 type SharedNotifier = Arc<tokio::sync::Mutex<CharacteristicNotifier>>;
 
-/// How long an indication may wait for the central's confirmation: the ATT
-/// transaction timeout, after which the central has broken the bearer anyway.
-const INDICATION_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Backstop on waiting for BlueZ to finish an indication. The wait is only
+/// backpressure, so expiring is `Sent` like every other ending. It exists
+/// because some waits never end: BlueZ skips a bonded central that is still
+/// subscribed but not connected, without ever calling `Confirm`.
+const INDICATION_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(35);
 
 struct PeripheralInner {
     _session: Session,
@@ -134,6 +136,41 @@ fn emit_state(inner: &Arc<PeripheralInner>, event: PeripheralStateEvent) {
 
 fn emit_request(inner: &Arc<PeripheralInner>, request: PeripheralRequest) {
     let _ = inner.request_tx.send(request);
+}
+
+/// The `(notify, indicate)` flags to register with BlueZ, or `None` when the
+/// characteristic supports neither. BlueZ creates the CCCD from these flags and
+/// refuses a CCCD write for a kind that isn't declared, so declaring only
+/// `NOTIFY` makes an indicate-only characteristic impossible to subscribe to.
+fn notify_flags(props: CharacteristicProperties) -> Option<(bool, bool)> {
+    let notify = props.contains(CharacteristicProperties::NOTIFY);
+    let indicate = props.contains(CharacteristicProperties::INDICATE);
+    (notify || indicate).then_some((notify, indicate))
+}
+
+/// What one notifier's `notify()` means for the caller: `Ok(true)` if the value
+/// was handed to BlueZ, `Ok(false)` if the session was already gone. `result`
+/// is `None` when [`INDICATION_BACKSTOP`] elapsed; `stopped` is read after.
+///
+/// Every ending after the emit is `Sent`. BlueZ calls `Confirm` for a real
+/// confirmation and equally when the indication fails (ATT timeout or
+/// disconnect), so `Ok` says nothing about delivery, and neither does the
+/// session ending mid-wait or the backstop. `notify` emits on its first poll,
+/// before it waits, so the backstop can only elapse after the emit.
+fn notify_outcome(result: Option<bluer::Result<()>>, stopped: bool) -> BlewResult<bool> {
+    match result {
+        None | Some(Ok(())) => Ok(true),
+        Some(Err(e)) => match e.kind {
+            bluer::ErrorKind::IndicationUnconfirmed => Ok(true),
+            // bluer reports a failed D-Bus emit with the same kind as a
+            // session that had already stopped; only the session tells them
+            // apart.
+            bluer::ErrorKind::NotificationSessionStopped if stopped => Ok(false),
+            _ => Err(BlewError::Peripheral {
+                source: Box::new(e),
+            }),
+        },
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -243,10 +280,11 @@ fn build_characteristic(
         None
     };
 
-    let notify = if props.contains(CharacteristicProperties::NOTIFY) {
+    let notify = if let Some((notify, indicate)) = notify_flags(props) {
         let inner_n = Arc::clone(inner);
         Some(CharacteristicNotify {
-            notify: true,
+            notify,
+            indicate,
             method: CharacteristicNotifyMethod::Fun(Box::new(
                 move |notifier: CharacteristicNotifier| {
                     let inner_n = Arc::clone(&inner_n);
@@ -483,63 +521,49 @@ impl PeripheralBackend for LinuxPeripheral {
 
             let mut any_stopped = false;
             let mut sent = 0_usize;
-            let mut all_confirmed = true;
-            let mut unconfirmed = None;
+            let mut emit_failed = None;
             for arc in arcs {
                 let mut notifier = arc.lock().await;
                 if notifier.is_stopped() {
                     any_stopped = true;
                     continue;
                 }
-                if notifier.confirming() {
-                    // bluer's `notify` waits for the confirmation with no
-                    // deadline of its own.
-                    match tokio::time::timeout(
-                        INDICATION_CONFIRM_TIMEOUT,
-                        notifier.notify(value.clone()),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => sent += 1,
-                        // Stopped before the value went out: the subscriber
-                        // left, which is not a delivery failure.
-                        Ok(Err(e)) if e.kind == bluer::ErrorKind::NotificationSessionStopped => {}
-                        Ok(Err(e)) => {
-                            unconfirmed.get_or_insert_with(|| BlewError::Peripheral {
-                                source: Box::new(e),
-                            });
-                        }
-                        Err(_) => {
-                            unconfirmed.get_or_insert_with(|| BlewError::Peripheral {
-                                source: format!(
-                                    "indication not confirmed within {INDICATION_CONFIRM_TIMEOUT:?}"
-                                )
-                                .into(),
-                            });
-                        }
-                    }
+                let result = if notifier.confirming() {
+                    // An indicate-only characteristic: bluer's `notify` waits
+                    // until BlueZ finishes the indication, which paces sends
+                    // to BlueZ's one indication in flight per bearer. If the
+                    // backstop drops a wait, a late `Confirm` can land after
+                    // the next `notify` flushes the channel and end that wait
+                    // early. That only loosens pacing: the result is `Sent`.
+                    tokio::time::timeout(INDICATION_BACKSTOP, notifier.notify(value.clone()))
+                        .await
+                        .ok()
                 } else {
-                    all_confirmed = false;
-                    // Best-effort: a failed notification means the session
-                    // ended under us, the same as a stopped one.
-                    if notifier.notify(value.clone()).await.is_ok() {
-                        sent += 1;
+                    Some(notifier.notify(value.clone()).await)
+                };
+                match notify_outcome(result, notifier.is_stopped()) {
+                    Ok(true) => sent += 1,
+                    Ok(false) => any_stopped = true,
+                    Err(e) => {
+                        emit_failed.get_or_insert(e);
                     }
                 }
             }
 
             if any_stopped {
+                // A notifier another send holds is live: an indication can
+                // keep it locked for the whole confirmation wait.
                 handle.notifiers.lock().entry(char_uuid).and_modify(|v| {
-                    v.retain(|arc| !arc.try_lock().map_or(true, |n| n.is_stopped()));
+                    v.retain(|arc| arc.try_lock().map_or(true, |n| !n.is_stopped()));
                 });
             }
-            if let Some(e) = unconfirmed {
+            if let Some(e) = emit_failed {
                 return Err(e);
             }
-            Ok(match sent {
-                0 => Delivery::NoSubscriber,
-                _ if all_confirmed => Delivery::Confirmed,
-                _ => Delivery::Sent,
+            Ok(if sent == 0 {
+                Delivery::NoSubscriber
+            } else {
+                Delivery::Sent
             })
         }
     }
@@ -568,5 +592,69 @@ impl PeripheralBackend for LinuxPeripheral {
             .lock()
             .take()
             .map(UnboundedReceiverStream::new)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notify_flags_follow_the_declared_properties() {
+        assert_eq!(notify_flags(CharacteristicProperties::READ), None);
+        assert_eq!(
+            notify_flags(CharacteristicProperties::NOTIFY),
+            Some((true, false))
+        );
+        assert_eq!(
+            notify_flags(CharacteristicProperties::INDICATE),
+            Some((false, true))
+        );
+        assert_eq!(
+            notify_flags(CharacteristicProperties::NOTIFY | CharacteristicProperties::INDICATE),
+            Some((true, true))
+        );
+    }
+
+    fn bluer_error(kind: bluer::ErrorKind) -> bluer::Error {
+        bluer::Error {
+            kind,
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn every_ending_after_the_emit_is_sent() {
+        assert!(matches!(notify_outcome(Some(Ok(())), false), Ok(true)));
+        assert!(matches!(notify_outcome(None, false), Ok(true)));
+        assert!(matches!(
+            notify_outcome(
+                Some(Err(bluer_error(bluer::ErrorKind::IndicationUnconfirmed))),
+                true
+            ),
+            Ok(true)
+        ));
+    }
+
+    #[test]
+    fn a_stopped_session_sends_nothing_and_a_failed_emit_is_an_error() {
+        assert!(matches!(
+            notify_outcome(
+                Some(Err(bluer_error(
+                    bluer::ErrorKind::NotificationSessionStopped
+                ))),
+                true
+            ),
+            Ok(false)
+        ));
+        assert!(matches!(
+            notify_outcome(
+                Some(Err(bluer_error(
+                    bluer::ErrorKind::NotificationSessionStopped
+                ))),
+                false
+            ),
+            Err(BlewError::Peripheral { .. })
+        ));
     }
 }
