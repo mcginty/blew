@@ -202,10 +202,14 @@ impl Peripheral {
     ///
     /// Like [`LocalName::AllowPermanent`], this is device-global and
     /// persistent. It fails if the stack refuses the rename (Bluetooth is off,
-    /// or `BLUETOOTH_CONNECT` hasn't been granted), if the name hasn't taken
-    /// effect within a second, or if a later rename -- including one a named
-    /// [`start_advertising`](Self::start_advertising) makes -- replaces it
-    /// before it lands.
+    /// or `BLUETOOTH_CONNECT` hasn't been granted), or if the name hasn't taken
+    /// effect within a second.
+    ///
+    /// One rename waits at a time. While another is still waiting to take
+    /// effect -- another `set_adapter_name`, or the one a named
+    /// [`start_advertising`](Self::start_advertising) makes -- this fails
+    /// immediately rather than queueing behind it, and a named
+    /// `start_advertising` is refused the same way while this one waits.
     pub async fn set_adapter_name(&self, name: &str) -> BlewResult<()> {
         self.backend.set_adapter_name(name).await
     }

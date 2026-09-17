@@ -361,10 +361,14 @@ scan response snapshots whatever name is in place at start, so a named start
 waits for `ACTION_LOCAL_NAME_CHANGED`. After one second it reads the name back
 and **fails** the start (`ADVERTISE_FAILED_RENAME_UNCONFIRMED`) if the rename
 hasn't landed — never advertise anyway, that puts the previous name on air.
-Requests can overlap (a named start and `set_adapter_name`): the stack applies
-renames in order, so once every rename lands, waiters for the final name are
-ready and the rest **fail**. Don't leave a superseded waiter pending — nothing
-would ever resolve it short of the Rust-side timeout.
+One rename waits at a time. A second request while one waits — a named start
+and `set_adapter_name`, or two sets — is **refused** (`Outcome.Busy`, surfacing
+as `ADVERTISE_RENAME_BUSY` / `RENAME_BUSY`), not queued and not allowed to
+replace the first: overwriting a waiter strands its caller until the Rust-side
+timeout, and resolving overlaps in order is machinery for a case the app
+creates itself. Only the last name asked for is tracked; a broadcast for any
+other name is ignored, which can't put a wrong name on air because an
+advertisement takes the name in place when it starts.
 `onReady` runs under the class's monitor so `cancel` can't slip between
 deciding to advertise and advertising; `onFailed` runs after the monitor is
 released, because it takes `advertiseLock`, which callers hold while calling

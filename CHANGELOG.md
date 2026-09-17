@@ -34,8 +34,9 @@ All notable changes to `blew` are documented here. Format follows
   was no way to read the adapter's name before advertising, or to write it
   back afterwards. These Android-only methods do both. `set_adapter_name`
   returns once the new name has taken effect, and fails if the stack refuses
-  it, if it hasn't landed within a second, or if a later rename replaces it
-  first. The `testing` mock mirrors both, and advertising under
+  it or it hasn't landed within a second. One rename waits at a time: while
+  one is waiting, a second `set_adapter_name` or a named `start_advertising`
+  fails immediately instead of queueing. The `testing` mock mirrors both, and advertising under
   `AllowPermanent` renames its adapter as Android does.
 
 ### Changed

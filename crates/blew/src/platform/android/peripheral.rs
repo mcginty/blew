@@ -32,6 +32,8 @@ const ADVERTISE_OK: i32 = 0;
 const ADVERTISE_ALREADY: i32 = 2;
 /// Kotlin's `BlePeripheralManager.ADVERTISE_NAME_REJECTED`.
 const ADVERTISE_NAME_REJECTED: i32 = 3;
+/// Kotlin's `BlePeripheralManager.ADVERTISE_RENAME_BUSY`.
+const ADVERTISE_RENAME_BUSY: i32 = 4;
 /// Kotlin's `BlePeripheralManager.ADVERTISE_FAILED_RENAME_UNCONFIRMED`, reported
 /// through `nativeOnAdvertisingResult` in place of an `AdvertiseCallback` error.
 pub(super) const ADVERTISE_FAILED_RENAME_UNCONFIRMED: i32 = -1;
@@ -44,6 +46,11 @@ const RENAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const RENAME_OK: i32 = 0;
 /// Kotlin's `BlePeripheralManager.RENAME_REJECTED`.
 const RENAME_REJECTED: i32 = 2;
+/// Kotlin's `BlePeripheralManager.RENAME_BUSY`.
+const RENAME_BUSY: i32 = 3;
+
+/// Refusal for a rename requested while another is still waiting to land.
+const RENAME_IN_PROGRESS: &str = "a Bluetooth adapter rename is already waiting to take effect";
 
 static NEXT_RENAME_ID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
@@ -283,6 +290,11 @@ impl AndroidPeripheral {
                         .into(),
                 });
             }
+            RENAME_BUSY => {
+                return Err(BlewError::Peripheral {
+                    source: RENAME_IN_PROGRESS.into(),
+                });
+            }
             _ => return Err(BlewError::NotInitialized),
         }
 
@@ -354,6 +366,11 @@ async fn drive_advertising(
         ADVERTISE_NAME_REJECTED => {
             return Err(BlewError::Peripheral {
                 source: "Android refused to rename the Bluetooth adapter".into(),
+            });
+        }
+        ADVERTISE_RENAME_BUSY => {
+            return Err(BlewError::Peripheral {
+                source: RENAME_IN_PROGRESS.into(),
             });
         }
         _ => {

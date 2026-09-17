@@ -44,6 +44,9 @@ object BlePeripheralManager {
     /** The stack refused to rename the adapter for a named advertisement. */
     const val ADVERTISE_NAME_REJECTED = 3
 
+    /** A [setAdapterName] is still waiting for its name, so a named advertisement can't rename. */
+    const val ADVERTISE_RENAME_BUSY = 4
+
     /**
      * Error code reported through [nativeOnAdvertisingResult] when the adapter
      * rename a named advertisement waits for never took effect. Negative, so it
@@ -59,6 +62,9 @@ object BlePeripheralManager {
 
     /** The stack refused the rename -- Bluetooth is off, or BLUETOOTH_CONNECT isn't granted. */
     const val RENAME_REJECTED = 2
+
+    /** Another rename -- a named advertisement's, or another [setAdapterName] -- is still waiting. */
+    const val RENAME_BUSY = 3
 
     private var context: Context? = null
     private var bluetoothManager: BluetoothManager? = null
@@ -268,12 +274,17 @@ object BlePeripheralManager {
         requestId: Int,
     ): Int {
         val rename = adapterRename ?: return RENAME_UNAVAILABLE
-        rename.request(
-            name,
-            onReady = { nativeOnAdapterRenameResult(requestId, true) },
-            onFailed = { nativeOnAdapterRenameResult(requestId, false) },
-        ) ?: return RENAME_REJECTED
-        return RENAME_OK
+        val outcome =
+            rename.request(
+                name,
+                onReady = { nativeOnAdapterRenameResult(requestId, true) },
+                onFailed = { nativeOnAdapterRenameResult(requestId, false) },
+            )
+        return when (outcome) {
+            is AdapterRename.Outcome.Accepted -> RENAME_OK
+            AdapterRename.Outcome.Refused -> RENAME_REJECTED
+            AdapterRename.Outcome.Busy -> RENAME_BUSY
+        }
     }
 
     private class AndroidAdapterNames : AdapterNames {
@@ -617,16 +628,17 @@ object BlePeripheralManager {
         // onReady may run after this returns, from the name broadcast. Stop
         // cancels the ticket before touching the advertiser, which drops a
         // start that hasn't run yet, so a late one can't outlive it.
-        val ticket =
+        val outcome =
             rename.request(
                 name,
                 onReady = { adv.startAdvertising(settings, data, scanResponse, callback) },
                 onFailed = { renameUnconfirmed(requestId) },
-            ) ?: run {
-                advertiseCallback = null
-                return ADVERTISE_NAME_REJECTED
-            }
-        advertiseRenameTicket = ticket
+            )
+        if (outcome !is AdapterRename.Outcome.Accepted) {
+            advertiseCallback = null
+            return if (outcome is AdapterRename.Outcome.Busy) ADVERTISE_RENAME_BUSY else ADVERTISE_NAME_REJECTED
+        }
+        advertiseRenameTicket = outcome.ticket
         return ADVERTISE_OK
     }
 
