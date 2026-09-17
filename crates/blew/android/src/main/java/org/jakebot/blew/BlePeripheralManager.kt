@@ -68,7 +68,7 @@ object BlePeripheralManager {
     private val connectedDevices = ConcurrentHashMap<String, BluetoothDevice>()
 
     // What each device enabled per characteristic through its CCCD write.
-    private val subscriptions = ConcurrentHashMap<String, ConcurrentHashMap<UUID, Subscription>>()
+    private val subscriptions = SubscriptionTable()
 
     // Map characteristic UUID -> BluetoothGattCharacteristic for notification sending.
     private val characteristics = ConcurrentHashMap<UUID, BluetoothGattCharacteristic>()
@@ -359,15 +359,8 @@ object BlePeripheralManager {
                 if (descriptor.uuid == cccdUuid) {
                     val charUuid = descriptor.characteristic.uuid
                     val addr = device.address
-                    val subscription = Subscription.fromCccd(value)
-
-                    if (subscription != null) {
-                        subscriptions.getOrPut(addr) { ConcurrentHashMap() }[charUuid] = subscription
-                    } else {
-                        subscriptions[addr]?.remove(charUuid)
-                    }
-
-                    nativeOnSubscriptionChanged(addr, charUuid.toString(), subscription != null)
+                    val subscribed = subscriptions.update(addr, charUuid, value)
+                    nativeOnSubscriptionChanged(addr, charUuid.toString(), subscribed)
                 }
 
                 if (responseNeeded) {
@@ -648,15 +641,26 @@ object BlePeripheralManager {
         val uuid = UUID.fromString(charUuid)
         val char = characteristics[uuid] ?: return 3
         val device = connectedDevices[deviceAddr] ?: return 2
-        val subscription = subscriptions[deviceAddr]?.get(uuid) ?: return 2
         if (!acquireNotify(deviceAddr, timeoutMs = 50)) return 1
-        val sent = sendNotification(device, char, value, subscription.confirm)
-        if (!sent) {
-            releaseNotify(deviceAddr)
-            return 1
-        }
-        return 0
+        val status = sendToSubscriber(device, char, value)
+        if (status != 0) releaseNotify(deviceAddr)
+        return status
     }
+
+    /**
+     * Send [value] as whatever [device] currently subscribes to on [char]:
+     * 0 = handed to the stack, 1 = the stack refused it, 2 = not subscribed.
+     * The subscription is read and used under the lock the CCCD write handler
+     * takes, so a rewrite can't change notification vs. indication midway.
+     */
+    private fun sendToSubscriber(
+        device: BluetoothDevice,
+        char: BluetoothGattCharacteristic,
+        value: ByteArray,
+    ): Int =
+        subscriptions.withSubscription(device.address, char.uuid) { subscription ->
+            if (sendNotification(device, char, value, subscription.confirm)) 0 else 1
+        } ?: 2
 
     /**
      * Send a single notification, handling the API 33+ / legacy split.

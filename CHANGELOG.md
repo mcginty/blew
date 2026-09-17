@@ -60,8 +60,10 @@ All notable changes to `blew` are documented here. Format follows
   only indications received a notification it never asked for, and never got
   to confirm it. The peripheral now remembers which bit each central set per
   characteristic and sends an indication when only the indicate bit is set; a
-  central that enables both gets notifications. This matches CoreBluetooth and
-  BlueZ, which already follow the CCCD. There is no API change.
+  central that enables both gets notifications. A central that rewrites its
+  CCCD while a send is waiting its turn gets the kind it asked for last. There
+  is no API change. This fix is Android-only: on Linux a characteristic that
+  declares only `INDICATE` still can't be subscribed to.
 - **Android: a named advertisement no longer goes out under the previous
   name.** ([#21](https://github.com/mcginty/blew/pull/21), reported by
   @Resilum-owner) The adapter applies a rename asynchronously, but the scan
