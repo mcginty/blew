@@ -32,11 +32,22 @@ use uuid::Uuid;
 /// across the await point.
 type SharedNotifier = Arc<tokio::sync::Mutex<CharacteristicNotifier>>;
 
-/// Backstop on waiting for BlueZ to finish an indication. The wait is only
-/// backpressure, so expiring is `Sent` like every other ending. It exists
-/// because some waits never end: BlueZ skips a bonded central that is still
-/// subscribed but not connected, without ever calling `Confirm`.
-const INDICATION_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(35);
+/// How long a send waits for BlueZ to finish an indication before it gives up
+/// on pacing. A pacing bound, not an ATT deadline: expiring is `Sent` like
+/// every other ending, and BlueZ still delivers the indication (or times it
+/// out after 30 s and drops the link).
+///
+/// 5 s is well past an indication round trip on any link a peripheral
+/// realistically has — BlueZ, iOS and Android negotiate connection intervals
+/// between 7.5 ms and 2 s — so a live subscriber paces sends by its
+/// confirmations, not by this bound. It stays this short because some waits
+/// are never answered: a bonded central keeps its subscription after it
+/// disconnects (`att_disconnected` in BlueZ's `src/gatt-database.c` returns
+/// early for a bonded device), and values for it are dropped without a
+/// `Confirm` (`send_notification_to_device` → `state_set_pending`). Every send
+/// then pays the bound, so it decides how badly a central that walked away
+/// throttles the application.
+const INDICATION_PACING_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
 struct PeripheralInner {
     _session: Session,
@@ -150,13 +161,13 @@ fn notify_flags(props: CharacteristicProperties) -> Option<(bool, bool)> {
 
 /// What one notifier's `notify()` means for the caller: `Ok(true)` if the value
 /// was handed to BlueZ, `Ok(false)` if the session was already gone. `result`
-/// is `None` when [`INDICATION_BACKSTOP`] elapsed; `stopped` is read after.
+/// is `None` when [`INDICATION_PACING_BOUND`] elapsed; `stopped` is read after.
 ///
 /// Every ending after the emit is `Sent`. BlueZ calls `Confirm` for a real
 /// confirmation and equally when the indication fails (ATT timeout or
 /// disconnect), so `Ok` says nothing about delivery, and neither does the
-/// session ending mid-wait or the backstop. `notify` emits on its first poll,
-/// before it waits, so the backstop can only elapse after the emit.
+/// session ending mid-wait or the pacing bound. `notify` emits on its first
+/// poll, before it waits, so the bound can only elapse after the emit.
 fn notify_outcome(result: Option<bluer::Result<()>>, stopped: bool) -> BlewResult<bool> {
     match result {
         None | Some(Ok(())) => Ok(true),
@@ -532,10 +543,10 @@ impl PeripheralBackend for LinuxPeripheral {
                     // An indicate-only characteristic: bluer's `notify` waits
                     // until BlueZ finishes the indication, which paces sends
                     // to BlueZ's one indication in flight per bearer. If the
-                    // backstop drops a wait, a late `Confirm` can land after
-                    // the next `notify` flushes the channel and end that wait
+                    // bound drops a wait, a late `Confirm` can land after the
+                    // next `notify` flushes the channel and end that wait
                     // early. That only loosens pacing: the result is `Sent`.
-                    tokio::time::timeout(INDICATION_BACKSTOP, notifier.notify(value.clone()))
+                    tokio::time::timeout(INDICATION_PACING_BOUND, notifier.notify(value.clone()))
                         .await
                         .ok()
                 } else {
@@ -614,6 +625,17 @@ mod tests {
             notify_flags(CharacteristicProperties::NOTIFY | CharacteristicProperties::INDICATE),
             Some((true, true))
         );
+    }
+
+    #[test]
+    fn the_indication_wait_stays_a_pacing_bound() {
+        // At or above BlueZ's 30 s ATT transaction timeout, only a wait that
+        // nothing will ever answer can reach the bound -- the stall #41
+        // reported, where a bonded central that walked away costs every send
+        // the full wait. Far below a couple of connection events it would
+        // abandon live waits instead and stop pacing at all.
+        assert!(INDICATION_PACING_BOUND < std::time::Duration::from_secs(30));
+        assert!(INDICATION_PACING_BOUND >= std::time::Duration::from_secs(4));
     }
 
     fn bluer_error(kind: bluer::ErrorKind) -> bluer::Error {

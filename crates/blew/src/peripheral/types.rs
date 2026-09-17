@@ -51,10 +51,12 @@ pub enum PeripheralStateEvent {
 ///
 /// Linux never fails a value it handed to BlueZ. On an indicate-only
 /// characteristic the call waits until BlueZ has finished the indication,
-/// bounded by a 35 s backstop, which paces sends to what BlueZ can deliver.
-/// Finished means confirmed or timed out, and Linux can't tell which: BlueZ
-/// reports both the same way. A BlueZ ATT timeout also drops the link, which
-/// shows up as the central disconnecting.
+/// bounded by 5 s, which paces sends to what BlueZ can deliver. Finished means
+/// confirmed or timed out, and Linux can't tell which: BlueZ reports both the
+/// same way. A BlueZ ATT timeout also drops the link, which shows up as the
+/// central disconnecting. A bonded central that is still subscribed but no
+/// longer connected is never answered at all, so until it unsubscribes or
+/// returns, each send waits out the bound and then reports `Sent`.
 ///
 /// [`notify_characteristic`]: crate::peripheral::Peripheral::notify_characteristic
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

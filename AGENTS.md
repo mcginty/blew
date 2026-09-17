@@ -297,11 +297,20 @@ an error opcode, `conf_cb` in `src/shared/gatt-server.c` ignores the opcode,
 and `conf_cb` in `src/gatt-database.c` calls `Confirm`. Confirmations from
 every subscribed central also land in the same channel. The wait exists only
 for backpressure, pacing sends to BlueZ's one indication in flight per bearer.
-It has a 35 s backstop because some waits never end: BlueZ skips a bonded
-central that is subscribed but not connected without calling `Confirm`.
-**Don't turn a successful `notify()` into `Confirmed`, and don't turn a
-backstop expiry or a session ending mid-wait into an error**; all of them are
-`Sent`.
+**Don't turn a successful `notify()` into `Confirmed`, and don't turn the wait
+expiring or a session ending mid-wait into an error**; all of them are `Sent`.
+
+`INDICATION_PACING_BOUND` caps that wait at 5 s, and the number is load-bearing
+in both directions. Some waits are never answered: a bonded central keeps its
+subscription when it disconnects (`att_disconnected` returns early for a bonded
+device) and BlueZ drops values for it without a `Confirm`
+(`send_notification_to_device` → `state_set_pending`), so until it returns
+every send pays the bound — the throttle #41 reported, at 35 s per send. Raising
+the bound back toward BlueZ's 30 s ATT transaction timeout restores it.
+Dropping it far below an indication round trip goes wrong the other way: live
+waits get abandoned, pacing stops, and each abandoned wait leaves a `Confirm`
+for the next send's flush to pick up, so a send can return on the previous
+value's confirmation.
 
 ## Android backend design (`platform/android/`)
 
