@@ -67,8 +67,8 @@ object BlePeripheralManager {
     // Track connected devices for notification delivery.
     private val connectedDevices = ConcurrentHashMap<String, BluetoothDevice>()
 
-    // Track which (device, characteristic) pairs are subscribed for notifications.
-    private val subscriptions = ConcurrentHashMap<String, MutableSet<UUID>>()
+    // What each device enabled per characteristic through its CCCD write.
+    private val subscriptions = ConcurrentHashMap<String, ConcurrentHashMap<UUID, Subscription>>()
 
     // Map characteristic UUID -> BluetoothGattCharacteristic for notification sending.
     private val characteristics = ConcurrentHashMap<UUID, BluetoothGattCharacteristic>()
@@ -359,15 +359,15 @@ object BlePeripheralManager {
                 if (descriptor.uuid == cccdUuid) {
                     val charUuid = descriptor.characteristic.uuid
                     val addr = device.address
-                    val subscribed = value != null && value.isNotEmpty() && value[0].toInt() != 0
+                    val subscription = Subscription.fromCccd(value)
 
-                    if (subscribed) {
-                        subscriptions.getOrPut(addr) { mutableSetOf() }.add(charUuid)
+                    if (subscription != null) {
+                        subscriptions.getOrPut(addr) { ConcurrentHashMap() }[charUuid] = subscription
                     } else {
                         subscriptions[addr]?.remove(charUuid)
                     }
 
-                    nativeOnSubscriptionChanged(addr, charUuid.toString(), subscribed)
+                    nativeOnSubscriptionChanged(addr, charUuid.toString(), subscription != null)
                 }
 
                 if (responseNeeded) {
@@ -630,6 +630,8 @@ object BlePeripheralManager {
 
     /**
      * Send a notification on a characteristic to a single subscribed device.
+     * Whether it goes out as a notification or an indication is what the
+     * device enabled in its CCCD write.
      *
      * Returns:
      *   0 = success
@@ -646,10 +648,9 @@ object BlePeripheralManager {
         val uuid = UUID.fromString(charUuid)
         val char = characteristics[uuid] ?: return 3
         val device = connectedDevices[deviceAddr] ?: return 2
-        val subs = subscriptions[deviceAddr] ?: return 2
-        if (uuid !in subs) return 2
+        val subscription = subscriptions[deviceAddr]?.get(uuid) ?: return 2
         if (!acquireNotify(deviceAddr, timeoutMs = 50)) return 1
-        val sent = sendNotification(device, char, value)
+        val sent = sendNotification(device, char, value, subscription.confirm)
         if (!sent) {
             releaseNotify(deviceAddr)
             return 1
@@ -666,15 +667,16 @@ object BlePeripheralManager {
         device: BluetoothDevice,
         char: BluetoothGattCharacteristic,
         value: ByteArray,
+        confirm: Boolean,
     ): Boolean =
         if (Build.VERSION.SDK_INT >= 33) {
-            gattServer?.notifyCharacteristicChanged(device, char, false, value) ==
+            gattServer?.notifyCharacteristicChanged(device, char, confirm, value) ==
                 BluetoothStatusCodes.SUCCESS
         } else {
             @Suppress("DEPRECATION")
             synchronized(char) {
                 char.value = value
-                gattServer?.notifyCharacteristicChanged(device, char, false) ?: false
+                gattServer?.notifyCharacteristicChanged(device, char, confirm) ?: false
             }
         }
 
