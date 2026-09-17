@@ -247,10 +247,10 @@ impl AndroidPeripheral {
                         &[],
                     )?
                     .l()?;
+                let name = env.cast_local::<jni::objects::JString>(name)?;
                 if name.is_null() {
                     return Ok(None);
                 }
-                let name = unsafe { jni::objects::JString::from_raw(env, name.as_raw()) };
                 Ok(Some(name.try_to_string(env)?))
             })
             .map_err(|e| jni_err(&e))

@@ -851,10 +851,15 @@ impl crate::peripheral::Peripheral<MockPeripheral> {
         Ok(self.backend.adapter_name.lock().clone())
     }
 
-    /// Mirrors the Android-only `Peripheral::set_adapter_name`.
+    /// Mirrors the Android-only `Peripheral::set_adapter_name`, including
+    /// renaming nothing until the returned future is polled.
     pub fn set_adapter_name(&self, name: &str) -> impl Future<Output = BlewResult<()>> + Send {
-        *self.backend.adapter_name.lock() = Some(name.to_owned());
-        std::future::ready(Ok(()))
+        let adapter_name = Arc::clone(&self.backend.adapter_name);
+        let name = name.to_owned();
+        async move {
+            *adapter_name.lock() = Some(name);
+            Ok(())
+        }
     }
 }
 #[cfg(test)]
@@ -992,6 +997,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(peripheral.adapter_name().unwrap(), theirs);
+    }
+
+    #[tokio::test]
+    async fn test_mock_set_adapter_name_renames_nothing_until_polled() {
+        let (_c, p) = MockLink::pair();
+        let peripheral = Peripheral::from_backend(p.peripheral);
+
+        drop(peripheral.set_adapter_name("never-awaited"));
+        assert_eq!(
+            peripheral.adapter_name().unwrap().as_deref(),
+            Some(MOCK_ADAPTER_NAME)
+        );
     }
 
     #[tokio::test]
