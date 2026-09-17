@@ -72,14 +72,26 @@ All notable changes to `blew` are documented here. Format follows
   subscribed, which stays a success. A send awaiting confirmation fails if the
   central disconnects or doesn't confirm within the ATT transaction timeout,
   rather than reporting success. Android now resolves only once
-  `onNotificationSent` reports, and Linux resolves a confirmed indication once
-  BlueZ relays the confirmation. Apple can only ever report `Sent`.
-  CoreBluetooth has no indication confirmation. Android always sends
-  notifications and the Linux backend registers only notification sessions, so
-  no backend returns `Confirmed` yet.
+  `onNotificationSent` reports, so an indication to a central that subscribed
+  for indications returns `Confirmed` once the central confirms it. Linux
+  reports `Confirmed` once BlueZ relays the confirmation of an indication, but
+  the Linux backend doesn't yet register indication subscriptions, so today it
+  returns `Sent`. Apple can only ever report `Sent`: CoreBluetooth has no
+  indication confirmation.
 
 ### Fixed
 
+- **Android: a central that subscribes for indications now gets indications.**
+  ([#18](https://github.com/mcginty/blew/issues/18)) The peripheral reduced
+  the central's CCCD write to "subscribed or not" and then sent every
+  `notify_characteristic` value as a notification, so a central that enabled
+  only indications received a notification it never asked for, and never got
+  to confirm it. The peripheral now remembers which bit each central set per
+  characteristic and sends an indication when only the indicate bit is set; a
+  central that enables both gets notifications. A central that rewrites its
+  CCCD while a send is waiting its turn gets the kind it asked for last. There
+  is no API change. This fix is Android-only: on Linux a characteristic that
+  declares only `INDICATE` still can't be subscribed to.
 - **Android: notifying a busy device no longer fails after a few seconds, and
   a refused notification is no longer retried as busy.** Kotlin serialized sends
   per device with a semaphore released by `onNotificationSent`, and Rust polled

@@ -97,8 +97,8 @@ object BlePeripheralManager {
     // Track connected devices for notification delivery.
     private val connectedDevices = ConcurrentHashMap<String, BluetoothDevice>()
 
-    // Track which (device, characteristic) pairs are subscribed for notifications.
-    private val subscriptions = ConcurrentHashMap<String, MutableSet<UUID>>()
+    // What each device enabled per characteristic through its CCCD write.
+    private val subscriptions = SubscriptionTable()
 
     // Map characteristic UUID -> BluetoothGattCharacteristic for notification sending.
     private val characteristics = ConcurrentHashMap<UUID, BluetoothGattCharacteristic>()
@@ -417,14 +417,7 @@ object BlePeripheralManager {
                 if (descriptor.uuid == cccdUuid) {
                     val charUuid = descriptor.characteristic.uuid
                     val addr = device.address
-                    val subscribed = value != null && value.isNotEmpty() && value[0].toInt() != 0
-
-                    if (subscribed) {
-                        subscriptions.getOrPut(addr) { mutableSetOf() }.add(charUuid)
-                    } else {
-                        subscriptions[addr]?.remove(charUuid)
-                    }
-
+                    val subscribed = subscriptions.update(addr, charUuid, value)
                     nativeOnSubscriptionChanged(addr, charUuid.toString(), subscribed)
                 }
 
@@ -688,7 +681,8 @@ object BlePeripheralManager {
     }
 
     /**
-     * Send a value on a characteristic to a single subscribed device.
+     * Send a value on a characteristic to a single subscribed device, as
+     * whatever the device enabled in its CCCD write.
      *
      * The stack takes one value per device until `onNotificationSent`, and
      * drops or refuses a second. Rust serializes calls per device and waits for
@@ -703,23 +697,27 @@ object BlePeripheralManager {
         val uuid = UUID.fromString(charUuid)
         val char = characteristics[uuid] ?: return NOTIFY_CHAR_NOT_FOUND
         val device = connectedDevices[deviceAddr] ?: return NOTIFY_NOT_SUBSCRIBED
-        val subs = subscriptions[deviceAddr] ?: return NOTIFY_NOT_SUBSCRIBED
-        if (uuid !in subs) return NOTIFY_NOT_SUBSCRIBED
-        val confirm = sendsIndication(deviceAddr, uuid)
-        if (!sendNotification(device, char, value, confirm)) return NOTIFY_REJECTED
-        return if (confirm) NOTIFY_INDICATED else NOTIFY_SENT
+        return sendToSubscriber(device, char, value)
     }
 
     /**
-     * Whether a value for [charUuid] goes to [deviceAddr] as an indication.
-     * The only place that decides, because Rust reports an indication's
-     * completion as a confirmation.
+     * Send [value] as whatever [device] currently subscribes to on [char],
+     * returning a `NOTIFY_*` code. The subscription is read and used under the
+     * lock the CCCD write handler takes, so a rewrite can't change notification
+     * vs. indication midway, and it is the only thing that decides between them.
      */
-    @Suppress("UNUSED_PARAMETER")
-    private fun sendsIndication(
-        deviceAddr: String,
-        charUuid: UUID,
-    ): Boolean = false
+    private fun sendToSubscriber(
+        device: BluetoothDevice,
+        char: BluetoothGattCharacteristic,
+        value: ByteArray,
+    ): Int =
+        subscriptions.withSubscription(device.address, char.uuid) { subscription ->
+            when {
+                !sendNotification(device, char, value, subscription.confirm) -> NOTIFY_REJECTED
+                subscription.confirm -> NOTIFY_INDICATED
+                else -> NOTIFY_SENT
+            }
+        } ?: NOTIFY_NOT_SUBSCRIBED
 
     /**
      * Send a single notification or indication, handling the API 33+ / legacy
