@@ -741,6 +741,20 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnAdve
     });
 }
 
+/// Asynchronous outcome of `setAdapterName`: whether the new name took effect.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnAdapterRenameResult(
+    _env: EnvUnowned,
+    _class: JClass,
+    request_id: jint,
+    success: jboolean,
+) {
+    guard("nativeOnAdapterRenameResult", || {
+        trace!(request_id, success, "adapter rename result");
+        super::peripheral::complete_rename(request_id, success);
+    });
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnL2capChannelClosed(
     mut env: EnvUnowned,

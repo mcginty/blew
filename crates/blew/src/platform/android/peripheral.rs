@@ -15,8 +15,8 @@ use crate::peripheral::types::{
     AdvertisingConfig, LocalName, PeripheralConfig, PeripheralRequest, PeripheralStateEvent,
 };
 use crate::types::DeviceId;
-use crate::util::BroadcastEventStream;
 use crate::util::advertise_state::{AdvertiseState, Advertising};
+use crate::util::{BroadcastEventStream, KeyedRequestMap};
 
 use super::jni_globals::{jvm, peripheral_class};
 
@@ -36,11 +36,23 @@ const ADVERTISE_NAME_REJECTED: i32 = 3;
 /// through `nativeOnAdvertisingResult` in place of an `AdvertiseCallback` error.
 pub(super) const ADVERTISE_FAILED_RENAME_UNCONFIRMED: i32 = -1;
 
+/// How long `set_adapter_name` waits for Kotlin's verdict. Kotlin fails an
+/// unconfirmed rename itself after a second; this only bounds a verdict that
+/// never arrives.
+const RENAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Kotlin's `BlePeripheralManager.RENAME_OK`.
+const RENAME_OK: i32 = 0;
+/// Kotlin's `BlePeripheralManager.RENAME_REJECTED`.
+const RENAME_REJECTED: i32 = 2;
+
+static NEXT_RENAME_ID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
 struct PeripheralState {
     request_tx: mpsc::UnboundedSender<PeripheralRequest>,
     request_rx: Mutex<Option<mpsc::UnboundedReceiver<PeripheralRequest>>>,
     state_tx: broadcast::Sender<PeripheralStateEvent>,
     advertise: Mutex<AdvertiseState>,
+    renames: KeyedRequestMap<i32, oneshot::Sender<bool>>,
 }
 
 /// Run `f` against the advertising state, if the backend is initialised.
@@ -164,6 +176,31 @@ pub(crate) fn complete_advertise(request_id: i32, result: BlewResult<()>) {
     }
 }
 
+/// Deliver Kotlin's verdict to a waiting `set_adapter_name`.
+pub(crate) fn complete_rename(request_id: i32, success: bool) {
+    let tx = STATE
+        .lock()
+        .as_ref()
+        .and_then(|s| s.renames.take(&request_id));
+    if let Some(tx) = tx {
+        let _ = tx.send(success);
+    } else {
+        debug!(request_id, "ignoring rename result for a stale request");
+    }
+}
+
+/// Drops a rename's waiter however `set_adapter_name` exits, including being
+/// dropped mid-await.
+struct RenameGuard(i32);
+
+impl Drop for RenameGuard {
+    fn drop(&mut self) {
+        if let Some(s) = STATE.lock().as_ref() {
+            s.renames.take(&self.0);
+        }
+    }
+}
+
 pub(crate) fn send_request(request: PeripheralRequest) {
     if let Some(s) = STATE.lock().as_ref() {
         let _ = s.request_tx.send(request);
@@ -191,10 +228,81 @@ impl AndroidPeripheral {
         this.l2cap_encryption = config.l2cap.encryption;
         Ok(this)
     }
+
+    pub fn adapter_name(&self) -> BlewResult<Option<String>> {
+        jvm()
+            .attach_current_thread(|env| {
+                let name = env
+                    .call_static_method(
+                        peripheral_class(),
+                        jni_str!("getAdapterName"),
+                        jni_sig!("()Ljava/lang/String;"),
+                        &[],
+                    )?
+                    .l()?;
+                if name.is_null() {
+                    return Ok(None);
+                }
+                let name = unsafe { jni::objects::JString::from_raw(env, name.as_raw()) };
+                Ok(Some(name.try_to_string(env)?))
+            })
+            .map_err(|e| jni_err(&e))
+    }
+
+    pub async fn set_adapter_name(&self, name: &str) -> BlewResult<()> {
+        let request_id = NEXT_RENAME_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        // Registered before the JNI call: a name already in place is confirmed
+        // before the call returns.
+        STATE
+            .lock()
+            .as_ref()
+            .ok_or(BlewError::NotInitialized)?
+            .renames
+            .insert(request_id, tx);
+        let _guard = RenameGuard(request_id);
+
+        let code: i32 = jvm()
+            .attach_current_thread(|env| {
+                let name = env.new_string(name)?;
+                env.call_static_method(
+                    peripheral_class(),
+                    jni_str!("setAdapterName"),
+                    jni_sig!("(Ljava/lang/String;I)I"),
+                    &[(&name).into(), request_id.into()],
+                )?
+                .i()
+            })
+            .map_err(|e| jni_err(&e))?;
+        match code {
+            RENAME_OK => {}
+            RENAME_REJECTED => {
+                return Err(BlewError::Peripheral {
+                    source: "Android refused to rename the Bluetooth adapter \
+                             (is Bluetooth on, and BLUETOOTH_CONNECT granted?)"
+                        .into(),
+                });
+            }
+            _ => return Err(BlewError::NotInitialized),
+        }
+
+        match tokio::time::timeout(RENAME_TIMEOUT, rx).await {
+            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(false)) => Err(BlewError::Peripheral {
+                source: "the Bluetooth adapter rename didn't take effect".into(),
+            }),
+            Ok(Err(_)) => Err(BlewError::Peripheral {
+                source: "adapter rename result dropped".into(),
+            }),
+            Err(_) => Err(BlewError::Peripheral {
+                source: format!("adapter rename unconfirmed after {RENAME_TIMEOUT:?}").into(),
+            }),
+        }
+    }
 }
 
 /// The name Kotlin may rename the adapter to, or `None` to leave it alone.
-fn adapter_name(local_name: &LocalName) -> BlewResult<Option<&str>> {
+fn rename_target(local_name: &LocalName) -> BlewResult<Option<&str>> {
     match local_name {
         LocalName::None => Ok(None),
         LocalName::AllowPermanent(name) => Ok(Some(name)),
@@ -305,6 +413,7 @@ impl PeripheralBackend for AndroidPeripheral {
             request_rx: Mutex::new(Some(request_rx)),
             state_tx,
             advertise: Mutex::new(AdvertiseState::default()),
+            renames: KeyedRequestMap::new(),
         });
         // The L2CAP statics are shared between the two roles but were only
         // initialised from the central path. A peripheral-only app would find
@@ -390,7 +499,7 @@ impl PeripheralBackend for AndroidPeripheral {
     }
 
     async fn start_advertising(&self, config: &AdvertisingConfig) -> BlewResult<()> {
-        let adapter_name = adapter_name(&config.local_name)?;
+        let adapter_name = rename_target(&config.local_name)?;
         // Claimed before the JNI call: AdvertiseCallback can fire before the
         // call has even returned.
         let (request_id, rx) = register_advertise()?;

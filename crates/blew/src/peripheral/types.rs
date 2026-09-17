@@ -222,7 +222,9 @@ pub enum LocalName {
     /// the app exits. blew doesn't record or restore the previous name: a
     /// restore can't be made reliable from inside one app (an uninstall, a
     /// killed process, or another app renaming the adapter in the meantime
-    /// all defeat it), so putting a name back is left to the application.
+    /// all defeat it), so putting a name back is left to the application. The
+    /// Android-only `Peripheral::adapter_name` and `Peripheral::set_adapter_name`
+    /// read and write it for that.
     ///
     /// Android applies a rename asynchronously, and an advertisement carries
     /// whichever name is in place when it starts, so blew only starts

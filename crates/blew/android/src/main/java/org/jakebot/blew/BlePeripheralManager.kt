@@ -51,6 +51,15 @@ object BlePeripheralManager {
      */
     const val ADVERTISE_FAILED_RENAME_UNCONFIRMED = -1
 
+    /** setAdapterName handed the rename to [AdapterRename]; the outcome follows asynchronously. */
+    const val RENAME_OK = 0
+
+    /** No [AdapterRename] yet: [init] hasn't run. */
+    const val RENAME_UNAVAILABLE = 1
+
+    /** The stack refused the rename -- Bluetooth is off, or BLUETOOTH_CONNECT isn't granted. */
+    const val RENAME_REJECTED = 2
+
     private var context: Context? = null
     private var bluetoothManager: BluetoothManager? = null
 
@@ -176,6 +185,13 @@ object BlePeripheralManager {
         errorCode: Int,
     )
 
+    /** Async outcome of [setAdapterName]: whether the new name took effect. */
+    @JvmStatic
+    external fun nativeOnAdapterRenameResult(
+        requestId: Int,
+        success: Boolean,
+    )
+
     @JvmStatic
     external fun nativeOnL2capChannelClosed(
         socketId: Int,
@@ -217,7 +233,7 @@ object BlePeripheralManager {
         // null when it comes back on. It is resolved per startAdvertising call.
         Log.d(TAG, "initialized, adapter=${adapter != null}")
         if (adapterRename == null) {
-            adapterRename = AdapterRename(AndroidAdapterNames(), scope)
+            adapterRename = AdapterRename(adapterNames, scope)
         }
         // Registering the same receiver twice delivers every adapter state
         // change twice. init() runs again whenever the host activity is
@@ -231,9 +247,34 @@ object BlePeripheralManager {
         }
     }
 
-    /** Renames the adapter for named advertisements; see [AdapterRename]. */
+    /** Renames the adapter for named advertisements and [setAdapterName]; see [AdapterRename]. */
     @Volatile
     private var adapterRename: AdapterRename? = null
+
+    private val adapterNames: AdapterNames = AndroidAdapterNames()
+
+    /** The adapter's name, or null when it can't be read. */
+    @JvmStatic
+    fun getAdapterName(): String? = adapterNames.get()
+
+    /**
+     * Rename the adapter for the application. Returns [RENAME_OK] once the
+     * request is in hand, and reports through [nativeOnAdapterRenameResult]
+     * when the name has taken effect or failed to.
+     */
+    @JvmStatic
+    fun setAdapterName(
+        name: String,
+        requestId: Int,
+    ): Int {
+        val rename = adapterRename ?: return RENAME_UNAVAILABLE
+        rename.request(
+            name,
+            onReady = { nativeOnAdapterRenameResult(requestId, true) },
+            onFailed = { nativeOnAdapterRenameResult(requestId, false) },
+        ) ?: return RENAME_REJECTED
+        return RENAME_OK
+    }
 
     private class AndroidAdapterNames : AdapterNames {
         override fun get(): String? =

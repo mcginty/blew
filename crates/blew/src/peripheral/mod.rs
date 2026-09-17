@@ -179,6 +179,38 @@ impl Peripheral {
     }
 }
 
+#[cfg(target_os = "android")]
+impl Peripheral {
+    /// The Bluetooth adapter's name: what every app, paired device and pairing
+    /// dialog shows, and what [`LocalName::AllowPermanent`] replaces.
+    ///
+    /// blew doesn't restore a name it replaced. An application that wants the
+    /// previous name back reads it here before advertising under
+    /// `AllowPermanent`, keeps it wherever suits it, and puts it back with
+    /// [`set_adapter_name`](Self::set_adapter_name) when it chooses to. Check
+    /// the adapter still carries the advertised name first, so a name the user
+    /// or another app chose in the meantime isn't overwritten.
+    ///
+    /// `None` when the name can't be read: Bluetooth is unavailable, or
+    /// `BLUETOOTH_CONNECT` hasn't been granted.
+    pub fn adapter_name(&self) -> BlewResult<Option<String>> {
+        self.backend.adapter_name()
+    }
+
+    /// Rename the Bluetooth adapter, returning once the new name has taken
+    /// effect.
+    ///
+    /// Like [`LocalName::AllowPermanent`], this is device-global and
+    /// persistent. It fails if the stack refuses the rename (Bluetooth is off,
+    /// or `BLUETOOTH_CONNECT` hasn't been granted), if the name hasn't taken
+    /// effect within a second, or if a later rename -- including one a named
+    /// [`start_advertising`](Self::start_advertising) makes -- replaces it
+    /// before it lands.
+    pub async fn set_adapter_name(&self, name: &str) -> BlewResult<()> {
+        self.backend.set_adapter_name(name).await
+    }
+}
+
 #[cfg(all(test, feature = "testing"))]
 mod take_requests_tests {
     #[tokio::test]

@@ -42,6 +42,15 @@ class AdapterRenameTest {
 
         fun request(name: String = BEACON) = rename.request(name, { ready++ }, { failed++ })
 
+        /** A request with outcomes of its own, for tests where several overlap. */
+        inner class Waiter(
+            name: String,
+        ) {
+            var ready = 0
+            var failed = 0
+            val ticket = rename.request(name, { ready++ }, { failed++ })!!
+        }
+
         /** The stack applies the oldest pending rename and broadcasts it. */
         fun land() {
             val next = adapter.queued.removeFirst()
@@ -188,5 +197,59 @@ class AdapterRenameTest {
             assertEquals(1, f.ready)
             f.elapse(5_000)
             assertEquals(0, f.failed)
+        }
+
+    @Test
+    fun aLaterRenameFailsAnEarlierWaiterOnceItLands() =
+        runTest {
+            val f = Fixture(this)
+            val advertisement = f.Waiter(BEACON)
+            val application = f.Waiter(USER)
+            f.land()
+            assertEquals("nothing settles while a rename is still queued", 0, advertisement.failed)
+            assertEquals(0, application.ready)
+            f.land()
+            assertEquals(1, application.ready)
+            assertEquals(0, advertisement.ready)
+            assertEquals(1, advertisement.failed)
+            f.elapse(5_000)
+            assertEquals(1, advertisement.failed)
+            assertEquals(0, application.failed)
+        }
+
+    @Test
+    fun waitersForTheSameNameAreAllReleased() =
+        runTest {
+            val f = Fixture(this)
+            val first = f.Waiter(BEACON)
+            val second = f.Waiter(BEACON)
+            assertEquals(listOf(BEACON), f.adapter.requests)
+            f.land()
+            assertEquals(1, first.ready)
+            assertEquals(1, second.ready)
+        }
+
+    @Test
+    fun cancellingOneWaiterLeavesTheOthers() =
+        runTest {
+            val f = Fixture(this)
+            val cancelled = f.Waiter(BEACON)
+            val kept = f.Waiter(BEACON)
+            f.rename.cancel(cancelled.ticket)
+            f.land()
+            assertEquals(0, cancelled.ready)
+            assertEquals(1, kept.ready)
+        }
+
+    @Test
+    fun anUnconfirmedRenameFailsEveryWaiter() =
+        runTest {
+            val f = Fixture(this)
+            val advertisement = f.Waiter(BEACON)
+            val application = f.Waiter(BEACON)
+            f.elapse(1_000)
+            assertEquals(1, advertisement.failed)
+            assertEquals(1, application.failed)
+            assertEquals(0, advertisement.ready + application.ready)
         }
 }
