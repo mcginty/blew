@@ -74,10 +74,11 @@ All notable changes to `blew` are documented here. Format follows
   rather than reporting success. Android now resolves only once
   `onNotificationSent` reports, so an indication to a central that subscribed
   for indications returns `Confirmed` once the central confirms it. Linux
-  reports `Confirmed` once BlueZ relays the confirmation of an indication, but
-  the Linux backend doesn't yet register indication subscriptions, so today it
-  returns `Sent`. Apple can only ever report `Sent`: CoreBluetooth has no
-  indication confirmation.
+  and Apple can only ever report `Sent`: CoreBluetooth has no indication
+  confirmation, and BlueZ relays every central's confirmation to the same
+  place, so one can't be attributed to a value or a central. Linux still waits
+  for a confirmation on an indicate-only characteristic and fails the call if
+  none arrives within the ATT transaction timeout.
 
 ### Fixed
 
@@ -90,8 +91,21 @@ All notable changes to `blew` are documented here. Format follows
   characteristic and sends an indication when only the indicate bit is set; a
   central that enables both gets notifications. A central that rewrites its
   CCCD while a send is waiting its turn gets the kind it asked for last. There
-  is no API change. This fix is Android-only: on Linux a characteristic that
-  declares only `INDICATE` still can't be subscribed to.
+  is no API change.
+- **Linux: a characteristic that declares `INDICATE` can be subscribed to.**
+  ([#18](https://github.com/mcginty/blew/issues/18)) The peripheral registered
+  a characteristic with BlueZ as notify-only whenever it declared `NOTIFY`, and
+  not at all when it declared only `INDICATE`. BlueZ builds the CCCD from those
+  flags and refuses a subscription for a kind that isn't registered, so a
+  central could never enable indications. The characteristic now registers
+  exactly the kinds it declares, and BlueZ sends each central the kind it
+  subscribed for. `notify_characteristic` on an indicate-only characteristic
+  waits for a confirmation (up to 35 s) and returns `Delivery::Sent`, not
+  `Confirmed`: BlueZ indicates every subscribed central and passes every
+  confirmation to the same channel, so it can't say whose it was. It fails
+  only when no confirmation arrives at all. A concurrent send on the same
+  characteristic also no longer forgets a subscriber whose session another
+  send is holding, which a slow indication made easy to hit.
 - **Android: notifying a busy device no longer fails after a few seconds, and
   a refused notification is no longer retried as busy.** Kotlin serialized sends
   per device with a semaphore released by `onNotificationSent`, and Rust polled

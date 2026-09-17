@@ -288,6 +288,18 @@ Uses `bluer 0.17` (official BlueZ Rust bindings over D-Bus).
 - `CharacteristicWrite.write` = Write Request (with response); `CharacteristicWrite.write_without_response` = Write Command (no response). The doc comment on `write` saying "Write Command" is incorrect — trust `set_characteristic_flags` which maps directly to `CharacteristicFlags.write` = BlueZ "write" property = Write Request.
 - `WriteOp::Request` in `CharacteristicWriteRequest.op_type` indicates a Write Request needing a response.
 
+**Linux never reports `Delivery::Confirmed`.** bluer gives an indicate-only
+characteristic (`indicate && !notify`) one confirmation channel, and
+`CharacteristicNotifier::notify` returns on the first confirmation it receives.
+BlueZ sends each value to every subscribed central and calls `Confirm` once per
+central that confirms (`conf_cb` in `src/gatt-database.c`), all into that one
+channel. It also calls `StartNotify` for every central's CCCD write, and bluer
+replaces the session each time, so no session count tells you how many
+centrals are subscribed. A confirmation can therefore belong to another central
+or to an earlier value. **Don't map a successful `notify()` to `Confirmed`**
+without a way to attribute the confirmation; the wait is kept only so a value
+nobody confirms within the ATT timeout fails.
+
 ## Android backend design (`platform/android/`)
 
 Uses `jni 0.22` and `ndk-context 0.1`. The Android BLE API is Java/Kotlin-only, so the backend bridges Rust ↔ Kotlin via JNI.
