@@ -83,12 +83,16 @@ All notable changes to `blew` are documented here. Format follows
   for 35 s.** ([#41](https://github.com/mcginty/blew/issues/41)) A bonded
   central keeps its subscription when it disconnects, and BlueZ drops values
   for it without ever reporting a confirmation, so `notify_characteristic` on
-  an indicate-only characteristic waited out its full bound on every send and
-  held the characteristic's other senders behind it. The wait is now capped at
-  5 s, which is still well past an indication round trip on any link a
-  peripheral realistically has, so a live subscriber paces sends exactly as
-  before. Nothing else changes: the call still returns `Sent`, and the wait
-  still says nothing about delivery.
+  an indicate-only characteristic waited out its full 35 s bound on every send
+  and held the characteristic's other senders behind it. The wait now has two
+  phases: after one second without a confirmation it asks BlueZ whether any
+  central is connected, and returns as soon as the answer is no. A connected
+  central still gets the full wait, so a subscriber that confirms slowly is
+  awaited as before and only one indication is ever in flight. An absent
+  subscriber alongside another connected central still costs the full wait:
+  BlueZ doesn't say which centrals subscribed to a characteristic. Nothing else
+  changes: the call still returns `Sent`, and the wait still says nothing about
+  delivery.
 - **Android: a central that subscribes for indications now gets indications.**
   ([#18](https://github.com/mcginty/blew/issues/18)) The peripheral reduced
   the central's CCCD write to "subscribed or not" and then sent every
@@ -108,8 +112,8 @@ All notable changes to `blew` are documented here. Format follows
   exactly the kinds it declares, and BlueZ sends each central the kind it
   subscribed for. On Linux `notify_characteristic` returns `Delivery::Sent`
   once the value is handed to BlueZ, never `Confirmed`, and never fails a
-  value that went out. On an indicate-only characteristic it first waits,
-  up to 5 s, for BlueZ to finish the indication, to pace sends to what BlueZ
+  value that went out. On an indicate-only characteristic it first waits for
+  BlueZ to finish the indication, to pace sends to what BlueZ
   can deliver; BlueZ reports a confirmation and a timed-out indication the
   same way, so the wait says nothing about delivery. A failed D-Bus emit is an
   error. A concurrent send on the same characteristic also no longer forgets a

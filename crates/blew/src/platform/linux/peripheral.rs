@@ -32,22 +32,17 @@ use uuid::Uuid;
 /// across the await point.
 type SharedNotifier = Arc<tokio::sync::Mutex<CharacteristicNotifier>>;
 
-/// How long a send waits for BlueZ to finish an indication before it gives up
-/// on pacing. A pacing bound, not an ATT deadline: expiring is `Sent` like
-/// every other ending, and BlueZ still delivers the indication (or times it
-/// out after 30 s and drops the link).
-///
-/// 5 s is well past an indication round trip on any link a peripheral
-/// realistically has — BlueZ, iOS and Android negotiate connection intervals
-/// between 7.5 ms and 2 s — so a live subscriber paces sends by its
-/// confirmations, not by this bound. It stays this short because some waits
-/// are never answered: a bonded central keeps its subscription after it
-/// disconnects (`att_disconnected` in BlueZ's `src/gatt-database.c` returns
-/// early for a bonded device), and values for it are dropped without a
-/// `Confirm` (`send_notification_to_device` → `state_set_pending`). Every send
-/// then pays the bound, so it decides how badly a central that walked away
-/// throttles the application.
-const INDICATION_PACING_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+/// First phase of an indication wait: long enough that a healthy confirmation
+/// lands inside it, so the connectivity query below stays off the common path
+/// and costs no D-Bus traffic at all.
+const INDICATION_PROBE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Total bound on an indication wait once a central is known to be connected.
+/// It covers BlueZ's 30 s ATT transaction timeout, after which BlueZ answers
+/// the indication itself (`Confirm` with an error opcode) and drops the link,
+/// so a connected subscriber is always awaited to its conclusion and at most
+/// one indication is ever outstanding.
+const INDICATION_WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(35);
 
 struct PeripheralInner {
     _session: Session,
@@ -161,13 +156,14 @@ fn notify_flags(props: CharacteristicProperties) -> Option<(bool, bool)> {
 
 /// What one notifier's `notify()` means for the caller: `Ok(true)` if the value
 /// was handed to BlueZ, `Ok(false)` if the session was already gone. `result`
-/// is `None` when [`INDICATION_PACING_BOUND`] elapsed; `stopped` is read after.
+/// is `None` when the wait was given up rather than answered (see
+/// [`paced_indication_wait`]); `stopped` is read after.
 ///
 /// Every ending after the emit is `Sent`. BlueZ calls `Confirm` for a real
 /// confirmation and equally when the indication fails (ATT timeout or
 /// disconnect), so `Ok` says nothing about delivery, and neither does the
-/// session ending mid-wait or the pacing bound. `notify` emits on its first
-/// poll, before it waits, so the bound can only elapse after the emit.
+/// session ending mid-wait or the wait being given up. `notify` emits on its
+/// first poll, before it waits, so neither phase can elapse before the emit.
 fn notify_outcome(result: Option<bluer::Result<()>>, stopped: bool) -> BlewResult<bool> {
     match result {
         None | Some(Ok(())) => Ok(true),
@@ -182,6 +178,70 @@ fn notify_outcome(result: Option<bluer::Result<()>>, stopped: bool) -> BlewResul
             }),
         },
     }
+}
+
+/// Whether any device is connected to the adapter, as far as BlueZ will say.
+///
+/// Only consulted when an indication has gone unanswered for
+/// [`INDICATION_PROBE`], so the D-Bus round trips stay off the common path. An
+/// error is deliberately not turned into `false` here: the caller treats a
+/// failed query as "a central may be connected" and keeps waiting.
+async fn any_device_connected(adapter: &Adapter) -> bluer::Result<bool> {
+    for addr in adapter.device_addresses().await? {
+        if adapter.device(addr)?.is_connected().await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Wait for BlueZ to finish an indication, in two phases. `None` means the
+/// wait was given up rather than answered, which the caller still reports as
+/// `Delivery::Sent`.
+///
+/// The phases exist because the connection interval says nothing about how
+/// long a confirmation may take, so one fixed bound cannot serve both cases.
+/// A short bound would release the notifier while a slow central is still
+/// answering, let the next value go out, and let the previous value's
+/// confirmation end that wait early — leaving BlueZ's unbounded `ind_queue`
+/// (`src/shared/att.c`, one `pending_ind` per bearer) to grow, however
+/// carefully the application awaits each send. A long bound would instead
+/// make every send pay it when no confirmation can ever arrive.
+///
+/// So phase one waits [`INDICATION_PROBE`], which a healthy confirmation
+/// beats. If it expires, `connected` decides which case this is: with no
+/// central connected nothing can answer the indication (a bonded central
+/// keeps its subscription across a disconnect and BlueZ drops its values
+/// silently), so waiting longer is pointless. With one connected — or with a
+/// query that failed, which must never shorten the wait — phase two waits out
+/// [`INDICATION_WAIT_BOUND`], past the point where BlueZ answers the
+/// indication itself.
+async fn paced_indication_wait<N, C, CF>(notify: N, connected: C) -> Option<bluer::Result<()>>
+where
+    N: Future<Output = bluer::Result<()>>,
+    C: FnOnce() -> CF,
+    CF: Future<Output = bluer::Result<bool>>,
+{
+    let deadline = tokio::time::Instant::now() + INDICATION_WAIT_BOUND;
+    let mut notify = std::pin::pin!(notify);
+
+    let probe = tokio::time::Instant::now() + INDICATION_PROBE;
+    if let Ok(result) = tokio::time::timeout_at(probe, notify.as_mut()).await {
+        return Some(result);
+    }
+
+    match connected().await {
+        Ok(false) => {
+            trace!("no central connected; not waiting out the indication");
+            return None;
+        }
+        Ok(true) => (),
+        Err(e) => trace!(%e, "could not tell whether a central is connected; waiting"),
+    }
+
+    tokio::time::timeout_at(deadline, notify.as_mut())
+        .await
+        .ok()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -542,13 +602,14 @@ impl PeripheralBackend for LinuxPeripheral {
                 let result = if notifier.confirming() {
                     // An indicate-only characteristic: bluer's `notify` waits
                     // until BlueZ finishes the indication, which paces sends
-                    // to BlueZ's one indication in flight per bearer. If the
-                    // bound drops a wait, a late `Confirm` can land after the
-                    // next `notify` flushes the channel and end that wait
-                    // early. That only loosens pacing: the result is `Sent`.
-                    tokio::time::timeout(INDICATION_PACING_BOUND, notifier.notify(value.clone()))
-                        .await
-                        .ok()
+                    // to BlueZ's one indication in flight per bearer. A wait
+                    // given up because nothing is connected can leave a late
+                    // `Confirm` behind for the next `notify` to flush, which
+                    // only loosens pacing for a peer that isn't there.
+                    paced_indication_wait(notifier.notify(value.clone()), || {
+                        any_device_connected(&handle.adapter)
+                    })
+                    .await
                 } else {
                     Some(notifier.notify(value.clone()).await)
                 };
@@ -627,17 +688,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_indication_wait_stays_a_pacing_bound() {
-        // At or above BlueZ's 30 s ATT transaction timeout, only a wait that
-        // nothing will ever answer can reach the bound -- the stall #41
-        // reported, where a bonded central that walked away costs every send
-        // the full wait. Far below a couple of connection events it would
-        // abandon live waits instead and stop pacing at all.
-        assert!(INDICATION_PACING_BOUND < std::time::Duration::from_secs(30));
-        assert!(INDICATION_PACING_BOUND >= std::time::Duration::from_secs(4));
-    }
-
     fn bluer_error(kind: bluer::ErrorKind) -> bluer::Error {
         bluer::Error {
             kind,
@@ -678,5 +728,115 @@ mod tests {
             ),
             Err(BlewError::Peripheral { .. })
         ));
+    }
+
+    /// Counts how often the wait consulted BlueZ for connectivity, so a test
+    /// can pin the query to the slow path.
+    #[derive(Default)]
+    struct Queries(std::sync::atomic::AtomicUsize);
+
+    impl Queries {
+        fn answer(
+            &self,
+            answer: bluer::Result<bool>,
+        ) -> impl Future<Output = bluer::Result<bool>> + '_ {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::future::ready(answer)
+        }
+
+        fn count(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    async fn confirmation_after(delay: std::time::Duration) -> bluer::Result<()> {
+        tokio::time::sleep(delay).await;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_prompt_confirmation_never_asks_who_is_connected() {
+        let queries = Queries::default();
+        let start = tokio::time::Instant::now();
+
+        let result = paced_indication_wait(
+            confirmation_after(std::time::Duration::from_millis(30)),
+            || queries.answer(Ok(true)),
+        )
+        .await;
+
+        assert!(matches!(result, Some(Ok(()))));
+        assert_eq!(
+            queries.count(),
+            0,
+            "the common path must cost no D-Bus calls"
+        );
+        assert!(start.elapsed() < INDICATION_PROBE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_confirmation_from_a_connected_central_is_awaited() {
+        let queries = Queries::default();
+        let start = tokio::time::Instant::now();
+
+        // Six seconds is a confirmation the probe cannot cover. Cutting the
+        // wait short here would release the notifier, let the next value out,
+        // and grow BlueZ's indication queue.
+        let result = paced_indication_wait(
+            confirmation_after(std::time::Duration::from_secs(6)),
+            || queries.answer(Ok(true)),
+        )
+        .await;
+
+        assert!(matches!(result, Some(Ok(()))));
+        assert_eq!(queries.count(), 1);
+        assert!(start.elapsed() >= std::time::Duration::from_secs(6));
+        assert!(start.elapsed() < INDICATION_WAIT_BOUND);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_connected_gives_up_after_the_probe() {
+        let queries = Queries::default();
+        let start = tokio::time::Instant::now();
+
+        let result =
+            paced_indication_wait(std::future::pending(), || queries.answer(Ok(false))).await;
+
+        assert!(result.is_none());
+        assert_eq!(queries.count(), 1);
+        assert!(start.elapsed() >= INDICATION_PROBE);
+        assert!(
+            start.elapsed() < INDICATION_PROBE * 2,
+            "an unanswerable indication must not wait out the full bound"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connected_central_that_never_confirms_waits_out_the_bound() {
+        let queries = Queries::default();
+        let start = tokio::time::Instant::now();
+
+        let result =
+            paced_indication_wait(std::future::pending(), || queries.answer(Ok(true))).await;
+
+        assert!(result.is_none());
+        assert!(start.elapsed() >= INDICATION_WAIT_BOUND);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_connectivity_query_keeps_waiting() {
+        let queries = Queries::default();
+        let start = tokio::time::Instant::now();
+
+        let result = paced_indication_wait(std::future::pending(), || {
+            queries.answer(Err(bluer_error(bluer::ErrorKind::Failed)))
+        })
+        .await;
+
+        assert!(result.is_none());
+        assert!(
+            start.elapsed() >= INDICATION_WAIT_BOUND,
+            "a query that failed must never shorten the wait"
+        );
     }
 }
