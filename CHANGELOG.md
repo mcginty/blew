@@ -89,8 +89,11 @@ All notable changes to `blew` are documented here. Format follows
   outright was also reported as busy and retried to the same end. Rust now holds
   a per-device gate across the send and waits for the stack's callback, so
   concurrent sends queue instead of failing and a refusal fails at once. The
-  gate stays held until the stack reports, even if the caller stops waiting, so
-  a cancelled send can't let the next one overlap it.
+  gate is released only by the stack's report or a disconnect. A caller that
+  times out (35 s, counting the wait for the gate) or is cancelled gets its
+  error, but the gate stays held, so a send can never overlap one still in the
+  stack or be completed by an earlier send's late callback. A device whose
+  callback never arrives fails later sends with a timeout until it disconnects.
 - **Android: a named advertisement no longer goes out under the previous
   name.** ([#21](https://github.com/mcginty/blew/pull/21), reported by
   @Resilum-owner) The adapter applies a rename asynchronously, but the scan

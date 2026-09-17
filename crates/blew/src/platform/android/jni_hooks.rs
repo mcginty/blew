@@ -284,12 +284,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnConn
                 "peripheral connection state changed"
             );
             if connected != JNI_TRUE {
-                super::peripheral::finish_notify(
-                    &addr,
-                    Err(BlewError::DisconnectedDuringOperation(DeviceId::from(
-                        addr.as_str(),
-                    ))),
-                );
+                super::peripheral::notify_disconnected(&addr);
             }
             // Not surfaced as a PeripheralEvent -- the transport discovers
             // connections via SubscriptionChanged events instead.
@@ -319,7 +314,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnNoti
                     source: format!("notification failed with GATT status {status}").into(),
                 })
             };
-            super::peripheral::finish_notify(&addr, result);
+            super::peripheral::notify_completed(&addr, result);
             Ok(())
         })
         .into_outcome();
