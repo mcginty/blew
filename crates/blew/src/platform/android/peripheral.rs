@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use jni::objects::{JObject, JObjectArray};
 use jni::{jni_sig, jni_str};
 use parking_lot::Mutex;
@@ -12,10 +14,12 @@ use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, L2capEncryption, types::Psm};
 use crate::peripheral::backend::{self, PeripheralBackend};
 use crate::peripheral::types::{
-    AdvertisingConfig, LocalName, PeripheralConfig, PeripheralRequest, PeripheralStateEvent,
+    AdvertisingConfig, Delivery, LocalName, PeripheralConfig, PeripheralRequest,
+    PeripheralStateEvent,
 };
 use crate::types::DeviceId;
 use crate::util::advertise_state::{AdvertiseState, Advertising};
+use crate::util::notify_gate::{self, Handoff, NotifyGates};
 use crate::util::{BroadcastEventStream, KeyedRequestMap};
 
 use super::jni_globals::{jvm, peripheral_class};
@@ -38,6 +42,19 @@ const ADVERTISE_RENAME_BUSY: i32 = 4;
 /// through `nativeOnAdvertisingResult` in place of an `AdvertiseCallback` error.
 pub(super) const ADVERTISE_FAILED_RENAME_UNCONFIRMED: i32 = -1;
 
+/// Kotlin's `BlePeripheralManager.NOTIFY_*` results from `notifyCharacteristic`.
+const NOTIFY_SENT: i32 = 0;
+const NOTIFY_INDICATED: i32 = 1;
+const NOTIFY_NOT_SUBSCRIBED: i32 = 2;
+const NOTIFY_CHAR_NOT_FOUND: i32 = 3;
+const NOTIFY_REJECTED: i32 = 4;
+
+/// How long a send may wait, for the device's earlier send and then for its own
+/// `onNotificationSent`. Past the ATT transaction timeout, so a central that
+/// never confirms normally ends the wait itself by losing the link. Running out
+/// fails the caller but keeps the device's gate held; see `util::notify_gate`.
+const NOTIFY_COMPLETE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
+
 /// How long `set_adapter_name` waits for Kotlin's verdict. Kotlin fails an
 /// unconfirmed rename itself after a second; this only bounds a verdict that
 /// never arrives.
@@ -59,7 +76,25 @@ struct PeripheralState {
     request_rx: Mutex<Option<mpsc::UnboundedReceiver<PeripheralRequest>>>,
     state_tx: broadcast::Sender<PeripheralStateEvent>,
     advertise: Mutex<AdvertiseState>,
+    notifies: Arc<Mutex<NotifyGates>>,
     renames: KeyedRequestMap<i32, oneshot::Sender<bool>>,
+}
+
+/// Resolve `addr`'s registered notification send with the stack's verdict.
+pub(crate) fn notify_completed(addr: &str, result: BlewResult<()>) {
+    let notifies = STATE.lock().as_ref().map(|s| Arc::clone(&s.notifies));
+    if let Some(notifies) = notifies {
+        notifies.lock().complete(addr, result);
+    }
+}
+
+/// Fail `addr`'s registered notification send, if any: no callback follows a
+/// disconnect.
+pub(crate) fn notify_disconnected(addr: &str) {
+    let notifies = STATE.lock().as_ref().map(|s| Arc::clone(&s.notifies));
+    if let Some(notifies) = notifies {
+        notifies.lock().disconnect(addr);
+    }
 }
 
 /// Run `f` against the advertising state, if the backend is initialised.
@@ -430,6 +465,8 @@ impl PeripheralBackend for AndroidPeripheral {
             request_rx: Mutex::new(Some(request_rx)),
             state_tx,
             advertise: Mutex::new(AdvertiseState::default()),
+            notifies: Arc::new(Mutex::new(NotifyGates::default())),
+
             renames: KeyedRequestMap::new(),
         });
         // The L2CAP statics are shared between the two roles but were only
@@ -561,13 +598,16 @@ impl PeripheralBackend for AndroidPeripheral {
         device_id: &DeviceId,
         char_uuid: Uuid,
         value: Vec<u8>,
-    ) -> BlewResult<()> {
+    ) -> BlewResult<Delivery> {
         let device_addr = device_id.as_str().to_owned();
-        // Retry loop: Kotlin returns 1 ("busy") when the previous
-        // notification hasn't completed yet (onNotificationSent pending).
-        // We retry with async sleep so we don't block the tokio thread.
-        for attempt in 0..50_u32 {
-            let status: i32 = jvm()
+        let notifies = STATE
+            .lock()
+            .as_ref()
+            .map(|s| Arc::clone(&s.notifies))
+            .ok_or(BlewError::NotInitialized)?;
+
+        notify_gate::send(&notifies, &device_addr, NOTIFY_COMPLETE_TIMEOUT, || {
+            let status = jvm()
                 .attach_current_thread(|env| {
                     let addr_str = env.new_string(&device_addr)?;
                     let uuid_str = env.new_string(char_uuid.to_string())?;
@@ -581,32 +621,24 @@ impl PeripheralBackend for AndroidPeripheral {
                     )?;
                     ret.i()
                 })
-                .map_err(|e| jni_err(&e))?;
-
+                .map_err(|e| jni_err(&e));
             match status {
-                // 0 = success; 2 = no subscribers (not an error).
-                0 | 2 => return Ok(()),
-                1 => {
-                    // Busy -- previous notification still in flight.
-                    // Yield to tokio and retry after a short delay.
-                    if attempt < 49 {
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                    }
+                Ok(NOTIFY_SENT) => Handoff::Accepted(Delivery::Sent),
+                Ok(NOTIFY_INDICATED) => Handoff::Accepted(Delivery::Confirmed),
+                Ok(NOTIFY_NOT_SUBSCRIBED) => Handoff::Declined(Ok(Delivery::NoSubscriber)),
+                Ok(NOTIFY_CHAR_NOT_FOUND) => {
+                    Handoff::Declined(Err(BlewError::LocalCharacteristicNotFound { char_uuid }))
                 }
-                3 => {
-                    return Err(BlewError::LocalCharacteristicNotFound { char_uuid });
-                }
-                other => {
-                    return Err(BlewError::Peripheral {
-                        source: format!("notify returned unknown status {other}").into(),
-                    });
-                }
+                Ok(NOTIFY_REJECTED) => Handoff::Declined(Err(BlewError::Peripheral {
+                    source: "the stack refused the notification".into(),
+                })),
+                Ok(unknown) => Handoff::Declined(Err(BlewError::Peripheral {
+                    source: format!("notify returned unknown status {unknown}").into(),
+                })),
+                Err(e) => Handoff::Declined(Err(e)),
             }
-        }
-        // Exhausted retries -- treat as transient error.
-        Err(BlewError::Peripheral {
-            source: "notification busy after retries".into(),
         })
+        .await
     }
 
     async fn l2cap_listener(

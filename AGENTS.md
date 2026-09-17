@@ -339,6 +339,20 @@ rx.await?; // safe to await now
 - `GattConnections` owns each attempt's callback, handle, queue, nonces and MTU. Its monitor orders callbacks, operation kicks, retirement and delivery to Rust; `GattFactory.open` runs outside the monitor so an unpublished handle can be retired. The callback captures its attempt before factory entry. All lifecycle/GATT JNI requests and results carry a generation (except read-only `refresh`/`getMtu`). Disconnect fallback and cancellation target exact generations; there is no wildcard close. `ci:test-kotlin` exercises the production controller with a fake factory and virtual coroutine time.
 - `AndroidPeripheral`: state events fan out through `tokio::sync::broadcast` (`PeripheralStateEvent` is `Clone`). GATT reads/writes are delivered as `PeripheralRequest` over an `mpsc::UnboundedSender`, handed out once via `take_requests()`. For each request, a tokio task awaits the responder's oneshot then calls Kotlin `respondToRead`/`respondToWrite` via JNI. All Rust-side synchronization uses `parking_lot::Mutex`.
 
+**Notification gate invariant.** Android's GATT server takes one notification
+per device until `onNotificationSent`, and that callback carries no id: it
+belongs to whichever send is registered for the device when it arrives.
+`util::notify_gate` therefore admits one send per device and holds the gate
+until the callback or a disconnect clears the registration — **nothing else
+frees it**. A send whose caller times out or is dropped stays registered as
+abandoned, still holding the gate; its late callback is consumed and discarded.
+**Don't "fix" a stuck device by releasing the gate on timeout**: the next send
+would then register, and the stale callback would complete it with a false
+`Sent`/`Confirmed`. **Don't add a generation through Kotlin either**: with no id
+on `onNotificationSent`, Kotlin could only echo whichever send is current, which
+is the same flaw. A device whose callback never comes fails later sends with a
+timeout (the deadline covers waiting for the gate), not hangs and not overlaps.
+
 **Local-name invariant.** `AdvertisingConfig::local_name` (`LocalName`) is a
 permission, not just a value. Android has no per-advertisement name, so
 `AllowPermanent` is the only variant that reaches `BluetoothAdapter.setName`,

@@ -50,8 +50,8 @@ use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, L2capEncryption, types::Psm};
 use crate::peripheral::backend::{self, PeripheralBackend};
 use crate::peripheral::types::{
-    AdvertisingConfig, PeripheralConfig, PeripheralRequest, PeripheralStateEvent, ReadResponder,
-    WriteResponder,
+    AdvertisingConfig, Delivery, PeripheralConfig, PeripheralRequest, PeripheralStateEvent,
+    ReadResponder, WriteResponder,
 };
 use crate::platform::apple::helpers::{
     ObjcSend, cbuuid_to_uuid, central_device_id, retain_send, uuid_to_cbuuid,
@@ -122,7 +122,7 @@ struct PendingNotify {
     device_id: DeviceId,
     char_uuid: Uuid,
     value: Vec<u8>,
-    done: oneshot::Sender<BlewResult<()>>,
+    done: oneshot::Sender<BlewResult<Delivery>>,
 }
 
 /// Result of one `updateValue:forCharacteristic:onSubscribedCentrals:` attempt.
@@ -137,6 +137,22 @@ enum NotifyOutcome {
     /// The transmit queue is full. CoreBluetooth will call
     /// `peripheralManagerIsReadyToUpdateSubscribers:` when space frees up.
     QueueFull,
+}
+
+impl NotifyOutcome {
+    /// The caller-facing result of an attempt that did not hit a full queue.
+    ///
+    /// Acceptance into the transmit queue is all CoreBluetooth reports, even for
+    /// an indication, so a sent value is never [`Delivery::Confirmed`].
+    fn delivery(&self, char_uuid: Uuid) -> BlewResult<Delivery> {
+        match self {
+            NotifyOutcome::Sent | NotifyOutcome::QueueFull => Ok(Delivery::Sent),
+            NotifyOutcome::SubscriberGone => Ok(Delivery::NoSubscriber),
+            NotifyOutcome::CharNotFound => {
+                Err(BlewError::LocalCharacteristicNotFound { char_uuid })
+            }
+        }
+    }
 }
 
 struct PeripheralInner {
@@ -274,13 +290,7 @@ impl PeripheralInner {
                 break;
             }
             let pending = queue.pop_front().expect("front was just observed");
-            let result = match outcome {
-                NotifyOutcome::CharNotFound => Err(BlewError::LocalCharacteristicNotFound {
-                    char_uuid: pending.char_uuid,
-                }),
-                _ => Ok(()),
-            };
-            let _ = pending.done.send(result);
+            let _ = pending.done.send(outcome.delivery(pending.char_uuid));
         }
     }
 
@@ -931,7 +941,7 @@ impl PeripheralBackend for ApplePeripheral {
         device_id: &DeviceId,
         char_uuid: Uuid,
         value: Vec<u8>,
-    ) -> impl Future<Output = BlewResult<()>> + Send {
+    ) -> impl Future<Output = BlewResult<Delivery>> + Send {
         let handle = Arc::clone(&self.0);
         let device_id = device_id.clone();
         async move {
@@ -944,12 +954,6 @@ impl PeripheralBackend for ApplePeripheral {
                     .inner
                     .try_update_value(&handle.manager, &device_id, char_uuid, &value)
                 {
-                    // A subscriber that disappeared between our caller's
-                    // decision and now is a no-op, not an error.
-                    NotifyOutcome::Sent | NotifyOutcome::SubscriberGone => return Ok(()),
-                    NotifyOutcome::CharNotFound => {
-                        return Err(BlewError::LocalCharacteristicNotFound { char_uuid });
-                    }
                     NotifyOutcome::QueueFull => {
                         trace!(device = %device_id, %char_uuid, "transmit queue full; queueing notification");
                         let (tx, rx) = oneshot::channel();
@@ -961,6 +965,9 @@ impl PeripheralBackend for ApplePeripheral {
                         });
                         rx
                     }
+                    // A subscriber that disappeared between our caller's
+                    // decision and now is a no-op, not an error.
+                    outcome => return outcome.delivery(char_uuid),
                 }
                 // `queue` and every ObjC temporary drop here, before the await.
             };

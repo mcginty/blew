@@ -61,6 +61,23 @@ All notable changes to `blew` are documented here. Format follows
   can't be done reliably from inside one app, so that is up to the
   application. 0.4.0-beta.5 and beta.6 had an interim `Option<String>` here,
   where `Some` renamed the Android adapter.
+- **`Peripheral::notify_characteristic` returns a `Delivery` instead of `()`.**
+  ([#9](https://github.com/mcginty/blew/issues/9)) `Ok(())` meant something
+  different on every backend — queued on Apple, handed to BlueZ on Linux, and on
+  Android accepted by the stack without waiting for `onNotificationSent` — and
+  there was no way to learn that a central had confirmed an indication.
+  `Delivery::Confirmed` means the central's ATT layer acknowledged the value,
+  `Delivery::Sent` means the platform took it with no acknowledgement, and
+  `Delivery::NoSubscriber` means nothing was sent because the central isn't
+  subscribed, which stays a success. A send awaiting confirmation fails if the
+  central disconnects or doesn't confirm within the ATT transaction timeout,
+  rather than reporting success. Android now resolves only once
+  `onNotificationSent` reports, so an indication to a central that subscribed
+  for indications returns `Confirmed` once the central confirms it. Linux
+  reports `Confirmed` once BlueZ relays the confirmation of an indication, but
+  the Linux backend doesn't yet register indication subscriptions, so today it
+  returns `Sent`. Apple can only ever report `Sent`: CoreBluetooth has no
+  indication confirmation.
 
 ### Fixed
 
@@ -75,6 +92,20 @@ All notable changes to `blew` are documented here. Format follows
   CCCD while a send is waiting its turn gets the kind it asked for last. There
   is no API change. This fix is Android-only: on Linux a characteristic that
   declares only `INDICATE` still can't be subscribed to.
+- **Android: notifying a busy device no longer fails after a few seconds, and
+  a refused notification is no longer retried as busy.** Kotlin serialized sends
+  per device with a semaphore released by `onNotificationSent`, and Rust polled
+  it with fifty 5 ms retries. A device whose previous value was still in the
+  stack for longer than that, or several tasks notifying one device at once,
+  failed with "notification busy after retries". A value the stack refused
+  outright was also reported as busy and retried to the same end. Rust now holds
+  a per-device gate across the send and waits for the stack's callback, so
+  concurrent sends queue instead of failing and a refusal fails at once. The
+  gate is released only by the stack's report or a disconnect. A caller that
+  times out (35 s, counting the wait for the gate) or is cancelled gets its
+  error, but the gate stays held, so a send can never overlap one still in the
+  stack or be completed by an earlier send's late callback. A device whose
+  callback never arrives fails later sends with a timeout until it disconnects.
 - **Android: a named advertisement no longer goes out under the previous
   name.** ([#21](https://github.com/mcginty/blew/pull/21), reported by
   @Resilum-owner) The adapter applies a rename asynchronously, but the scan
@@ -928,6 +959,28 @@ renamed and stays renamed, and blew doesn't restore the previous name. Prefer
 read it with `Peripheral::adapter_name` before advertising and write it with
 `Peripheral::set_adapter_name` afterwards — checking first that the adapter
 still carries your name, so one the user chose in the meantime survives.
+
+**If you were using the result of `Peripheral::notify_characteristic`**, it is
+now a `Delivery` rather than `()`. Code that only propagates or inspects the
+error (`?`, `if let Err(e) = …`) compiles unchanged. Code that binds the value
+needs to accept it:
+
+```rust
+use blew::peripheral::Delivery;
+
+// Before
+let () = peripheral.notify_characteristic(&client, CHAR_UUID, value).await?;
+
+// After
+match peripheral.notify_characteristic(&client, CHAR_UUID, value).await? {
+    Delivery::Confirmed => { /* the central acknowledged the indication */ }
+    Delivery::Sent => { /* handed to the stack, no acknowledgement */ }
+    Delivery::NoSubscriber => { /* the central isn't subscribed; nothing sent */ }
+}
+```
+
+A future you were spawning and awaiting as `JoinHandle<BlewResult<()>>` now
+yields `BlewResult<Delivery>`.
 
 ---
 

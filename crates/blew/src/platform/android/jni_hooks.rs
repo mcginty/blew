@@ -35,6 +35,7 @@ use tracing::trace;
 use uuid::Uuid;
 
 use crate::central::types::{CentralEvent, DisconnectCause};
+use crate::error::BlewError;
 use crate::l2cap::types::Psm;
 use crate::peripheral::types::{
     PeripheralRequest, PeripheralStateEvent, ReadResponder, WriteResponder,
@@ -282,8 +283,38 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnConn
                 connected = connected == JNI_TRUE,
                 "peripheral connection state changed"
             );
+            if connected != JNI_TRUE {
+                super::peripheral::notify_disconnected(&addr);
+            }
             // Not surfaced as a PeripheralEvent -- the transport discovers
             // connections via SubscriptionChanged events instead.
+            Ok(())
+        })
+        .into_outcome();
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_org_jakebot_blew_BlePeripheralManager_nativeOnNotificationSent(
+    mut env: EnvUnowned,
+    _class: JClass,
+    device_addr: JString,
+    status: jint,
+) {
+    guard("nativeOnNotificationSent", || {
+        env.with_env(|env| {
+            let Some(addr) = jstring_to_string(env, &device_addr) else {
+                return Ok::<_, jni::errors::Error>(());
+            };
+            trace!(addr, status, "notification sent");
+            let result = if status == 0 {
+                Ok(())
+            } else {
+                Err(BlewError::Peripheral {
+                    source: format!("notification failed with GATT status {status}").into(),
+                })
+            };
+            super::peripheral::notify_completed(&addr, result);
             Ok(())
         })
         .into_outcome();

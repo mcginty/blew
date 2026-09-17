@@ -4,8 +4,8 @@ use crate::gatt::service::GattService;
 use crate::l2cap::{L2capChannel, L2capEncryption, types::Psm};
 use crate::peripheral::backend::{self, PeripheralBackend};
 use crate::peripheral::types::{
-    AdvertisingConfig, PeripheralConfig, PeripheralRequest, PeripheralStateEvent, ReadResponder,
-    WriteResponder,
+    AdvertisingConfig, Delivery, PeripheralConfig, PeripheralRequest, PeripheralStateEvent,
+    ReadResponder, WriteResponder,
 };
 use crate::platform::linux::l2cap::{apply_security, bridge_l2cap};
 use crate::types::DeviceId;
@@ -31,6 +31,10 @@ use uuid::Uuid;
 /// tokio::sync::Mutex so we can await `notify()` without holding a std MutexGuard
 /// across the await point.
 type SharedNotifier = Arc<tokio::sync::Mutex<CharacteristicNotifier>>;
+
+/// How long an indication may wait for the central's confirmation: the ATT
+/// transaction timeout, after which the central has broken the bearer anyway.
+const INDICATION_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 struct PeripheralInner {
     _session: Session,
@@ -461,7 +465,7 @@ impl PeripheralBackend for LinuxPeripheral {
         _device_id: &crate::types::DeviceId,
         char_uuid: Uuid,
         value: Vec<u8>,
-    ) -> impl Future<Output = BlewResult<()>> + Send {
+    ) -> impl Future<Output = BlewResult<Delivery>> + Send {
         // NOTE: BlueZ's `CharacteristicNotifier` callback does not expose the
         // remote device identity, so we cannot route a notification to a
         // specific subscriber here. Every live notifier for the characteristic
@@ -478,14 +482,50 @@ impl PeripheralBackend for LinuxPeripheral {
                 .unwrap_or_default();
 
             let mut any_stopped = false;
+            let mut sent = 0_usize;
+            let mut all_confirmed = true;
+            let mut unconfirmed = None;
             for arc in arcs {
                 let mut notifier = arc.lock().await;
                 if notifier.is_stopped() {
                     any_stopped = true;
                     continue;
                 }
-                // Best-effort: ignore errors on individual notifiers.
-                let _ = notifier.notify(value.clone()).await;
+                if notifier.confirming() {
+                    // bluer's `notify` waits for the confirmation with no
+                    // deadline of its own.
+                    match tokio::time::timeout(
+                        INDICATION_CONFIRM_TIMEOUT,
+                        notifier.notify(value.clone()),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => sent += 1,
+                        // Stopped before the value went out: the subscriber
+                        // left, which is not a delivery failure.
+                        Ok(Err(e)) if e.kind == bluer::ErrorKind::NotificationSessionStopped => {}
+                        Ok(Err(e)) => {
+                            unconfirmed.get_or_insert_with(|| BlewError::Peripheral {
+                                source: Box::new(e),
+                            });
+                        }
+                        Err(_) => {
+                            unconfirmed.get_or_insert_with(|| BlewError::Peripheral {
+                                source: format!(
+                                    "indication not confirmed within {INDICATION_CONFIRM_TIMEOUT:?}"
+                                )
+                                .into(),
+                            });
+                        }
+                    }
+                } else {
+                    all_confirmed = false;
+                    // Best-effort: a failed notification means the session
+                    // ended under us, the same as a stopped one.
+                    if notifier.notify(value.clone()).await.is_ok() {
+                        sent += 1;
+                    }
+                }
             }
 
             if any_stopped {
@@ -493,7 +533,14 @@ impl PeripheralBackend for LinuxPeripheral {
                     v.retain(|arc| !arc.try_lock().map_or(true, |n| n.is_stopped()));
                 });
             }
-            Ok(())
+            if let Some(e) = unconfirmed {
+                return Err(e);
+            }
+            Ok(match sent {
+                0 => Delivery::NoSubscriber,
+                _ if all_confirmed => Delivery::Confirmed,
+                _ => Delivery::Sent,
+            })
         }
     }
 
