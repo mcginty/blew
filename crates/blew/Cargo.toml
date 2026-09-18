@@ -48,6 +48,9 @@ parking_lot = "0.12"
 [dev-dependencies]
 proptest = { version = "1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# `test-util` gives the tests a paused clock, so a 35 s bound is asserted
+# without spending 35 s or racing a loaded CI machine.
+tokio = { version = "1", features = ["test-util", "macros", "rt"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 objc2 = "0.6"

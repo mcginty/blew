@@ -297,11 +297,44 @@ an error opcode, `conf_cb` in `src/shared/gatt-server.c` ignores the opcode,
 and `conf_cb` in `src/gatt-database.c` calls `Confirm`. Confirmations from
 every subscribed central also land in the same channel. The wait exists only
 for backpressure, pacing sends to BlueZ's one indication in flight per bearer.
-It has a 35 s backstop because some waits never end: BlueZ skips a bonded
-central that is subscribed but not connected without calling `Confirm`.
-**Don't turn a successful `notify()` into `Confirmed`, and don't turn a
-backstop expiry or a session ending mid-wait into an error**; all of them are
-`Sent`.
+**Don't turn a successful `notify()` into `Confirmed`, and don't turn the wait
+expiring or a session ending mid-wait into an error**; all of them are `Sent`.
+
+**The indication wait has two phases, and one fixed bound cannot replace
+them.** `paced_indication_wait` waits `INDICATION_PROBE` (1 s) first, and only
+if that expires asks BlueZ whether any central is connected; no central means
+nothing can answer the indication, so it stops waiting and reports `Sent`. A
+connected one — or a connectivity query that *failed*, which must never
+shorten the wait — gets the full `INDICATION_WAIT_BOUND` (35 s), past BlueZ's
+30 s ATT transaction timeout, after which BlueZ answers the indication itself.
+
+**Phase two races the query against the confirmation and the deadline; it must
+never `await` the query on its own.** The query is D-Bus traffic bounded only by
+bluer's 120 s timeout, so awaiting it in sequence holds the notifier lock far
+past the 35 s this function advertises and swallows a confirmation that already
+arrived (a confirmation ready at 2 s returned at 121 s). In the race the
+confirmation or a stopped session finishes the call, the deadline returns
+`Sent`, and the query only decides whether to keep waiting. Only the query may
+be dropped mid-flight — the notification future stays pinned across the race,
+so it emits once and a losing branch abandons a poll rather than the future.
+
+Both halves are load-bearing. Waiting out 35 s unconditionally is the throttle
+#41 reported: a bonded central keeps its subscription when it disconnects
+(`att_disconnected` returns early for a bonded device) and BlueZ drops its
+values without a `Confirm` (`send_notification_to_device` →
+`state_set_pending`), so every send paid the bound. Capping the wait at a few
+seconds instead breaks pacing, because the connection interval says nothing
+about confirmation latency: a central confirming at 6 s would see the notifier
+released, the next value emitted, and its own late `Confirm` end that next
+wait, while BlueZ's unbounded `ind_queue` (`src/shared/att.c`, one
+`pending_ind` per bearer) grows — the unbounded-queue failure mode this project
+treats as load-bearing. **Don't collapse the two phases into one timeout**, and
+keep the connectivity query off the fast path: it costs D-Bus round trips.
+
+Residual, and not fixable from here: an absent bonded subscriber while some
+*other* central is connected still costs the full 35 s. BlueZ's notify session
+carries no device identity, so blew cannot tell which devices subscribed to the
+characteristic.
 
 ## Android backend design (`platform/android/`)
 
