@@ -216,6 +216,12 @@ async fn any_device_connected(adapter: &Adapter) -> bluer::Result<bool> {
 /// query that failed, which must never shorten the wait — phase two waits out
 /// [`INDICATION_WAIT_BOUND`], past the point where BlueZ answers the
 /// indication itself.
+///
+/// Phase two **races** the query against the confirmation and the deadline
+/// rather than awaiting it first. The query is D-Bus traffic bounded only by
+/// bluer's own 120 s timeout, so awaiting it in sequence would hold the
+/// notifier past this function's advertised bound and swallow a confirmation
+/// that had already arrived.
 async fn paced_indication_wait<N, C, CF>(notify: N, connected: C) -> Option<bluer::Result<()>>
 where
     N: Future<Output = bluer::Result<()>>,
@@ -230,7 +236,23 @@ where
         return Some(result);
     }
 
-    match connected().await {
+    // Cancel safety, since only one of the three branches gets to finish:
+    // `notify` stays pinned here and outlives the race, so a losing branch
+    // abandons a poll rather than the future -- it already emitted on its
+    // first poll in phase one, and phase two below keeps awaiting the same
+    // future. `sleep_until` is a timer, so nothing is lost either. The query
+    // is the one future that can be dropped mid-flight, which cancels its
+    // pending D-Bus call: fine, because the only reason to drop it is that the
+    // answer can no longer change what this call returns.
+    let mut query = std::pin::pin!(connected());
+    let answer = tokio::select! {
+        biased;
+        result = notify.as_mut() => return Some(result),
+        () = tokio::time::sleep_until(deadline) => return None,
+        answer = query.as_mut() => answer,
+    };
+
+    match answer {
         Ok(false) => {
             trace!("no central connected; not waiting out the indication");
             return None;
@@ -744,6 +766,27 @@ mod tests {
             std::future::ready(answer)
         }
 
+        /// A query that only answers after `delay`, as a slow D-Bus round trip
+        /// does.
+        fn answer_after(
+            &self,
+            delay: std::time::Duration,
+            answer: bluer::Result<bool>,
+        ) -> impl Future<Output = bluer::Result<bool>> + '_ {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            async move {
+                tokio::time::sleep(delay).await;
+                answer
+            }
+        }
+
+        /// A query that never answers: BlueZ or the bus wedged, with only
+        /// bluer's own 120 s timeout underneath it.
+        fn stalled(&self) -> impl Future<Output = bluer::Result<bool>> + '_ {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::future::pending()
+        }
+
         fn count(&self) -> usize {
             self.0.load(std::sync::atomic::Ordering::Relaxed)
         }
@@ -837,6 +880,59 @@ mod tests {
         assert!(
             start.elapsed() >= INDICATION_WAIT_BOUND,
             "a query that failed must never shorten the wait"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_confirmation_beats_a_stalled_query() {
+        let queries = Queries::default();
+        let start = tokio::time::Instant::now();
+
+        let result = paced_indication_wait(
+            confirmation_after(std::time::Duration::from_secs(2)),
+            || queries.stalled(),
+        )
+        .await;
+
+        assert!(matches!(result, Some(Ok(()))));
+        assert_eq!(queries.count(), 1);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "a confirmation that already arrived must not wait for the query"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_query_cannot_outlast_the_deadline() {
+        let queries = Queries::default();
+        let start = tokio::time::Instant::now();
+
+        let result = paced_indication_wait(std::future::pending(), || queries.stalled()).await;
+
+        assert!(result.is_none());
+        // bluer's own D-Bus timeout is 120 s; the wait is ours to bound.
+        assert!(start.elapsed() >= INDICATION_WAIT_BOUND);
+        assert!(start.elapsed() < INDICATION_WAIT_BOUND + INDICATION_PROBE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_late_answer_of_nobody_connected_stops_the_wait() {
+        let queries = Queries::default();
+        let start = tokio::time::Instant::now();
+
+        let result = paced_indication_wait(std::future::pending(), || {
+            queries.answer_after(std::time::Duration::from_secs(3), Ok(false))
+        })
+        .await;
+
+        assert!(result.is_none());
+        // The query starts when the probe expires, so a 3 s round trip answers
+        // at `INDICATION_PROBE + 3 s`, and the wait must end there.
+        let answered_at = INDICATION_PROBE + std::time::Duration::from_secs(3);
+        assert!(start.elapsed() >= answered_at);
+        assert!(
+            start.elapsed() < answered_at + std::time::Duration::from_secs(1),
+            "the answer must end the wait when it arrives, not at the bound"
         );
     }
 }

@@ -308,6 +308,16 @@ connected one — or a connectivity query that *failed*, which must never
 shorten the wait — gets the full `INDICATION_WAIT_BOUND` (35 s), past BlueZ's
 30 s ATT transaction timeout, after which BlueZ answers the indication itself.
 
+**Phase two races the query against the confirmation and the deadline; it must
+never `await` the query on its own.** The query is D-Bus traffic bounded only by
+bluer's 120 s timeout, so awaiting it in sequence holds the notifier lock far
+past the 35 s this function advertises and swallows a confirmation that already
+arrived (a confirmation ready at 2 s returned at 121 s). In the race the
+confirmation or a stopped session finishes the call, the deadline returns
+`Sent`, and the query only decides whether to keep waiting. Only the query may
+be dropped mid-flight — the notification future stays pinned across the race,
+so it emits once and a losing branch abandons a poll rather than the future.
+
 Both halves are load-bearing. Waiting out 35 s unconditionally is the throttle
 #41 reported: a bonded central keeps its subscription when it disconnects
 (`att_disconnected` returns early for a bonded device) and BlueZ drops its
