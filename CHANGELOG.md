@@ -124,6 +124,39 @@ All notable changes to `blew` are documented here. Format follows
   and once more per cycle. This holds whether or not the adapter cycled. The
   queue itself survives a power-off, so an application that doesn't re-add
   gets the same services back on its next `start_advertising`.
+- **Android: turning Bluetooth off and on no longer leaves the peripheral
+  holding a dead GATT server.**
+  ([#44](https://github.com/mcginty/blew/issues/44)) Nothing dropped the
+  peripheral's state when the adapter powered off, so the
+  `BluetoothGattServer` outlived the stack instance it was registered with.
+  Android had already torn that registration down, and a service added to the
+  old handle was accepted and never reported added: `add_service` waited out
+  its five seconds, returned `Ok(())`, and left a peripheral advertising a
+  service table the platform no longer had. An application re-adding its
+  services on `AdapterStateChanged { powered: true }` — the documented way to
+  survive a cycle on Android — landed every one of them on the dead server.
+
+  Powering off now closes and forgets the server, its characteristics and its
+  static values, so the next `add_service` opens a fresh one. Connections on
+  that server are taken down with it, which the stack itself doesn't do: their
+  subscriptions are dropped, and a `notify_characteristic` waiting on one fails
+  with `DisconnectedDuringOperation` instead of running out its 35 s timeout.
+  Each device is taken down once, whether the loss comes from the power cycle
+  or from a disconnect callback that still arrives. The central role likewise
+  forgets the scan callback that died with the adapter instead of handing it
+  back to the next scanner.
+
+  `add_service` also reports what happened on Android rather than always
+  returning `Ok(())`: `BlewError::NotPowered` when there is no server to
+  register on, and `BlewError::Peripheral` when the stack refuses the service,
+  never confirms it, or is still registering an earlier one. Apple already
+  reported these; a caller that ignored the result is unaffected. That last
+  case is new behaviour rather than a new report: Android registers one service
+  at a time and keeps a single pending slot that the next `addService`
+  overwrites, so an add issued after an earlier one timed out used to be
+  answered by the earlier one's callback — reported as registered on a
+  callback that said nothing about it — while its own answer was dropped. blew
+  now refuses it until the outstanding callback lands or the adapter cycles.
 - **Linux: an indication to a central that walked away no longer stalls sends
   for 35 s.** ([#41](https://github.com/mcginty/blew/issues/41)) A bonded
   central keeps its subscription when it disconnects, and BlueZ drops values

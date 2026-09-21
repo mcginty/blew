@@ -443,6 +443,50 @@ rx.await?; // safe to await now
 - `GattConnections` owns each attempt's callback, handle, queue, nonces and MTU. Its monitor orders callbacks, operation kicks, retirement and delivery to Rust; `GattFactory.open` runs outside the monitor so an unpublished handle can be retired. The callback captures its attempt before factory entry. All lifecycle/GATT JNI requests and results carry a generation (except read-only `refresh`/`getMtu`). Disconnect fallback and cancellation target exact generations; there is no wildcard close. `ci:test-kotlin` exercises the production controller with a fake factory and virtual coroutine time.
 - `AndroidPeripheral`: state events fan out through `tokio::sync::broadcast` (`PeripheralStateEvent` is `Clone`). GATT reads/writes are delivered as `PeripheralRequest` over an `mpsc::UnboundedSender`, handed out once via `take_requests()`. For each request, a tokio task awaits the responder's oneshot then calls Kotlin `respondToRead`/`respondToWrite` via JNI. All Rust-side synchronization uses `parking_lot::Mutex`.
 
+**A power cycle invalidates the GATT server, and nothing reports it.** Powering
+the adapter off tears down the stack instance the `BluetoothGattServer` was
+registered with. The object keeps working: it accepts `addService` and never
+calls `onServiceAdded`, so an add on a server held across the cycle burns its
+timeout and leaves the peripheral advertising a service table the platform no
+longer has (#44). `GattServerHost` owns the handle and what is registered on it
+— characteristics and static values join the table only once the stack confirms
+the service — and `BlePeripheralManager.onAdapterOff` drops all of it before
+`nativeOnAdapterStateChanged(false)` goes out: it closes the server, wakes the
+adds waiting on it with `SERVICE_UNAVAILABLE` rather than leaving them on their
+timeouts, and reports the connections that died with it. Whoever takes a device
+out of `connectedDevices` reports it, so a disconnect callback that still
+arrives doesn't report it twice. **Don't cache anything else across that
+event** — `init` already resolves the advertiser per call for the same reason —
+and **don't replay the services from here**: re-adding them is the
+application's response to `AdapterStateChanged { powered: true }`, and blew has
+no way to remove one it added (#34). `addService` returns a `SERVICE_*` code
+that `add_service` maps to a `BlewError`; it used to return `Ok(())` whatever
+happened, which is what hid this.
+
+**A timed-out `addService` still owns the platform's registration slot.**
+`BluetoothGattServer` keeps exactly one `mPendingService` and `addService`
+overwrites it with no guard; when a registration completes, the framework hands
+the callback *that stored service* — writing the completed registration's
+handles onto it — and clears the slot, so the next service's own completion is
+dropped by its `mPendingService == null` check
+(`BluetoothGattServer.java`, and its javadoc: "Do not add another service
+before this callback"). A second add after a timeout is therefore confirmed by
+the first one's callback, under the second one's name, and never hears its own.
+`GattServerHost` keeps one `pending` add per server and returns `SERVICE_BUSY`
+without touching the platform while it is held; a timeout is blew giving up on
+the callback, not the stack giving up the slot, so only the callback or `reset`
+frees it. **Don't release `pending` on timeout**, and **don't correlate the
+callback's `BluetoothGattService`** — it names whichever add is pending now, so
+it agrees with the waiting add in exactly the case where the callback is
+someone else's. The one thing that is worth checking is the server: a callback
+from a server `reset` closed must not answer an add on its replacement, and the
+platform callback carries no server identity, so `openGattServer` gets a
+**fresh callback instance per server**, closing over a generation the host
+compares. The cost of holding the slot is that a callback the stack never sends
+blocks registration until the adapter cycles; that direction is deliberate,
+since the alternative is telling an application a service is registered on the
+strength of another add's callback.
+
 **Notification gate invariant.** Android's GATT server takes one notification
 per device until `onNotificationSent`, and that callback carries no id: it
 belongs to whichever send is registered for the device when it arrives.

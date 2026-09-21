@@ -42,6 +42,32 @@ const ADVERTISE_RENAME_BUSY: i32 = 4;
 /// through `nativeOnAdvertisingResult` in place of an `AdvertiseCallback` error.
 pub(super) const ADVERTISE_FAILED_RENAME_UNCONFIRMED: i32 = -1;
 
+/// Kotlin's `GattServerHost.SERVICE_*` results from `addService`.
+const SERVICE_OK: i32 = 0;
+const SERVICE_UNAVAILABLE: i32 = 1;
+const SERVICE_REJECTED: i32 = 2;
+const SERVICE_TIMED_OUT: i32 = 3;
+const SERVICE_BUSY: i32 = 4;
+
+/// Map a failed `addService` to a [`BlewError`].
+fn service_status_to_error(status: i32) -> BlewError {
+    match status {
+        SERVICE_UNAVAILABLE => BlewError::NotPowered,
+        SERVICE_REJECTED => BlewError::Peripheral {
+            source: "the Bluetooth stack refused the GATT service".into(),
+        },
+        SERVICE_TIMED_OUT => BlewError::Peripheral {
+            source: "the Bluetooth stack never reported the GATT service added".into(),
+        },
+        SERVICE_BUSY => BlewError::Peripheral {
+            source: "an earlier GATT service is still registering; Android registers one at a \
+                     time and holds the slot until it reports back"
+                .into(),
+        },
+        other => BlewError::Internal(format!("unknown addService status {other}")),
+    }
+}
+
 /// Kotlin's `BlePeripheralManager.NOTIFY_*` results from `notifyCharacteristic`.
 const NOTIFY_SENT: i32 = 0;
 const NOTIFY_INDICATED: i32 = 1;
@@ -500,7 +526,7 @@ impl PeripheralBackend for AndroidPeripheral {
         let n = service.characteristics.len();
         let n_i32 = i32::try_from(n)
             .map_err(|_| BlewError::Internal("too many characteristics for JNI".into()))?;
-        jvm()
+        let result = jvm()
             .attach_current_thread(|env| {
                 let service_uuid = env.new_string(service.uuid.to_string())?;
 
@@ -531,10 +557,10 @@ impl PeripheralBackend for AndroidPeripheral {
                 let j_perms = env.new_int_array(n)?;
                 j_perms.set_region(env, 0, &perms_arr)?;
 
-                env.call_static_method(
+                let result = env.call_static_method(
                     peripheral_class(),
                     jni_str!("addService"),
-                    jni_sig!("(Ljava/lang/String;[Ljava/lang/String;[I[I[[B)V"),
+                    jni_sig!("(Ljava/lang/String;[Ljava/lang/String;[I[I[[B)I"),
                     &[
                         (&service_uuid).into(),
                         (&char_uuids).into(),
@@ -544,9 +570,13 @@ impl PeripheralBackend for AndroidPeripheral {
                     ],
                 )?;
 
-                Ok(())
+                result.i()
             })
             .map_err(|e| jni_err(&e))?;
+
+        if result != SERVICE_OK {
+            return Err(service_status_to_error(result));
+        }
 
         debug!(uuid = %service.uuid, "added GATT service");
         Ok(())

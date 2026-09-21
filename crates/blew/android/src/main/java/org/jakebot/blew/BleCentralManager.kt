@@ -198,8 +198,18 @@ object BleCentralManager {
                 if (intent.action == BluetoothAdapter.ACTION_STATE_CHANGED) {
                     val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
                     when (state) {
-                        BluetoothAdapter.STATE_ON -> nativeOnAdapterStateChanged(true)
-                        BluetoothAdapter.STATE_OFF -> nativeOnAdapterStateChanged(false)
+                        BluetoothAdapter.STATE_ON -> {
+                            nativeOnAdapterStateChanged(true)
+                        }
+
+                        BluetoothAdapter.STATE_OFF -> {
+                            // The scan died with the stack instance that ran it.
+                            // Handing this callback back to the scanner the next
+                            // power-on brings up would stop a scan it never
+                            // started, so forget it rather than stopping it.
+                            scanCallback = null
+                            nativeOnAdapterStateChanged(false)
+                        }
                     }
                 }
             }

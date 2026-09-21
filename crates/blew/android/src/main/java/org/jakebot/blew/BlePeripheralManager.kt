@@ -19,8 +19,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 
 /**
  * Singleton managing the Android BLE peripheral role (GATT server + advertiser).
@@ -91,7 +89,15 @@ object BlePeripheralManager {
      */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    private var gattServer: BluetoothGattServer? = null
+    // Owns the GATT server and the services registered on it, including
+    // dropping both when a power cycle invalidates them.
+    private val gattServer: GattServerHost =
+        GattServerHost(
+            GattServerFactory { generation ->
+                bluetoothManager?.openGattServer(context, gattCallback(generation))
+            },
+        )
+
     private var advertiser: BluetoothLeAdvertiser? = null
 
     // Track connected devices for notification delivery.
@@ -99,15 +105,6 @@ object BlePeripheralManager {
 
     // What each device enabled per characteristic through its CCCD write.
     private val subscriptions = SubscriptionTable()
-
-    // Map characteristic UUID -> BluetoothGattCharacteristic for notification sending.
-    private val characteristics = ConcurrentHashMap<UUID, BluetoothGattCharacteristic>()
-
-    // Static characteristic values — auto-responded on read, matching CoreBluetooth behaviour.
-    private val staticValues = ConcurrentHashMap<UUID, ByteArray>()
-
-    // Latch to serialize addService calls (Android requires waiting for onServiceAdded).
-    @Volatile private var serviceAddedLatch: CountDownLatch? = null
 
     // ── L2CAP state ──
     private val l2cap =
@@ -119,10 +116,6 @@ object BlePeripheralManager {
         )
 
     @Volatile private var l2capServerSocket: BluetoothServerSocket? = null
-
-    // Serializes addService calls (Android requires waiting for onServiceAdded
-    // before adding the next service).
-    private val serviceAddLock = Any()
 
     @JvmStatic
     external fun nativeOnReadRequest(
@@ -223,7 +216,7 @@ object BlePeripheralManager {
                         val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
                         when (state) {
                             BluetoothAdapter.STATE_ON -> nativeOnAdapterStateChanged(true)
-                            BluetoothAdapter.STATE_OFF -> nativeOnAdapterStateChanged(false)
+                            BluetoothAdapter.STATE_OFF -> onAdapterOff()
                         }
                     }
 
@@ -233,6 +226,32 @@ object BlePeripheralManager {
                 }
             }
         }
+
+    /**
+     * Drop everything that belonged to the stack instance the adapter just
+     * took down.
+     *
+     * Android invalidates the GATT server and every connection on it without
+     * reporting either, so the state has to be dropped from here. A server
+     * kept across the cycle takes [addService] and never reports the service
+     * added, which leaves the peripheral advertising a service table Android
+     * no longer has.
+     *
+     * The lost connections are reported before the adapter event, so an
+     * application sees its peers go before the radio they were on.
+     */
+    private fun onAdapterOff() {
+        gattServer.reset()
+        for (addr in connectedDevices.keys.toList()) {
+            // The disconnect callback may still arrive for the same device;
+            // whichever gets the entry out of the map reports it, once.
+            if (connectedDevices.remove(addr) != null) {
+                subscriptions.remove(addr)
+                nativeOnConnectionStateChanged(addr, false)
+            }
+        }
+        nativeOnAdapterStateChanged(false)
+    }
 
     @Volatile
     private var receiverRegistered = false
@@ -311,14 +330,24 @@ object BlePeripheralManager {
             }
     }
 
-    private val gattCallback =
+    /**
+     * A callback for the server [generation] identifies.
+     *
+     * One instance per server, rather than one shared: `onServiceAdded` says
+     * nothing about which server it came from, and a callback from a server
+     * the adapter invalidated must not answer an add on its replacement.
+     */
+    private fun gattCallback(generation: Int): BluetoothGattServerCallback =
         object : BluetoothGattServerCallback() {
             override fun onServiceAdded(
                 status: Int,
                 service: BluetoothGattService?,
             ) {
-                Log.d(TAG, "onServiceAdded status=$status uuid=${service?.uuid}")
-                serviceAddedLatch?.countDown()
+                // The service is the framework's pending one, not necessarily
+                // the one the stack reported on, so it is logged and not used;
+                // see [GattServerHost.onServiceAdded].
+                Log.d(TAG, "onServiceAdded status=$status pending=${service?.uuid}")
+                gattServer.onServiceAdded(generation, status)
             }
 
             override fun onConnectionStateChange(
@@ -331,9 +360,12 @@ object BlePeripheralManager {
                     connectedDevices[addr] = device
                     nativeOnConnectionStateChanged(addr, true)
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    connectedDevices.remove(addr)
-                    subscriptions.remove(addr)
-                    nativeOnConnectionStateChanged(addr, false)
+                    // [onAdapterOff] drops connections the stack never reports
+                    // losing; taking the entry is what decides who reports it.
+                    if (connectedDevices.remove(addr) != null) {
+                        subscriptions.remove(addr)
+                        nativeOnConnectionStateChanged(addr, false)
+                    }
                 }
             }
 
@@ -352,10 +384,10 @@ object BlePeripheralManager {
             ) {
                 // Auto-respond for static characteristics (matches CoreBluetooth behaviour
                 // where characteristics with a non-nil value are served by the framework).
-                val staticValue = staticValues[characteristic.uuid]
+                val staticValue = gattServer.staticValue(characteristic.uuid)
                 if (staticValue != null) {
                     if (offset > staticValue.size) {
-                        gattServer?.sendResponse(
+                        gattServer.server()?.sendResponse(
                             device,
                             requestId,
                             BluetoothGatt.GATT_INVALID_OFFSET,
@@ -364,7 +396,7 @@ object BlePeripheralManager {
                         )
                         return
                     }
-                    gattServer?.sendResponse(
+                    gattServer.server()?.sendResponse(
                         device,
                         requestId,
                         BluetoothGatt.GATT_SUCCESS,
@@ -412,9 +444,7 @@ object BlePeripheralManager {
                 offset: Int,
                 value: ByteArray?,
             ) {
-                // Client Characteristic Configuration Descriptor (0x2902) — subscription toggle.
-                val cccdUuid = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-                if (descriptor.uuid == cccdUuid) {
+                if (descriptor.uuid == GattServerHost.CCCD_UUID) {
                     val charUuid = descriptor.characteristic.uuid
                     val addr = device.address
                     val subscribed = subscriptions.update(addr, charUuid, value)
@@ -422,19 +452,14 @@ object BlePeripheralManager {
                 }
 
                 if (responseNeeded) {
-                    gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
+                    gattServer.server()?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
                 }
             }
         }
 
-    private fun ensureGattServer() {
-        if (gattServer == null) {
-            gattServer = bluetoothManager?.openGattServer(context, gattCallback)
-        }
-    }
-
     /**
-     * Add a GATT service. Called from Rust via JNI.
+     * Add a GATT service, returning a [GattServerHost] `SERVICE_*` code once
+     * the stack has confirmed it -- or said why it hasn't.
      *
      * Parameters are kept flat to simplify JNI marshalling:
      * - serviceUuid: service UUID string
@@ -450,57 +475,54 @@ object BlePeripheralManager {
         charProperties: IntArray,
         charPermissions: IntArray,
         charValues: Array<ByteArray>,
-    ) {
-        synchronized(serviceAddLock) {
-            ensureGattServer()
+    ): Int {
+        val service =
+            BluetoothGattService(
+                UUID.fromString(serviceUuid),
+                BluetoothGattService.SERVICE_TYPE_PRIMARY,
+            )
 
-            val service =
-                BluetoothGattService(
-                    UUID.fromString(serviceUuid),
-                    BluetoothGattService.SERVICE_TYPE_PRIMARY,
-                )
+        val chars = HashMap<UUID, BluetoothGattCharacteristic>()
+        val statics = HashMap<UUID, ByteArray>()
 
-            val cccdUuid = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+        for (i in charUuids.indices) {
+            val uuid = UUID.fromString(charUuids[i])
+            val props = charProperties[i]
+            val perms = charPermissions[i]
 
-            for (i in charUuids.indices) {
-                val uuid = UUID.fromString(charUuids[i])
-                val props = charProperties[i]
-                val perms = charPermissions[i]
+            val char = BluetoothGattCharacteristic(uuid, props, perms)
 
-                val char = BluetoothGattCharacteristic(uuid, props, perms)
-
-                // Set static value if non-empty.
-                if (charValues[i].isNotEmpty()) {
-                    char.value = charValues[i]
-                    staticValues[uuid] = charValues[i]
-                }
-
-                // Add CCCD if the characteristic supports notifications or indications.
-                if (props and (
-                        BluetoothGattCharacteristic.PROPERTY_NOTIFY or
-                            BluetoothGattCharacteristic.PROPERTY_INDICATE
-                    ) != 0
-                ) {
-                    val cccd =
-                        BluetoothGattDescriptor(
-                            cccdUuid,
-                            BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE,
-                        )
-                    char.addDescriptor(cccd)
-                }
-
-                characteristics[uuid] = char
-                service.addCharacteristic(char)
+            // Set static value if non-empty.
+            if (charValues[i].isNotEmpty()) {
+                char.value = charValues[i]
+                statics[uuid] = charValues[i]
             }
 
-            val latch = CountDownLatch(1)
-            serviceAddedLatch = latch
-            gattServer?.addService(service)
-            if (!latch.await(5, TimeUnit.SECONDS)) {
-                Log.w(TAG, "addService timed out for $serviceUuid")
+            // Add CCCD if the characteristic supports notifications or indications.
+            if (props and (
+                    BluetoothGattCharacteristic.PROPERTY_NOTIFY or
+                        BluetoothGattCharacteristic.PROPERTY_INDICATE
+                ) != 0
+            ) {
+                val cccd =
+                    BluetoothGattDescriptor(
+                        GattServerHost.CCCD_UUID,
+                        BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE,
+                    )
+                char.addDescriptor(cccd)
             }
-            Log.d(TAG, "added service $serviceUuid with ${charUuids.size} characteristics")
+
+            chars[uuid] = char
+            service.addCharacteristic(char)
         }
+
+        val result = gattServer.addService(service, chars, statics)
+        if (result == GattServerHost.SERVICE_OK) {
+            Log.d(TAG, "added service $serviceUuid with ${charUuids.size} characteristics")
+        } else {
+            Log.w(TAG, "addService failed for $serviceUuid (result=$result)")
+        }
+        return result
     }
 
     /**
@@ -695,7 +717,7 @@ object BlePeripheralManager {
         value: ByteArray,
     ): Int {
         val uuid = UUID.fromString(charUuid)
-        val char = characteristics[uuid] ?: return NOTIFY_CHAR_NOT_FOUND
+        val char = gattServer.characteristic(uuid) ?: return NOTIFY_CHAR_NOT_FOUND
         val device = connectedDevices[deviceAddr] ?: return NOTIFY_NOT_SUBSCRIBED
         return sendToSubscriber(device, char, value)
     }
@@ -732,13 +754,13 @@ object BlePeripheralManager {
         confirm: Boolean,
     ): Boolean =
         if (Build.VERSION.SDK_INT >= 33) {
-            gattServer?.notifyCharacteristicChanged(device, char, confirm, value) ==
+            gattServer.server()?.notifyCharacteristicChanged(device, char, confirm, value) ==
                 BluetoothStatusCodes.SUCCESS
         } else {
             @Suppress("DEPRECATION")
             synchronized(char) {
                 char.value = value
-                gattServer?.notifyCharacteristicChanged(device, char, confirm) ?: false
+                gattServer.server()?.notifyCharacteristicChanged(device, char, confirm) ?: false
             }
         }
 
@@ -749,7 +771,7 @@ object BlePeripheralManager {
         value: ByteArray,
     ) {
         val device = connectedDevices[deviceAddr] ?: return
-        gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, value)
+        gattServer.server()?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, value)
     }
 
     @JvmStatic
@@ -758,7 +780,7 @@ object BlePeripheralManager {
         requestId: Int,
     ) {
         val device = connectedDevices[deviceAddr] ?: return
-        gattServer?.sendResponse(
+        gattServer.server()?.sendResponse(
             device,
             requestId,
             BluetoothGatt.GATT_FAILURE,
@@ -775,7 +797,7 @@ object BlePeripheralManager {
     ) {
         val device = connectedDevices[deviceAddr] ?: return
         val status = if (success) BluetoothGatt.GATT_SUCCESS else BluetoothGatt.GATT_FAILURE
-        gattServer?.sendResponse(device, requestId, status, 0, null)
+        gattServer.server()?.sendResponse(device, requestId, status, 0, null)
     }
 
     @JvmStatic
