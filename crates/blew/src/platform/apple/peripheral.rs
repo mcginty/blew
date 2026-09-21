@@ -825,6 +825,96 @@ struct PeripheralHandle {
 unsafe impl Send for PeripheralHandle {}
 unsafe impl Sync for PeripheralHandle {}
 
+/// What starting and stopping advertising need from the manager and its queue.
+/// [`PeripheralHandle`] implements it; the tests implement it over a fake
+/// serial queue to check the order commands reach the platform in.
+trait Advertiser: Send + Sync + 'static {
+    type Data: Send + 'static;
+    fn is_advertising(&self) -> bool;
+    fn is_powered_on(&self) -> bool;
+    fn slots(&self) -> &Mutex<CallbackSlots<(), (), ()>>;
+    fn start(&self, data: &Self::Data);
+    fn stop(&self);
+    /// Run `turn` on the manager's serial queue.
+    fn queue_turn(&self, turn: Box<dyn FnOnce() + Send>);
+}
+
+impl Advertiser for PeripheralHandle {
+    type Data = ObjcSend<NSDictionary<NSString, AnyObject>>;
+
+    fn is_advertising(&self) -> bool {
+        unsafe { self.manager.isAdvertising() }
+    }
+
+    fn is_powered_on(&self) -> bool {
+        powered_on(&self.manager)
+    }
+
+    fn slots(&self) -> &Mutex<CallbackSlots<(), (), ()>> {
+        &self.inner.adv
+    }
+
+    fn start(&self, data: &Self::Data) {
+        unsafe { self.manager.startAdvertising(Some(&*data.0)) };
+    }
+
+    fn stop(&self) {
+        unsafe { self.manager.stopAdvertising() };
+    }
+
+    fn queue_turn(&self, turn: Box<dyn FnOnce() + Send>) {
+        self.queue.exec_async(turn);
+    }
+}
+
+async fn start_advertising_in_turn<A: Advertiser>(adv: Arc<A>, data: A::Data) -> BlewResult<()> {
+    if adv.is_advertising() {
+        return Err(BlewError::AlreadyAdvertising);
+    }
+    let (answer, rx) = answer_channel();
+    let turn_adv = Arc::clone(&adv);
+    adv.queue_turn(Box::new(move || {
+        let adv = turn_adv;
+        // A start still owed its answer, even one whose caller gave up
+        // waiting, is advertising or about to be as far as anyone can tell.
+        let turn = submit(
+            adv.slots(),
+            adv.is_powered_on(),
+            (),
+            (),
+            answer,
+            || BlewError::AlreadyAdvertising,
+            || adv.start(&data),
+        );
+        trace!(?turn, "start_advertising turn");
+    }));
+    await_answer(rx, CALLBACK_TIMEOUT, || BlewError::Peripheral {
+        source: "CoreBluetooth never reported whether advertising started".into(),
+    })
+    .await
+}
+
+/// Stop advertising in a turn of its own, returning once the stop has been
+/// issued.
+///
+/// A start queues its turn and yields, so a stop issued from the calling
+/// thread could overtake one still waiting in the queue, and advertising would
+/// begin after this had returned. In the queue it runs after any start queued
+/// before it. The pending start is left alone: its own callback still answers
+/// it, and freeing its slot early would let that late answer reach a newer
+/// start.
+async fn stop_advertising_in_turn<A: Advertiser>(adv: Arc<A>) -> BlewResult<()> {
+    let (issued_tx, issued) = oneshot::channel();
+    let turn_adv = Arc::clone(&adv);
+    adv.queue_turn(Box::new(move || {
+        turn_adv.stop();
+        let _ = issued_tx.send(());
+    }));
+    issued.await.map_err(|_| {
+        BlewError::Internal("the manager queue dropped stop_advertising's turn".into())
+    })
+}
+
 pub struct ApplePeripheral(Arc<PeripheralHandle>);
 
 impl ApplePeripheral {
@@ -1015,13 +1105,8 @@ impl PeripheralBackend for ApplePeripheral {
         let handle = Arc::clone(&self.0);
         let config = config.clone();
         async move {
-            if unsafe { handle.manager.isAdvertising() } {
-                return Err(BlewError::AlreadyAdvertising);
-            }
             debug!(local_name = ?config.local_name, "starting advertising");
-
-            let (answer, rx) = answer_channel();
-            {
+            let adv_data = {
                 let local_name = config.local_name.name().map(NSString::from_str);
 
                 let service_uuids: Vec<Retained<CBUUID>> = config
@@ -1038,33 +1123,10 @@ impl PeripheralBackend for ApplePeripheral {
                     values.push(local_name);
                 }
 
-                let adv_data = ObjcSend(NSDictionary::from_slices(&keys, &values));
-                let turn_handle = Arc::clone(&handle);
-                handle.queue.exec_async(move || {
-                    let h = turn_handle;
-                    // Moved whole: capturing only `.0` would take the bare
-                    // `Retained`, which isn't `Send`.
-                    let adv_data = adv_data;
-                    // A start still owed its answer, even one whose caller gave
-                    // up waiting, is advertising or about to be as far as
-                    // anyone can tell.
-                    let turn = submit(
-                        &h.inner.adv,
-                        powered_on(&h.manager),
-                        (),
-                        (),
-                        answer,
-                        || BlewError::AlreadyAdvertising,
-                        || unsafe { h.manager.startAdvertising(Some(&*adv_data.0)) },
-                    );
-                    trace!(?turn, "start_advertising turn");
-                });
-            }
-
-            await_answer(rx, CALLBACK_TIMEOUT, || BlewError::Peripheral {
-                source: "CoreBluetooth never reported whether advertising started".into(),
-            })
-            .await
+                // Every ObjC temporary but the dictionary drops here.
+                ObjcSend(NSDictionary::from_slices(&keys, &values))
+            };
+            start_advertising_in_turn(handle, adv_data).await
         }
     }
 
@@ -1072,8 +1134,7 @@ impl PeripheralBackend for ApplePeripheral {
         let handle = Arc::clone(&self.0);
         async move {
             debug!("stopping advertising");
-            unsafe { handle.manager.stopAdvertising() };
-            Ok(())
+            stop_advertising_in_turn(handle).await
         }
     }
 
@@ -1369,6 +1430,84 @@ mod tests {
         inner.service_added(SVC, None);
 
         assert!(!published(&inner));
+    }
+
+    /// A manager whose serial queue runs only when told to, recording what
+    /// reaches the platform and whether it ends up advertising.
+    #[derive(Default)]
+    struct FakeAdvertiser {
+        queue: Mutex<VecDeque<Box<dyn FnOnce() + Send>>>,
+        platform: Mutex<Vec<&'static str>>,
+        advertising: Mutex<bool>,
+        slots: Mutex<CallbackSlots<(), (), ()>>,
+    }
+
+    impl Advertiser for FakeAdvertiser {
+        type Data = ();
+
+        fn is_advertising(&self) -> bool {
+            *self.advertising.lock()
+        }
+
+        fn is_powered_on(&self) -> bool {
+            true
+        }
+
+        fn slots(&self) -> &Mutex<CallbackSlots<(), (), ()>> {
+            &self.slots
+        }
+
+        fn start(&self, (): &()) {
+            self.platform.lock().push("start");
+            *self.advertising.lock() = true;
+        }
+
+        fn stop(&self) {
+            self.platform.lock().push("stop");
+            *self.advertising.lock() = false;
+        }
+
+        fn queue_turn(&self, turn: Box<dyn FnOnce() + Send>) {
+            self.queue.lock().push_back(turn);
+        }
+    }
+
+    impl FakeAdvertiser {
+        /// Run every queued turn in order, as the serial queue would.
+        fn run_queue(&self) {
+            loop {
+                let next = self.queue.lock().pop_front();
+                let Some(turn) = next else { break };
+                turn();
+            }
+        }
+    }
+
+    /// A start queues its turn and yields; a stop issued after it has to land
+    /// after it, or advertising begins once the stop has already returned.
+    #[tokio::test]
+    async fn a_stop_waits_for_a_start_queued_before_it() {
+        let adv = Arc::new(FakeAdvertiser::default());
+        let start = tokio::spawn(start_advertising_in_turn(Arc::clone(&adv), ()));
+        tokio::task::yield_now().await;
+        let stop = tokio::spawn(stop_advertising_in_turn(Arc::clone(&adv)));
+        tokio::task::yield_now().await;
+
+        assert!(
+            adv.platform.lock().is_empty(),
+            "nothing reaches the platform before the queue runs"
+        );
+        assert!(!stop.is_finished(), "stop returns only once it is issued");
+
+        adv.run_queue();
+
+        stop.await.unwrap().unwrap();
+        assert_eq!(*adv.platform.lock(), ["start", "stop"]);
+        assert!(!*adv.advertising.lock());
+
+        // The start is still answered by its own callback.
+        assert!(adv.slots.lock().take(&()).unwrap().answer(Ok(())));
+        start.await.unwrap().unwrap();
     }
 
     #[test]

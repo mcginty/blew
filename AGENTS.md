@@ -208,10 +208,28 @@ before the command for that reason. The turn owns its ObjC objects through
 the turn is queued, so it bounds queueing too; and a turn whose caller already
 gave up issues nothing, since carrying it out would contradict what that caller
 was told. `CallbackSlots::register` is private so a registration can't be made
-outside a turn. Residual, unverified either way: freeing slots on power-down
-still assumes CoreBluetooth never *answers* a request from before the
-power-down once the adapter is back on and a new request holds the same key —
-without an identity there would be nothing to check such an answer against.
+outside a turn.
+
+**Every command that must order against a queued turn goes through the queue —
+`stopAdvertising` included.** A start queues its turn and yields, so a stop
+issued straight from the calling thread overtook a start still waiting there,
+and advertising began after `stop_advertising` returned `Ok`.
+`stop_advertising_in_turn` queues the stop and returns only once it has been
+issued, after any start queued before it. It deliberately leaves a pending
+start's slot alone: the start's own `didStartAdvertising:` still answers it,
+and freeing the slot early would let that late answer reach a newer start. Both
+go through the private `Advertiser` trait so the order is tested against a
+fake queue. Calls that stay on the calling thread don't order against a turn:
+`updateValue:` targets characteristics and centrals the delegate queue already
+recorded, and serializes against `power_down` through `pending_notifies`;
+`respondToRequest:withResult:` answers the specific `CBATTRequest` it was
+handed; `isAdvertising` and `state` are reads, and the slot inside the turn,
+not the pre-check, decides whether a start goes ahead.
+
+Residual, unverified either way: freeing slots on power-down still assumes
+CoreBluetooth never *answers* a request from before the power-down once the
+adapter is back on and a new request holds the same key — without an identity
+there would be nothing to check such an answer against.
 
 **L2CAP reactor** (`platform/apple/l2cap.rs`): one dedicated OS thread owns an `NSRunLoop` and all `NSInputStream`/`NSOutputStream` objects. Channels register via `ReactorCmd::Register`, close via `ReactorCmd::Close`; there is no write command — each channel carries a bounded `outbound_rx` the reactor drains itself, so backpressure lands on the caller's `write()` instead of in a queue. Bytes flow Reactor→App through a bounded `mpsc::Sender<Vec<u8>>`, App→Reactor through a `tokio::io::duplex` + outbound bridge task. No per-channel threads. The loop is event-driven: each channel's streams carry an `NSStreamDelegate` that marks the channel in a shared `ReadySet`, and `pump_channels` services only marked channels plus any that are lingering. The 1s `acceptInputForMode:beforeDate:` timeout is a backstop against a missed wakeup, not the service interval.
 
