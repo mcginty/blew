@@ -2,6 +2,10 @@ package org.jakebot.blew
 
 import android.Manifest
 import android.app.Activity
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
+import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
@@ -19,6 +23,7 @@ class BlewPlugin(
     companion object {
         private const val TAG = "BlewPlugin"
         private const val PERMISSION_REQUEST_CODE = 42_001
+        private const val ENABLE_BLUETOOTH_REQUEST_CODE = 42_002
 
         // Weak: a static strong reference to an Activity keeps the whole
         // destroyed instance alive across recreation. Nothing here needs it to
@@ -40,6 +45,44 @@ class BlewPlugin(
                     return
                 }
             activity.runOnUiThread { requestOnActivity(activity) }
+        }
+
+        @JvmStatic
+        fun requestEnableBluetooth() {
+            val activity =
+                hostActivity?.get() ?: run {
+                    Log.w(TAG, "requestEnableBluetooth called with no live host activity")
+                    return
+                }
+            activity.runOnUiThread { requestEnableOnActivity(activity) }
+        }
+
+        private fun requestEnableOnActivity(activity: Activity) {
+            val adapter =
+                (activity.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
+            if (adapter == null) {
+                Log.w(TAG, "requestEnableBluetooth: no Bluetooth adapter")
+                return
+            }
+            if (adapter.isEnabled) {
+                Log.d(TAG, "requestEnableBluetooth: adapter already on")
+                return
+            }
+            // On 12+ the platform throws SecurityException for this intent
+            // without BLUETOOTH_CONNECT; checking first turns that into a log line.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                !hasPermission(activity, Manifest.permission.BLUETOOTH_CONNECT)
+            ) {
+                Log.w(TAG, "requestEnableBluetooth: BLUETOOTH_CONNECT not granted")
+                return
+            }
+            // The result code is ignored: acceptance is reported by the
+            // ACTION_STATE_CHANGED receivers as the adapter powers on.
+            @Suppress("DEPRECATION")
+            activity.startActivityForResult(
+                Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE),
+                ENABLE_BLUETOOTH_REQUEST_CODE,
+            )
         }
 
         private fun requestOnActivity(activity: Activity) {

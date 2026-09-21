@@ -39,6 +39,18 @@ All notable changes to `blew` are documented here. Format follows
   fails immediately instead of queueing. The `testing` mock mirrors both, and advertising under
   `AllowPermanent` renames its adapter as Android does.
 
+- **Android: `request_enable_bluetooth()` asks the user to turn Bluetooth on.**
+  Available as `tauri_plugin_blew::request_enable_bluetooth()` and
+  `blew::platform::android::request_enable_bluetooth()`. It shows the system
+  `ACTION_REQUEST_ENABLE` dialog on the plugin's host activity and, like
+  `request_ble_permissions()`, returns without waiting for an answer. If the
+  user accepts, you get `AdapterStateChanged { powered: true }` on the existing
+  Central and Peripheral event streams; a refusal reports nothing. It does
+  nothing if the adapter is already on, and on Android 12+ it also does
+  nothing, with a logged warning, until `BLUETOOTH_CONNECT` is granted, because
+  the platform rejects the request without that permission. On other platforms
+  the plugin function does nothing.
+
 ### Changed
 
 - **`AdvertisingConfig::local_name` is now a `LocalName`, defaulting to no

@@ -80,7 +80,6 @@ pub fn are_ble_permissions_granted() -> bool {
 /// has not run, the class is unavailable, or the host activity hasn't been
 /// captured yet, this is a no-op and a warning is logged.
 pub fn request_ble_permissions() {
-    use jni::objects::{JObject, JValue};
     use jni::{jni_sig, jni_str};
     if !is_initialized() {
         tracing::warn!(
@@ -90,28 +89,7 @@ pub fn request_ble_permissions() {
         return;
     }
     let result: Result<(), jni::errors::Error> = jni_globals::jvm().attach_current_thread(|env| {
-        // Only the classloader is needed here; the Activity the dialog is
-        // shown on is `BlewPlugin`'s own, on the Kotlin side.
-        let context =
-            unsafe { JObject::from_raw(env, ndk_context::android_context().context().cast()) };
-        let class_loader = env
-            .call_method(
-                &context,
-                jni_str!("getClassLoader"),
-                jni_sig!("()Ljava/lang/ClassLoader;"),
-                &[],
-            )?
-            .l()?;
-        let class_name = env.new_string("org.jakebot.blew.BlewPlugin")?;
-        let class_obj = env
-            .call_method(
-                &class_loader,
-                jni_str!("loadClass"),
-                jni_sig!("(Ljava/lang/String;)Ljava/lang/Class;"),
-                &[JValue::Object(&class_name)],
-            )?
-            .l()?;
-        let plugin_class = unsafe { jni::objects::JClass::from_raw(env, class_obj.as_raw()) };
+        let plugin_class = load_plugin_class(env)?;
         env.call_static_method(
             &plugin_class,
             jni_str!("requestBlePermissions"),
@@ -123,4 +101,72 @@ pub fn request_ble_permissions() {
     if let Err(e) = result {
         tracing::warn!("request_ble_permissions failed: {e}");
     }
+}
+
+/// Ask the user to turn Bluetooth on, via the system's
+/// `BluetoothAdapter.ACTION_REQUEST_ENABLE` dialog.
+///
+/// Fire-and-forget, like [`request_ble_permissions`]. There is no result: if
+/// the user accepts, the adapter powering on is reported as
+/// `AdapterStateChanged { powered: true }` on the Central and Peripheral event
+/// streams, and a refusal reports nothing. No dialog is shown when the adapter
+/// is already on, when there is no adapter, or on Android 12+ when
+/// `BLUETOOTH_CONNECT` hasn't been granted — the platform refuses the request
+/// without it, so ask for permissions first.
+///
+/// Same preconditions as [`request_ble_permissions`]: without the Tauri
+/// plugin's host activity this is a no-op and a warning is logged.
+pub fn request_enable_bluetooth() {
+    use jni::{jni_sig, jni_str};
+    if !is_initialized() {
+        tracing::warn!(
+            "request_enable_bluetooth called before init_jvm; \
+             register tauri-plugin-blew or call init_jvm first"
+        );
+        return;
+    }
+    let result: Result<(), jni::errors::Error> = jni_globals::jvm().attach_current_thread(|env| {
+        let plugin_class = load_plugin_class(env)?;
+        env.call_static_method(
+            &plugin_class,
+            jni_str!("requestEnableBluetooth"),
+            jni_sig!("()V"),
+            &[],
+        )?;
+        Ok(())
+    });
+    if let Err(e) = result {
+        tracing::warn!("request_enable_bluetooth failed: {e}");
+    }
+}
+
+/// `BlewPlugin` belongs to the Tauri plugin, so it isn't among the classes
+/// `init_jvm` caches; resolve it through the app context's classloader.
+fn load_plugin_class<'local>(
+    env: &mut jni::Env<'local>,
+) -> Result<jni::objects::JClass<'local>, jni::errors::Error> {
+    use jni::objects::{JObject, JValue};
+    use jni::{jni_sig, jni_str};
+    // Only the classloader is needed here; the Activity any dialog is shown on
+    // is `BlewPlugin`'s own, on the Kotlin side.
+    let context =
+        unsafe { JObject::from_raw(env, ndk_context::android_context().context().cast()) };
+    let class_loader = env
+        .call_method(
+            &context,
+            jni_str!("getClassLoader"),
+            jni_sig!("()Ljava/lang/ClassLoader;"),
+            &[],
+        )?
+        .l()?;
+    let class_name = env.new_string("org.jakebot.blew.BlewPlugin")?;
+    let class_obj = env
+        .call_method(
+            &class_loader,
+            jni_str!("loadClass"),
+            jni_sig!("(Ljava/lang/String;)Ljava/lang/Class;"),
+            &[JValue::Object(&class_name)],
+        )?
+        .l()?;
+    Ok(unsafe { jni::objects::JClass::from_raw(env, class_obj.into_raw()) })
 }

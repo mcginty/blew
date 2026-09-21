@@ -109,6 +109,23 @@ pub fn request_ble_permissions() {
     }
 }
 
+/// Ask the user to turn Bluetooth on, via Android's system enable dialog.
+///
+/// Fire-and-forget, like [`request_ble_permissions`]. There is no dedicated
+/// result: acceptance shows up as `AdapterStateChanged { powered: true }` on
+/// blew's Central/Peripheral event streams (or check `is_powered()`), and a
+/// refusal reports nothing. Does nothing when the adapter is already on, or on
+/// Android 12+ before `BLUETOOTH_CONNECT` has been granted — request
+/// permissions first.
+///
+/// No-op on non-Android platforms, which offer no in-app way to ask.
+pub fn request_enable_bluetooth() {
+    #[cfg(target_os = "android")]
+    {
+        blew::platform::android::request_enable_bluetooth();
+    }
+}
+
 /// Subscribe to Android BLE permission-change events.
 ///
 /// Emits a [`BlePermissionStatus`] whenever the aggregate BLE-permission state
