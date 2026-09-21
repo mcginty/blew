@@ -336,6 +336,33 @@ Residual, and not fixable from here: an absent bonded subscriber while some
 carries no device identity, so blew cannot tell which devices subscribed to the
 characteristic.
 
+**A power-off must drop the published handles before the event goes out.**
+BlueZ takes the advertisement and GATT application down with the adapter, but
+`start_advertising` refuses while `Published::adv` is set, so a handle kept
+across the cycle refuses every later start with `AlreadyAdvertising` and
+nothing on air (#46). `watch_adapter` calls `PeripheralInner::power_lost`
+*before* sending `AdapterStateChanged { powered: false }`, so a handler that
+reacts by advertising again finds the peripheral ready. The watcher holds a
+`Weak`, never an `Arc` — a strong reference would keep the peripheral alive
+for as long as the adapter's event stream runs — and `PeripheralInner`'s
+`Drop` aborts it, since dropping a `JoinHandle` doesn't.
+
+`Published` keeps both handles and a `power_generation` under **one** lock, and
+`start_advertising` re-checks the generation under that lock as it stores each
+handle. It awaits BlueZ twice between its first check and its last store, and
+a power-off landing in between would otherwise clear the handles and then
+watch the start store a fresh one to an advertisement that is already gone —
+the same wedge. **Don't split the handles back into separate mutexes, and
+don't store one without the check.**
+
+**`add_service` replaces a queued service by UUID; it never appends a
+duplicate.** It never reaches BlueZ: `pending_services` is served whole as one
+`Application` on each `start_advertising`, and nothing removes from it (#34),
+so an append would serve a re-added service once per call. The logic lives in
+`util::service_queue` so it runs on every host. `pending_services` is
+deliberately **not** cleared on power-off: with replacement, an application
+that re-adds converges, and one that doesn't keeps its services.
+
 ## Android backend design (`platform/android/`)
 
 Uses `jni 0.22` and `ndk-context 0.1`. The Android BLE API is Java/Kotlin-only, so the backend bridges Rust ↔ Kotlin via JNI.
