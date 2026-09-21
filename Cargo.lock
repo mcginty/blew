@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "blew"
-version = "0.5.1-beta.2"
+version = "0.5.1-beta.3"
 dependencies = [
  "bitflags 2.13.1",
  "bluer",
