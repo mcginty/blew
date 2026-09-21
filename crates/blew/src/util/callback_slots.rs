@@ -15,46 +15,31 @@
 //! only other way out is the platform dropping every outstanding request at
 //! once, which CoreBluetooth does when the adapter leaves `PoweredOn`; see
 //! [`CallbackSlots::drain`].
+//!
+//! Every [`submit`], [`CallbackSlots::take`] and [`CallbackSlots::drain`] on
+//! one set of slots must run on the same serial queue -- for CoreBluetooth,
+//! the manager's delegate queue. The mutex only makes the slots shareable; it
+//! is the queue that keeps a `drain` from landing inside a `submit`.
 
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
 use crate::error::{BlewError, BlewResult};
 
-/// Identifies one registration, so withdrawing it can't remove a later one
-/// that took the same key.
-#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Ticket(u64);
-
-/// A registration the platform still owes a callback.
-#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
-pub(crate) struct Pending<P, T> {
-    ticket: Ticket,
-    payload: P,
-    tx: oneshot::Sender<BlewResult<T>>,
-}
-
-#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
-impl<P, T> Pending<P, T> {
-    /// Separate what the answer applies to from the means of delivering it,
-    /// so the payload can take effect before the caller is woken.
-    pub(crate) fn split(self) -> (P, Answer<T>) {
-        (self.payload, Answer(self.tx))
-    }
-
-    /// Deliver `result`, discarding the payload. See [`Answer::send`].
-    pub(crate) fn answer(self, result: BlewResult<T>) -> bool {
-        self.split().1.send(result)
-    }
-}
-
-/// The way back to a registration's caller.
+/// The way back to a request's caller.
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub(crate) struct Answer<T>(oneshot::Sender<BlewResult<T>>);
+
+/// A request's answer and the receiver its caller awaits.
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+pub(crate) fn answer_channel<T>() -> (Answer<T>, oneshot::Receiver<BlewResult<T>>) {
+    let (tx, rx) = oneshot::channel();
+    (Answer(tx), rx)
+}
 
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 impl<T> Answer<T> {
@@ -63,19 +48,43 @@ impl<T> Answer<T> {
     pub(crate) fn send(self, result: BlewResult<T>) -> bool {
         self.0.send(result).is_ok()
     }
+
+    /// Whether the caller has stopped waiting.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.0.is_closed()
+    }
+}
+
+/// A registration the platform still owes a callback.
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+pub(crate) struct Pending<P, T> {
+    payload: P,
+    answer: Answer<T>,
+}
+
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+impl<P, T> Pending<P, T> {
+    /// Separate what the answer applies to from the means of delivering it,
+    /// so the payload can take effect before the caller is woken.
+    pub(crate) fn split(self) -> (P, Answer<T>) {
+        (self.payload, self.answer)
+    }
+
+    /// Deliver `result`, discarding the payload. See [`Answer::send`].
+    pub(crate) fn answer(self, result: BlewResult<T>) -> bool {
+        self.answer.send(result)
+    }
 }
 
 /// One slot per key, each held until the platform answers it.
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub(crate) struct CallbackSlots<K, P, T> {
-    next_ticket: u64,
     slots: HashMap<K, Pending<P, T>>,
 }
 
 impl<K, P, T> Default for CallbackSlots<K, P, T> {
     fn default() -> Self {
         Self {
-            next_ticket: 0,
             slots: HashMap::new(),
         }
     }
@@ -83,40 +92,18 @@ impl<K, P, T> Default for CallbackSlots<K, P, T> {
 
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 impl<K: Eq + Hash, P, T> CallbackSlots<K, P, T> {
-    /// Claim `key` for a request about to be issued, carrying `payload` for
-    /// whoever takes the answer. `None` while an earlier request under the
-    /// same key is still owed its callback, whether or not that request's
-    /// caller is still waiting.
-    pub(crate) fn register(
-        &mut self,
-        key: K,
-        payload: P,
-    ) -> Option<(Ticket, oneshot::Receiver<BlewResult<T>>)> {
+    /// Hold `key` for a request, with `payload` for whoever takes the answer.
+    /// Hands both back while an earlier request under the same key is still
+    /// owed its callback, whether or not that request's caller is still
+    /// waiting.
+    fn register(&mut self, key: K, payload: P, answer: Answer<T>) -> Result<(), (P, Answer<T>)> {
         use std::collections::hash_map::Entry;
-        let Entry::Vacant(slot) = self.slots.entry(key) else {
-            return None;
-        };
-        self.next_ticket = self.next_ticket.wrapping_add(1);
-        let ticket = Ticket(self.next_ticket);
-        let (tx, rx) = oneshot::channel();
-        slot.insert(Pending {
-            ticket,
-            payload,
-            tx,
-        });
-        Some((ticket, rx))
-    }
-
-    /// Give back a registration whose request was never issued, so no callback
-    /// is owed for it. Removes only the registration `ticket` names: a
-    /// [`drain`](Self::drain) can already have freed it, and a later
-    /// registration taken the key.
-    pub(crate) fn withdraw(&mut self, key: &K, ticket: Ticket) -> bool {
-        if self.slots.get(key).is_some_and(|p| p.ticket == ticket) {
-            self.slots.remove(key);
-            true
-        } else {
-            false
+        match self.slots.entry(key) {
+            Entry::Vacant(slot) => {
+                slot.insert(Pending { payload, answer });
+                Ok(())
+            }
+            Entry::Occupied(_) => Err((payload, answer)),
         }
     }
 
@@ -132,7 +119,60 @@ impl<K: Eq + Hash, P, T> CallbackSlots<K, P, T> {
     }
 }
 
-/// Wait at most `limit` for a registration's answer.
+/// How a request's [`submit`] turn ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+pub(crate) enum Turn {
+    /// Registered and handed to the platform.
+    Issued,
+    /// Refused with `NotPowered`, never issued.
+    NotPowered,
+    /// Refused because its key was held, never issued.
+    Busy,
+    /// Its caller gave up before the turn came; never issued.
+    Abandoned,
+}
+
+/// One request's turn: register it and `issue` it, or refuse it through
+/// `answer`.
+///
+/// Must run on the serial queue every `take` and `drain` on `slots` runs on.
+/// The check, the registration and `issue` then happen with nothing between
+/// them, so a request can't pass the check, lose its slot to a `drain`, and
+/// issue its command anyway after power returns -- where its answer would
+/// complete a newer request under the same key, and the command its caller
+/// was told failed would take effect. The lock is released before `issue`,
+/// which calls into the platform.
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+pub(crate) fn submit<K: Eq + Hash, P, T>(
+    slots: &Mutex<CallbackSlots<K, P, T>>,
+    powered: bool,
+    key: K,
+    payload: P,
+    answer: Answer<T>,
+    busy: impl FnOnce() -> BlewError,
+    issue: impl FnOnce(),
+) -> Turn {
+    // Issuing a request whose caller already gave up would carry out what
+    // that caller was told didn't happen.
+    if answer.is_closed() {
+        return Turn::Abandoned;
+    }
+    if !powered {
+        answer.send(Err(BlewError::NotPowered));
+        return Turn::NotPowered;
+    }
+    let refused = slots.lock().register(key, payload, answer);
+    if let Err((_, answer)) = refused {
+        answer.send(Err(busy()));
+        return Turn::Busy;
+    }
+    issue();
+    Turn::Issued
+}
+
+/// Wait at most `limit` for a request's answer, counting any time its turn
+/// spends queued.
 ///
 /// Giving up leaves the slot held: the platform still owes the answer, and it
 /// has to be consumed by this registration rather than by the next one under
@@ -154,9 +194,17 @@ pub(crate) async fn await_answer<T>(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
 
-    type Slots = CallbackSlots<u8, &'static str, u32>;
+    type Slots = Mutex<CallbackSlots<u8, &'static str, u32>>;
+
+    fn busy() -> BlewError {
+        BlewError::Peripheral {
+            source: "busy".into(),
+        }
+    }
 
     fn gave_up() -> BlewError {
         BlewError::Peripheral {
@@ -164,117 +212,212 @@ mod tests {
         }
     }
 
+    /// Takes a turn, recording whether it reached the platform.
+    fn turn(
+        slots: &Slots,
+        powered: bool,
+        payload: &'static str,
+    ) -> (Turn, bool, oneshot::Receiver<BlewResult<u32>>) {
+        let (answer, rx) = answer_channel();
+        let issued = std::cell::Cell::new(false);
+        let turn = submit(slots, powered, 1, payload, answer, busy, || {
+            issued.set(true)
+        });
+        (turn, issued.get(), rx)
+    }
+
+    fn held_by(slots: &Slots) -> Option<&'static str> {
+        let pending = slots.lock().take(&1)?;
+        let (payload, answer) = pending.split();
+        slots.lock().register(1, payload, answer).ok()?;
+        Some(payload)
+    }
+
+    fn power_down(slots: &Slots) {
+        let drained = slots.lock().drain();
+        for pending in drained {
+            pending.answer(Err(BlewError::NotPowered));
+        }
+    }
+
     #[test]
-    fn a_held_key_refuses_a_second_registration() {
-        let mut slots = Slots::default();
-        let _first = slots.register(1, "first").unwrap();
-        assert!(slots.register(1, "second").is_none());
+    fn a_turn_registers_and_issues() {
+        let slots = Slots::default();
+        let (turn, issued, _rx) = turn(&slots, true, "a");
+        assert_eq!(turn, Turn::Issued);
+        assert!(issued);
+        assert_eq!(held_by(&slots), Some("a"));
+    }
+
+    #[test]
+    fn a_turn_while_powered_off_is_refused_and_not_issued() {
+        let slots = Slots::default();
+        let (turn, issued, mut rx) = turn(&slots, false, "a");
+        assert_eq!(turn, Turn::NotPowered);
+        assert!(!issued);
+        assert!(matches!(rx.try_recv().unwrap(), Err(BlewError::NotPowered)));
+        assert_eq!(held_by(&slots), None);
+    }
+
+    #[test]
+    fn a_held_key_refuses_the_next_turn_without_issuing() {
+        let slots = Slots::default();
+        let (_, _, _first) = turn(&slots, true, "first");
+
+        let (second, issued, mut rx) = turn(&slots, true, "second");
+        assert_eq!(second, Turn::Busy);
+        assert!(!issued);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Err(BlewError::Peripheral { .. })
+        ));
+        assert_eq!(held_by(&slots), Some("first"));
     }
 
     #[test]
     fn keys_are_independent() {
-        let mut slots = Slots::default();
-        let _a = slots.register(1, "a").unwrap();
-        assert!(slots.register(2, "b").is_some());
+        let slots = Slots::default();
+        let (answer, _a) = answer_channel();
+        submit(&slots, true, 1, "a", answer, busy, || {});
+        let (answer, _b) = answer_channel();
+        assert_eq!(
+            submit(&slots, true, 2, "b", answer, busy, || {}),
+            Turn::Issued
+        );
+    }
+
+    #[test]
+    fn a_turn_whose_caller_gave_up_in_the_queue_is_not_issued() {
+        let slots = Slots::default();
+        let (answer, rx) = answer_channel::<u32>();
+        drop(rx);
+        let issued = std::cell::Cell::new(false);
+        let turn = submit(&slots, true, 1, "a", answer, busy, || issued.set(true));
+        assert_eq!(turn, Turn::Abandoned);
+        assert!(!issued.get());
+        assert_eq!(held_by(&slots), None);
     }
 
     #[test]
     fn the_callback_reaches_the_waiter_and_frees_the_slot() {
-        let mut slots = Slots::default();
-        let (_, mut rx) = slots.register(1, "chars").unwrap();
+        let slots = Slots::default();
+        let (_, _, mut rx) = turn(&slots, true, "chars");
 
-        let (payload, answer) = slots.take(&1).unwrap().split();
+        let (payload, answer) = slots.lock().take(&1).unwrap().split();
         assert_eq!(payload, "chars");
         assert!(answer.send(Ok(7)));
         assert_eq!(rx.try_recv().unwrap().unwrap(), 7);
-
-        assert!(slots.register(1, "again").is_some());
+        assert_eq!(turn(&slots, true, "again").0, Turn::Issued);
     }
 
-    /// The case the whole type exists for: a request whose caller stopped
-    /// waiting still owns its key, so its late answer can't confirm the next.
+    /// A request whose caller stopped waiting still owns its key, so its late
+    /// answer can't confirm the next one.
     #[test]
     fn a_late_answer_is_consumed_by_the_request_it_answers() {
-        let mut slots = Slots::default();
-        let (_, abandoned) = slots.register(1, "first").unwrap();
+        let slots = Slots::default();
+        let (_, _, abandoned) = turn(&slots, true, "first");
         drop(abandoned);
 
-        assert!(
-            slots.register(1, "retry").is_none(),
-            "the retry must not take a key the platform still owes an answer on"
-        );
+        assert_eq!(turn(&slots, true, "retry").0, Turn::Busy);
 
-        // The first request's answer lands, is consumed, and reaches nobody.
-        let (payload, answer) = slots.take(&1).unwrap().split();
+        let (payload, answer) = slots.lock().take(&1).unwrap().split();
         assert_eq!(payload, "first");
-        assert!(!answer.send(Ok(1)));
+        assert!(!answer.send(Ok(1)), "reaches nobody");
 
-        // Only now does the retry get the key, and only its own answer.
-        let (_, mut rx) = slots.register(1, "retry").unwrap();
-        assert!(slots.take(&1).unwrap().answer(Ok(2)));
+        let (retry, _, mut rx) = turn(&slots, true, "retry");
+        assert_eq!(retry, Turn::Issued);
+        assert!(slots.lock().take(&1).unwrap().answer(Ok(2)));
         assert_eq!(rx.try_recv().unwrap().unwrap(), 2);
     }
 
     #[test]
-    fn withdraw_removes_only_its_own_registration() {
-        let mut slots = Slots::default();
-        let (stale, _) = slots.register(1, "stale").unwrap();
-        for pending in slots.drain() {
-            pending.answer(Err(BlewError::NotPowered));
-        }
-        let (current, _rx) = slots.register(1, "current").unwrap();
-
-        assert!(!slots.withdraw(&1, stale));
-        assert!(
-            slots.register(1, "third").is_none(),
-            "current still holds it"
-        );
-        assert!(slots.withdraw(&1, current));
-        assert!(slots.register(1, "third").is_some());
-    }
-
-    #[test]
     fn drain_fails_every_waiter_and_frees_every_slot() {
-        let mut slots = Slots::default();
-        let (_, mut a) = slots.register(1, "a").unwrap();
-        let (_, abandoned) = slots.register(2, "b").unwrap();
-        drop(abandoned);
+        let slots = Slots::default();
+        let (_, _, mut a) = turn(&slots, true, "a");
+        power_down(&slots);
+        assert!(matches!(a.try_recv().unwrap(), Err(BlewError::NotPowered)));
+        assert_eq!(held_by(&slots), None);
+        assert_eq!(turn(&slots, true, "b").0, Turn::Issued);
+    }
 
-        let drained = slots.drain();
-        assert_eq!(drained.len(), 2);
-        for pending in drained {
-            pending.answer(Err(BlewError::NotPowered));
+    /// The race the serial queue exists to rule out. Everything that touches
+    /// the slots runs on one queue, one step at a time, so a request's turn
+    /// lands either before a power-down or after it, never across it. Played
+    /// out in both orders, the first request's command is only ever issued
+    /// while it holds its slot, and a newer request's slot is never taken by
+    /// it.
+    #[test]
+    fn a_turn_queued_across_a_power_cycle_cannot_take_a_newer_request() {
+        fn queued<'a>(
+            slots: &'a Slots,
+            issued: &'a RefCell<Vec<&'static str>>,
+            name: &'static str,
+            answer: Answer<u32>,
+        ) -> Box<dyn FnOnce() + 'a> {
+            Box::new(move || {
+                submit(slots, true, 1, name, answer, busy, || {
+                    issued.borrow_mut().push(name);
+                });
+            })
         }
 
-        assert!(matches!(a.try_recv().unwrap(), Err(BlewError::NotPowered)));
-        assert!(slots.take(&1).is_none());
-        assert!(slots.register(1, "a").is_some());
-        assert!(slots.register(2, "b").is_some());
+        let slots = Slots::default();
+        let issued = RefCell::new(Vec::new());
+        let (answer_a, mut rx_a) = answer_channel();
+        let (answer_b, _rx_b) = answer_channel();
+
+        // A was queued before the power-down, but its turn comes after power
+        // returns and after B has taken the key: the ordering in which A used
+        // to issue its command and take B's answer.
+        let queue = vec![
+            Box::new(|| power_down(&slots)) as Box<dyn FnOnce()>,
+            queued(&slots, &issued, "b", answer_b),
+            queued(&slots, &issued, "a", answer_a),
+        ];
+        for step in queue {
+            step();
+        }
+
+        assert_eq!(*issued.borrow(), vec!["b"], "A must not reach the platform");
+        assert!(matches!(
+            rx_a.try_recv().unwrap(),
+            Err(BlewError::Peripheral { .. })
+        ));
+        assert_eq!(held_by(&slots), Some("b"), "B keeps its slot");
     }
 
     #[test]
-    fn a_callback_with_nothing_registered_is_unclaimed() {
-        let mut slots = Slots::default();
-        assert!(slots.take(&1).is_none());
+    fn a_turn_before_the_power_down_is_issued_then_failed_by_it() {
+        let slots = Slots::default();
+        let (turn_a, issued, mut rx_a) = turn(&slots, true, "a");
+        assert_eq!((turn_a, issued), (Turn::Issued, true));
+
+        power_down(&slots);
+
+        assert!(matches!(
+            rx_a.try_recv().unwrap(),
+            Err(BlewError::NotPowered)
+        ));
+        assert_eq!(turn(&slots, true, "b").0, Turn::Issued);
     }
 
     #[tokio::test(start_paused = true)]
     async fn giving_up_leaves_the_slot_held() {
-        let mut slots = Slots::default();
-        let (_, rx) = slots.register(1, "first").unwrap();
+        let slots = Slots::default();
+        let (_, _, rx) = turn(&slots, true, "first");
 
         let result = await_answer(rx, Duration::from_secs(5), gave_up).await;
         assert!(matches!(result, Err(BlewError::Peripheral { .. })));
 
-        assert!(slots.register(1, "retry").is_none());
-        assert!(!slots.take(&1).unwrap().answer(Ok(1)));
+        assert_eq!(turn(&slots, true, "retry").0, Turn::Busy);
+        assert!(!slots.lock().take(&1).unwrap().answer(Ok(1)));
     }
 
     #[tokio::test(start_paused = true)]
     async fn an_answer_inside_the_limit_is_returned() {
-        let mut slots = Slots::default();
-        let (_, rx) = slots.register(1, "first").unwrap();
-        assert!(slots.take(&1).unwrap().answer(Ok(9)));
+        let slots = Slots::default();
+        let (_, _, rx) = turn(&slots, true, "first");
+        assert!(slots.lock().take(&1).unwrap().answer(Ok(9)));
 
         let result = await_answer(rx, Duration::from_secs(5), gave_up).await;
         assert_eq!(result.unwrap(), 9);

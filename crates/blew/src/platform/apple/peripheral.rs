@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use dispatch2::{DispatchQueue, DispatchQueueAttr};
+use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
 use futures_core::Stream;
 use objc2::define_class;
 use objc2::rc::Retained;
@@ -60,7 +60,7 @@ use crate::platform::apple::helpers::{
 use crate::platform::apple::l2cap::bridge_l2cap_channel;
 use crate::types::DeviceId;
 use crate::util::BroadcastEventStream;
-use crate::util::callback_slots::{CallbackSlots, await_answer};
+use crate::util::callback_slots::{CallbackSlots, answer_channel, await_answer, submit};
 
 /// How long `add_service`, `start_advertising` and `l2cap_listener` wait for
 /// CoreBluetooth's answer. Each normally arrives within milliseconds; this only
@@ -816,6 +816,9 @@ struct PeripheralHandle {
     manager: ObjcSend<CBPeripheralManager>,
     /// Held here so the CB manager's weak-ref delegate stays alive.
     _delegate: ObjcSend<PeripheralDelegate>,
+    /// The serial queue every delegate callback runs on. Requests that wait on
+    /// a callback take their turn here too; see `util::callback_slots::submit`.
+    queue: DispatchRetained<DispatchQueue>,
     inner: Arc<PeripheralInner>,
 }
 
@@ -893,6 +896,7 @@ impl ApplePeripheral {
         let handle = Arc::new(PeripheralHandle {
             manager,
             _delegate: delegate,
+            queue,
             inner,
         });
         Ok(ApplePeripheral(handle))
@@ -925,7 +929,8 @@ impl PeripheralBackend for ApplePeripheral {
         let service = service.clone();
         async move {
             debug!(service_uuid = %service.uuid, characteristics = service.characteristics.len(), "adding GATT service");
-            let rx = {
+            let (answer, rx) = answer_channel();
+            {
                 let svc_uuid = uuid_to_cbuuid(service.uuid);
                 let cb_service = unsafe {
                     CBMutableService::initWithType_primary(
@@ -970,26 +975,31 @@ impl PeripheralBackend for ApplePeripheral {
                 let char_array = NSArray::from_slice(&retained_refs);
                 unsafe { cb_service.setCharacteristics(Some(&char_array)) };
 
-                // The characteristics join `chars` from `didAddService:` once
-                // the service is in the database, not here.
-                let registration = handle.inner.add_svc.lock().register(service.uuid, char_map);
-                let Some((ticket, rx)) = registration else {
-                    return Err(BlewError::Peripheral {
-                        source: "an earlier add_service for this service is still waiting on \
-                                 CoreBluetooth to report it added"
-                            .into(),
-                    });
-                };
-                // Checked after registering: a power-down from here on fails
-                // the registration, and one before it shows up here.
-                if !powered_on(&handle.manager) {
-                    handle.inner.add_svc.lock().withdraw(&service.uuid, ticket);
-                    return Err(BlewError::NotPowered);
-                }
-                unsafe { handle.manager.addService(&cb_service) };
-                rx
+                // The turn owns the service, so nothing Retained crosses the
+                // await below. Its characteristics join `chars` from
+                // `didAddService:` once the service is in the database.
+                let cb_service = ObjcSend(cb_service);
+                let key = service.uuid;
+                let turn_handle = Arc::clone(&handle);
+                handle.queue.exec_async(move || {
+                    let h = turn_handle;
+                    let turn = submit(
+                        &h.inner.add_svc,
+                        powered_on(&h.manager),
+                        key,
+                        char_map,
+                        answer,
+                        || BlewError::Peripheral {
+                            source: "an earlier add_service for this service is still waiting \
+                                     on CoreBluetooth to report it added"
+                                .into(),
+                        },
+                        || unsafe { h.manager.addService(&cb_service) },
+                    );
+                    trace!(service_uuid = %key, ?turn, "add_service turn");
+                });
                 // All ObjC objects drop here, before .await
-            };
+            }
 
             await_answer(rx, CALLBACK_TIMEOUT, || BlewError::Peripheral {
                 source: "CoreBluetooth never reported the GATT service added".into(),
@@ -1010,7 +1020,8 @@ impl PeripheralBackend for ApplePeripheral {
             }
             debug!(local_name = ?config.local_name, "starting advertising");
 
-            let rx = {
+            let (answer, rx) = answer_channel();
+            {
                 let local_name = config.local_name.name().map(NSString::from_str);
 
                 let service_uuids: Vec<Retained<CBUUID>> = config
@@ -1027,22 +1038,28 @@ impl PeripheralBackend for ApplePeripheral {
                     values.push(local_name);
                 }
 
-                let adv_data = NSDictionary::from_slices(&keys, &values);
-
-                // A start still owed its answer, even one whose caller gave up
-                // waiting, is advertising or about to be as far as anyone can
-                // tell.
-                let registration = handle.inner.adv.lock().register((), ());
-                let Some((ticket, rx)) = registration else {
-                    return Err(BlewError::AlreadyAdvertising);
-                };
-                if !powered_on(&handle.manager) {
-                    handle.inner.adv.lock().withdraw(&(), ticket);
-                    return Err(BlewError::NotPowered);
-                }
-                unsafe { handle.manager.startAdvertising(Some(&adv_data)) };
-                rx
-            };
+                let adv_data = ObjcSend(NSDictionary::from_slices(&keys, &values));
+                let turn_handle = Arc::clone(&handle);
+                handle.queue.exec_async(move || {
+                    let h = turn_handle;
+                    // Moved whole: capturing only `.0` would take the bare
+                    // `Retained`, which isn't `Send`.
+                    let adv_data = adv_data;
+                    // A start still owed its answer, even one whose caller gave
+                    // up waiting, is advertising or about to be as far as
+                    // anyone can tell.
+                    let turn = submit(
+                        &h.inner.adv,
+                        powered_on(&h.manager),
+                        (),
+                        (),
+                        answer,
+                        || BlewError::AlreadyAdvertising,
+                        || unsafe { h.manager.startAdvertising(Some(&*adv_data.0)) },
+                    );
+                    trace!(?turn, "start_advertising turn");
+                });
+            }
 
             await_answer(rx, CALLBACK_TIMEOUT, || BlewError::Peripheral {
                 source: "CoreBluetooth never reported whether advertising started".into(),
@@ -1114,21 +1131,32 @@ impl PeripheralBackend for ApplePeripheral {
             let encryption = handle.inner.l2cap_config.lock().encryption;
             let encrypted = publish_encryption_flag(encryption)?;
             debug!(%encryption, "publishing L2CAP CoC channel");
-            let registration = handle.inner.l2cap_publish.lock().register((), ());
-            let Some((ticket, pub_rx)) = registration else {
-                return Err(BlewError::L2cap {
-                    source: "an earlier l2cap_listener is still waiting on CoreBluetooth to \
-                             report its channel published"
-                        .into(),
-                });
-            };
-            if !powered_on(&handle.manager) {
-                handle.inner.l2cap_publish.lock().withdraw(&(), ticket);
-                return Err(BlewError::NotPowered);
-            }
+            let (answer, pub_rx) = answer_channel();
             let (ch_tx, ch_rx) = mpsc::unbounded_channel::<BlewResult<(DeviceId, L2capChannel)>>();
-            *handle.inner.l2cap_channel_tx.lock() = Some(ch_tx);
-            unsafe { handle.manager.publishL2CAPChannelWithEncryption(encrypted) };
+            let turn_handle = Arc::clone(&handle);
+            handle.queue.exec_async(move || {
+                let h = turn_handle;
+                let turn = submit(
+                    &h.inner.l2cap_publish,
+                    powered_on(&h.manager),
+                    (),
+                    (),
+                    answer,
+                    || BlewError::L2cap {
+                        source: "an earlier l2cap_listener is still waiting on CoreBluetooth \
+                                 to report its channel published"
+                            .into(),
+                    },
+                    || {
+                        // Installed in the same turn as the publish, so a
+                        // power-down can't slip between them and leave a
+                        // stream that no power-down will end.
+                        *h.inner.l2cap_channel_tx.lock() = Some(ch_tx);
+                        unsafe { h.manager.publishL2CAPChannelWithEncryption(encrypted) };
+                    },
+                );
+                trace!(?turn, "l2cap_listener turn");
+            });
             let psm = await_answer(pub_rx, CALLBACK_TIMEOUT, || BlewError::L2cap {
                 source: "CoreBluetooth never reported the L2CAP channel published".into(),
             })
@@ -1165,6 +1193,7 @@ impl ApplePeripheral {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::callback_slots::Turn;
 
     const SVC: Uuid = Uuid::from_u128(0x1111);
     const CHR: Uuid = Uuid::from_u128(0x2222);
@@ -1189,10 +1218,33 @@ mod tests {
         inner.chars.lock().contains_key(&CHR)
     }
 
+    fn busy() -> BlewError {
+        BlewError::Peripheral {
+            source: "busy".into(),
+        }
+    }
+
+    /// An `add_service` turn as the manager's queue takes it, with the adapter
+    /// on and nothing to hand the service to.
+    fn add_turn(inner: &PeripheralInner) -> (Turn, oneshot::Receiver<BlewResult<()>>) {
+        let (answer, rx) = answer_channel();
+        let turn = submit(&inner.add_svc, true, SVC, char_map(), answer, busy, || {});
+        (turn, rx)
+    }
+
+    /// A `start_advertising` or `l2cap_listener` turn, likewise.
+    fn slot_turn<T>(
+        slots: &Mutex<CallbackSlots<(), (), T>>,
+    ) -> (Turn, oneshot::Receiver<BlewResult<T>>) {
+        let (answer, rx) = answer_channel();
+        let turn = submit(slots, true, (), (), answer, busy, || {});
+        (turn, rx)
+    }
+
     #[tokio::test]
     async fn a_service_joins_chars_only_once_added() {
         let (inner, _) = PeripheralInner::new();
-        let (_, mut rx) = inner.add_svc.lock().register(SVC, char_map()).unwrap();
+        let (_, mut rx) = add_turn(&inner);
         assert!(
             !published(&inner),
             "not before CoreBluetooth has the service"
@@ -1207,7 +1259,7 @@ mod tests {
     #[tokio::test]
     async fn a_rejected_service_leaves_nothing_to_notify_on() {
         let (inner, _) = PeripheralInner::new();
-        let (_, mut rx) = inner.add_svc.lock().register(SVC, char_map()).unwrap();
+        let (_, mut rx) = add_turn(&inner);
 
         inner.service_added(SVC, Some("refused".into()));
 
@@ -1223,25 +1275,25 @@ mod tests {
     #[tokio::test]
     async fn a_retry_waits_for_the_answer_the_first_attempt_is_owed() {
         let (inner, _) = PeripheralInner::new();
-        let (_, abandoned) = inner.add_svc.lock().register(SVC, char_map()).unwrap();
+        let (_, abandoned) = add_turn(&inner);
         drop(abandoned);
 
-        assert!(inner.add_svc.lock().register(SVC, char_map()).is_none());
+        assert_eq!(add_turn(&inner).0, Turn::Busy);
 
         // The late answer is consumed by the attempt it answers. The service
         // is in the database, so its characteristics are published anyway.
         inner.service_added(SVC, None);
         assert!(published(&inner));
-        assert!(inner.add_svc.lock().register(SVC, char_map()).is_some());
+        assert_eq!(add_turn(&inner).0, Turn::Issued);
     }
 
     #[tokio::test]
     async fn a_power_off_fails_every_waiter_and_keeps_the_database() {
         let (inner, _) = PeripheralInner::new();
         inner.chars.lock().extend(char_map());
-        let (_, mut add) = inner.add_svc.lock().register(SVC, char_map()).unwrap();
-        let (_, mut adv) = inner.adv.lock().register((), ()).unwrap();
-        let (_, mut publish) = inner.l2cap_publish.lock().register((), ()).unwrap();
+        let (_, mut add) = add_turn(&inner);
+        let (_, mut adv) = slot_turn(&inner.adv);
+        let (_, mut publish) = slot_turn(&inner.l2cap_publish);
         let (ch_tx, mut accepts) = mpsc::unbounded_channel();
         *inner.l2cap_channel_tx.lock() = Some(ch_tx);
         let (done, mut notify) = oneshot::channel();
@@ -1279,9 +1331,9 @@ mod tests {
         assert!(accepts.recv().await.is_none());
 
         // Every slot is free for the requests an application makes next.
-        assert!(inner.add_svc.lock().register(SVC, char_map()).is_some());
-        assert!(inner.adv.lock().register((), ()).is_some());
-        assert!(inner.l2cap_publish.lock().register((), ()).is_some());
+        assert_eq!(add_turn(&inner).0, Turn::Issued);
+        assert_eq!(slot_turn(&inner.adv).0, Turn::Issued);
+        assert_eq!(slot_turn(&inner.l2cap_publish).0, Turn::Issued);
 
         // CoreBluetooth keeps the local database across a power-off.
         assert!(published(&inner));
@@ -1311,7 +1363,7 @@ mod tests {
     #[tokio::test]
     async fn an_answer_after_a_power_down_is_unclaimed() {
         let (inner, _) = PeripheralInner::new();
-        let _rx = inner.add_svc.lock().register(SVC, char_map()).unwrap();
+        let (_, _rx) = add_turn(&inner);
         inner.power_down(CBManagerState::PoweredOff);
 
         inner.service_added(SVC, None);

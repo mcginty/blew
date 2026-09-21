@@ -188,14 +188,30 @@ its key held is refused. **Don't free a slot on timeout**: the late answer would
 then confirm the next request under the same key. Attribution by object identity
 (`didAddService:` passes a `CBService`) was not used because nothing here has
 verified that CoreBluetooth returns the instance it was given — and if it
-doesn't, every add would time out. Each call also registers *before* checking
-`PoweredOn`, so a power-down either fails the registration or is seen by the
-check; CoreBluetooth ignores a command issued while off and never answers it,
-which would otherwise hold the slot until the next power-down. Residual,
-unverified either way: freeing slots on power-down assumes CoreBluetooth never
-answers a request from before the power-down once the adapter is back on and a
-new request holds the same key. If it ever did, that answer would confirm the
-new request, and without an identity there is nothing to check it against.
+doesn't, every add would time out.
+
+**Submission and cleanup share the manager's queue.** Each of those calls takes
+one turn on `PeripheralHandle::queue` — the serial queue the delegate, and so
+`power_down`, runs on — through `callback_slots::submit`, which checks
+`PoweredOn`, registers, and issues the command with nothing in between, and
+refuses through the same oneshot the async side awaits. Done from a Tokio
+thread, as it was first written, a request could pass the check, lose its slot
+to `power_down` (its caller already told `NotPowered`), and issue its command
+after power returned: that answer completed a newer request under the same key,
+and the service the first caller was told failed was added anyway. **Don't fix
+this with a mutex** that `power_down` also takes, held across `addService:` /
+`startAdvertising:` / `publishL2CAPChannelWithEncryption:`: calling into
+CoreBluetooth while holding a lock the delegate queue needs deadlocks the moment
+CoreBluetooth waits on that queue internally, and the slots' mutex is released
+before the command for that reason. The turn owns its ObjC objects through
+`ObjcSend`, so nothing `Retained` crosses the await; the timeout starts before
+the turn is queued, so it bounds queueing too; and a turn whose caller already
+gave up issues nothing, since carrying it out would contradict what that caller
+was told. `CallbackSlots::register` is private so a registration can't be made
+outside a turn. Residual, unverified either way: freeing slots on power-down
+still assumes CoreBluetooth never *answers* a request from before the
+power-down once the adapter is back on and a new request holds the same key —
+without an identity there would be nothing to check such an answer against.
 
 **L2CAP reactor** (`platform/apple/l2cap.rs`): one dedicated OS thread owns an `NSRunLoop` and all `NSInputStream`/`NSOutputStream` objects. Channels register via `ReactorCmd::Register`, close via `ReactorCmd::Close`; there is no write command — each channel carries a bounded `outbound_rx` the reactor drains itself, so backpressure lands on the caller's `write()` instead of in a queue. Bytes flow Reactor→App through a bounded `mpsc::Sender<Vec<u8>>`, App→Reactor through a `tokio::io::duplex` + outbound bridge task. No per-channel threads. The loop is event-driven: each channel's streams carry an `NSStreamDelegate` that marks the channel in a shared `ReadySet`, and `pump_channels` services only marked channels plus any that are lingering. The 1s `acceptInputForMode:beforeDate:` timeout is a backstop against a missed wakeup, not the service interval.
 
