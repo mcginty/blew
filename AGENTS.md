@@ -131,7 +131,7 @@ let mut requests = peripheral.take_requests()                // single-consumer;
 **Threading model:**
 - Each manager (`CBCentralManager`, `CBPeripheralManager`) is initialized with a dedicated GCD serial queue via `initWithDelegate_queue(Some(&queue))`.
 - All CB delegate callbacks fire exclusively on that queue.
-- Tokio tasks call CB methods directly from the thread pool; CoreBluetooth is documented thread-safe on macOS 10.15+ / iOS 13+.
+- Tokio tasks call CB methods directly from the thread pool; CoreBluetooth is documented thread-safe on macOS 10.15+ / iOS 13+. The exception is peripheral commands that must order against a callback, which run on the manager queue (see below).
 - Results flow back to Tokio via `tokio::sync::oneshot` channels (set in the delegate callback, awaited in the async method).
 
 **Key patterns:**
@@ -164,6 +164,22 @@ rx.await...
 - Both imports are required; missing either gives "no method found" errors.
 
 **RAII responders:** `peripheralManager:didReceiveReadRequest:` and `didReceiveWriteRequests:` build a `ReadResponder`/`WriteResponder` (backed by an `oneshot::Sender`), emit a `PeripheralRequest` on the `mpsc::UnboundedSender` handed out by `take_requests()`, then spawn a task (via `inner.runtime.spawn()`) that awaits the oneshot and calls `respondToRequest:withResult:`. The spawn uses the captured `Handle` because GCD callbacks run outside the Tokio runtime context — bare `tokio::spawn` would panic. All Rust-side synchronization uses `parking_lot::Mutex` (poison-free, faster than `std::sync::Mutex`).
+
+**Apple peripheral power cycles and callback waiters.** The reasons live in the
+code; these are the rules.
+- **A power-down is cleaned up before it is reported**: below `PoweredOn`
+  waiters fail, the accept stream ends and subscribers are reported gone.
+  `chars` goes only below `PoweredOff`, following the SDK header, which Apple's
+  online docs contradict; unconfirmed on a device. Read
+  `PeripheralInner::power_down` before changing it either way.
+- **A waiter that gave up keeps its slot** until its own callback or a
+  power-down, and a request for a held key is refused. **Don't free a slot on
+  timeout.** See `util::callback_slots`, which also records the residual.
+- **Commands that order against a callback or another command run in a turn on
+  the manager queue** (`addService:`, `startAdvertising:`, `stopAdvertising`,
+  `publishL2CAPChannelWithEncryption:`), via `request_in_turn` /
+  `issue_in_turn`. **Don't replace this with a lock held across the command.**
+  See `TurnQueue` in `platform/apple/peripheral.rs`.
 
 **L2CAP reactor** (`platform/apple/l2cap.rs`): one dedicated OS thread owns an `NSRunLoop` and all `NSInputStream`/`NSOutputStream` objects. Channels register via `ReactorCmd::Register`, close via `ReactorCmd::Close`; there is no write command — each channel carries a bounded `outbound_rx` the reactor drains itself, so backpressure lands on the caller's `write()` instead of in a queue. Bytes flow Reactor→App through a bounded `mpsc::Sender<Vec<u8>>`, App→Reactor through a `tokio::io::duplex` + outbound bridge task. No per-channel threads. The loop is event-driven: each channel's streams carry an `NSStreamDelegate` that marks the channel in a shared `ReadySet`, and `pump_channels` services only marked channels plus any that are lingering. The 1s `acceptInputForMode:beforeDate:` timeout is a backstop against a missed wakeup, not the service interval.
 

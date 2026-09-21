@@ -17,10 +17,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use dispatch2::{DispatchQueue, DispatchQueueAttr};
+use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
 use futures_core::Stream;
 use objc2::define_class;
 use objc2::rc::Retained;
@@ -59,6 +60,22 @@ use crate::platform::apple::helpers::{
 use crate::platform::apple::l2cap::bridge_l2cap_channel;
 use crate::types::DeviceId;
 use crate::util::BroadcastEventStream;
+use crate::util::callback_slots::{
+    Answer, CallbackSlots, Turn, answer_channel, await_answer, submit,
+};
+
+/// How long a [`request_in_turn`] waits for CoreBluetooth's answer, which
+/// normally takes milliseconds.
+const CALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Characteristics of one service, keyed by UUID, as `chars` holds them.
+type CharMap = HashMap<Uuid, ObjcSend<CBMutableCharacteristic>>;
+
+/// CoreBluetooth ignores a command issued in any other state and never answers it.
+fn powered_on(manager: &CBPeripheralManager) -> bool {
+    let state = unsafe { manager.state() };
+    state == CBManagerState::PoweredOn
+}
 
 fn our_props_to_cb(props: CharacteristicProperties) -> CBCharacteristicProperties {
     let mut out = CBCharacteristicProperties(0);
@@ -163,10 +180,11 @@ struct PeripheralInner {
     /// `didUnsubscribeFromCharacteristic`. Used by `notify_characteristic` to
     /// target a single central rather than broadcasting.
     subscribers: Mutex<HashMap<Uuid, HashMap<DeviceId, ObjcSend<CBCentral>>>>,
-    /// Pending `start_advertising()` result.
-    adv_tx: Mutex<Option<oneshot::Sender<BlewResult<()>>>>,
-    /// Pending `add_service()` results.
-    add_svc_tx: Mutex<HashMap<Uuid, oneshot::Sender<BlewResult<()>>>>,
+    /// The `start_advertising()` still owed `didStartAdvertising:error:`.
+    adv: Mutex<CallbackSlots<(), (), ()>>,
+    /// Each `add_service()` still owed `didAddService:error:`, keyed by service
+    /// UUID, carrying the characteristics that join `chars` once it is added.
+    add_svc: Mutex<CallbackSlots<Uuid, CharMap, ()>>,
     /// Inbound GATT requests. The receiver is handed out at most once via
     /// [`PeripheralBackend::take_requests`].
     request_tx: mpsc::UnboundedSender<PeripheralRequest>,
@@ -182,7 +200,8 @@ struct PeripheralInner {
     powered_tx: watch::Sender<bool>,
     /// Result of `publishL2CAPChannelWithEncryption` -- carries the assigned PSM.
     l2cap_config: Mutex<crate::l2cap::L2capConfig>,
-    l2cap_publish_tx: Mutex<Option<oneshot::Sender<BlewResult<Psm>>>>,
+    /// The `l2cap_listener()` still owed `didPublishL2CAPChannel:error:`.
+    l2cap_publish: Mutex<CallbackSlots<(), (), Psm>>,
     /// Sender for incoming L2CAP channels (set by `l2cap_listener`). Unbounded so
     /// the GCD delegate queue is never blocked by a slow accept-stream consumer.
     #[allow(clippy::type_complexity)]
@@ -211,15 +230,15 @@ impl PeripheralInner {
         let inner = Arc::new(Self {
             chars: Default::default(),
             subscribers: Default::default(),
-            adv_tx: Default::default(),
-            add_svc_tx: Default::default(),
+            adv: Mutex::default(),
+            add_svc: Mutex::default(),
             request_tx,
             request_rx: Mutex::new(Some(request_rx)),
             state_tx,
             restored: Mutex::new(None),
             powered_tx,
             l2cap_config: Mutex::new(crate::l2cap::L2capConfig::default()),
-            l2cap_publish_tx: Mutex::new(None),
+            l2cap_publish: Mutex::default(),
             l2cap_channel_tx: Mutex::new(None),
             pending_notifies: Mutex::new(VecDeque::new()),
             runtime: Handle::current(),
@@ -229,6 +248,99 @@ impl PeripheralInner {
 
     fn emit_state(&self, event: PeripheralStateEvent) {
         let _ = self.state_tx.send(event);
+    }
+
+    /// Drop what a state below `PoweredOn` invalidates, before the adapter
+    /// event goes out: every central disconnects, so waiters fail and
+    /// subscribers go.
+    ///
+    /// Whether `chars` goes too depends on whether CoreBluetooth kept its local
+    /// database, and Apple's two sources disagree. The SDK header
+    /// (`CBPeripheralManager.h`, `peripheralManagerDidUpdateState:`, the same in
+    /// the macOS and iOS 27 SDKs) clears it only "if the state moves below
+    /// CBPeripheralManagerStatePoweredOff". The online page for
+    /// `peripheralManagerDidUpdateState(_:)` (updated 2026-08-29) says the
+    /// powered-off state itself clears it and all services must be re-added.
+    /// blew follows the header because the one field report does:
+    /// <https://stackoverflow.com/questions/37194937> (2016) saw `isAdvertising`
+    /// still YES after PoweredOff and back, and re-adding the service raise an
+    /// exception because it was already added. So `chars` goes only below
+    /// `PoweredOff`.
+    ///
+    /// If the online page is right, a plain power-off leaves `chars` holding
+    /// characteristics CoreBluetooth dropped. Their subscribers are gone and no
+    /// central can subscribe to a service CoreBluetooth no longer has, so a
+    /// notification on one reports `NoSubscriber` rather than hanging -- but an
+    /// application going by the header won't re-add, and the peripheral serves
+    /// nothing until it does. Unconfirmed on a device either way.
+    fn power_down(&self, state: CBManagerState) {
+        let database_cleared = state.0 < CBManagerState::PoweredOff.0;
+
+        // CoreBluetooth answers none of these once it leaves `PoweredOn`.
+        let adds = self.add_svc.lock().drain();
+        for pending in adds {
+            pending.answer(Err(BlewError::NotPowered));
+        }
+        let starts = self.adv.lock().drain();
+        for pending in starts {
+            pending.answer(Err(BlewError::NotPowered));
+        }
+        let publishes = self.l2cap_publish.lock().drain();
+        for pending in publishes {
+            pending.answer(Err(BlewError::NotPowered));
+        }
+        // Whether a PSM survives a power-off is undocumented; ending the stream
+        // tells its consumer to publish again rather than wait forever.
+        if let Some(tx) = self.l2cap_channel_tx.lock().take() {
+            let _ = tx.send(Err(BlewError::NotPowered));
+        }
+
+        // Held throughout, so no notification queues behind a dropped subscriber.
+        let lost: Vec<(DeviceId, Uuid)> = {
+            let mut queue = self.pending_notifies.lock();
+            for pending in queue.drain(..) {
+                let _ = pending.done.send(Err(BlewError::NotPowered));
+            }
+            if database_cleared {
+                self.chars.lock().clear();
+            }
+            self.subscribers
+                .lock()
+                .drain()
+                .flat_map(|(char_uuid, centrals)| {
+                    centrals
+                        .into_keys()
+                        .map(move |client_id| (client_id, char_uuid))
+                })
+                .collect()
+        };
+        for (client_id, char_uuid) in lost {
+            self.emit_state(PeripheralStateEvent::SubscriptionChanged {
+                client_id,
+                char_uuid,
+                subscribed: false,
+            });
+        }
+    }
+
+    /// Settle the `add_service` that `didAddService:error:` answers.
+    fn service_added(&self, svc_uuid: Uuid, error: Option<String>) {
+        let pending = self.add_svc.lock().take(&svc_uuid);
+        let Some(pending) = pending else { return };
+        let (chars, answer) = pending.split();
+        let result = if let Some(e) = error {
+            warn!(service_uuid = %svc_uuid, error = %e, "failed to add GATT service");
+            Err(BlewError::Internal(e))
+        } else {
+            debug!(service_uuid = %svc_uuid, "GATT service added");
+            // Before the caller wakes, so it can notify at once. Even if it gave
+            // up, the service is in the database.
+            self.chars.lock().extend(chars);
+            Ok(())
+        };
+        if !answer.send(result) {
+            debug!(service_uuid = %svc_uuid, "service result arrived after its add gave up waiting");
+        }
     }
 
     /// One `updateValue:forCharacteristic:onSubscribedCentrals:` attempt.
@@ -311,9 +423,13 @@ define_class!(
     unsafe impl CBPeripheralManagerDelegate for PeripheralDelegate {
         #[unsafe(method(peripheralManagerDidUpdateState:))]
         unsafe fn peripheralManagerDidUpdateState(&self, peripheral: &CBPeripheralManager) {
-            let powered = unsafe { peripheral.state() } == CBManagerState::PoweredOn;
-            debug!(powered, "peripheral adapter state changed");
+            let state = unsafe { peripheral.state() };
+            let powered = state == CBManagerState::PoweredOn;
+            debug!(powered, state = state.0, "peripheral adapter state changed");
             let inner = self.ivars();
+            if !powered {
+                inner.power_down(state);
+            }
             let _ = inner.powered_tx.send(powered);
             inner.emit_state(PeripheralStateEvent::AdapterStateChanged { powered });
         }
@@ -370,18 +486,20 @@ define_class!(
             error: Option<&NSError>,
         ) {
             let inner = self.ivars();
-            if let Some(tx) = inner.adv_tx.lock().take() {
-                let result = error.map_or_else(
-                    || {
-                        debug!("advertising started");
-                        Ok(())
-                    },
-                    |e| {
-                        warn!(error = %e.localizedDescription(), "advertising failed to start");
-                        Err(BlewError::Internal(e.localizedDescription().to_string()))
-                    },
-                );
-                let _ = tx.send(result);
+            let pending = inner.adv.lock().take(&());
+            let Some(pending) = pending else { return };
+            let result = error.map_or_else(
+                || {
+                    debug!("advertising started");
+                    Ok(())
+                },
+                |e| {
+                    warn!(error = %e.localizedDescription(), "advertising failed to start");
+                    Err(BlewError::Internal(e.localizedDescription().to_string()))
+                },
+            );
+            if !pending.answer(result) {
+                debug!("advertising result arrived after its start gave up waiting");
             }
         }
 
@@ -397,19 +515,7 @@ define_class!(
             let Some(svc_uuid) = cbuuid_to_uuid(&svc_uuid_ret) else {
                 return;
             };
-            if let Some(tx) = inner.add_svc_tx.lock().remove(&svc_uuid) {
-                let result = error.map_or_else(
-                    || {
-                        debug!(service_uuid = %svc_uuid, "GATT service added");
-                        Ok(())
-                    },
-                    |e| {
-                        warn!(service_uuid = %svc_uuid, error = %e.localizedDescription(), "failed to add GATT service");
-                        Err(BlewError::Internal(e.localizedDescription().to_string()))
-                    },
-                );
-                let _ = tx.send(result);
-            }
+            inner.service_added(svc_uuid, error.map(|e| e.localizedDescription().to_string()));
         }
 
         #[unsafe(method(peripheralManager:central:didSubscribeToCharacteristic:))]
@@ -452,20 +558,25 @@ define_class!(
             };
             let client_id = central_device_id(central);
             trace!(client_id = %client_id, %char_uuid, "client unsubscribed from characteristic");
-            {
+            let removed = {
                 let mut subs = inner.subscribers.lock();
-                if let Some(entry) = subs.get_mut(&char_uuid) {
-                    entry.remove(&client_id);
-                    if entry.is_empty() {
-                        subs.remove(&char_uuid);
-                    }
+                let removed = subs
+                    .get_mut(&char_uuid)
+                    .and_then(|entry| entry.remove(&client_id))
+                    .is_some();
+                if subs.get(&char_uuid).is_some_and(HashMap::is_empty) {
+                    subs.remove(&char_uuid);
                 }
+                removed
+            };
+            // `power_down` has already reported the rest.
+            if removed {
+                inner.emit_state(PeripheralStateEvent::SubscriptionChanged {
+                    client_id,
+                    char_uuid,
+                    subscribed: false,
+                });
             }
-            inner.emit_state(PeripheralStateEvent::SubscriptionChanged {
-                client_id,
-                char_uuid,
-                subscribed: false,
-            });
         }
 
         #[unsafe(method(peripheralManager:didReceiveReadRequest:))]
@@ -635,15 +746,17 @@ define_class!(
             error: Option<&NSError>,
         ) {
             let inner = self.ivars();
-            if let Some(tx) = inner.l2cap_publish_tx.lock().take() {
-                let result = if let Some(e) = error {
-                    warn!(error = %e.localizedDescription(), "L2CAP channel publish failed");
-                    Err(BlewError::Internal(e.localizedDescription().to_string()))
-                } else {
-                    debug!(psm = PSM, "L2CAP channel published");
-                    Ok(Psm(PSM))
-                };
-                let _ = tx.send(result);
+            let pending = inner.l2cap_publish.lock().take(&());
+            let Some(pending) = pending else { return };
+            let result = if let Some(e) = error {
+                warn!(error = %e.localizedDescription(), "L2CAP channel publish failed");
+                Err(BlewError::Internal(e.localizedDescription().to_string()))
+            } else {
+                debug!(psm = PSM, "L2CAP channel published");
+                Ok(Psm(PSM))
+            };
+            if !pending.answer(result) {
+                debug!(psm = PSM, "L2CAP publish result arrived after its listener gave up waiting");
             }
         }
 
@@ -709,11 +822,67 @@ struct PeripheralHandle {
     manager: ObjcSend<CBPeripheralManager>,
     /// Held here so the CB manager's weak-ref delegate stays alive.
     _delegate: ObjcSend<PeripheralDelegate>,
+    /// The delegate's serial queue; see [`TurnQueue`].
+    queue: DispatchRetained<DispatchQueue>,
     inner: Arc<PeripheralInner>,
 }
 
 unsafe impl Send for PeripheralHandle {}
 unsafe impl Sync for PeripheralHandle {}
+
+/// Where a turn runs: the manager's serial queue, which the delegate -- and so
+/// `power_down` -- runs on too.
+///
+/// A command whose order matters against a callback or another command is
+/// issued in a turn here, never from the calling thread. Otherwise a request
+/// can pass `submit`'s power check, lose its slot to `power_down`, and still
+/// issue its command after power returns, completing a newer request's wait;
+/// and a stop can overtake a start still waiting for its turn. Don't close
+/// those windows with a lock the delegate queue also takes, held across the
+/// command: CoreBluetooth waiting on its own queue would deadlock. Calls that
+/// order against nothing queued stay on the calling thread: `updateValue:`
+/// (serialized against `power_down` by `pending_notifies`),
+/// `respondToRequest:withResult:`, and state reads.
+trait TurnQueue {
+    fn run(&self, turn: Box<dyn FnOnce() + Send>);
+}
+
+impl TurnQueue for DispatchQueue {
+    fn run(&self, turn: Box<dyn FnOnce() + Send>) {
+        self.exec_async(turn);
+    }
+}
+
+/// A request CoreBluetooth answers with a delegate callback. `turn` submits it
+/// on `queue`; the wait covers the time the turn spends queued.
+async fn request_in_turn<T: Send + 'static>(
+    queue: &impl TurnQueue,
+    turn: impl FnOnce(Answer<T>) -> Turn + Send + 'static,
+    timed_out: impl FnOnce() -> BlewError,
+) -> BlewResult<T> {
+    let (answer, rx) = answer_channel();
+    queue.run(Box::new(move || {
+        let turn = turn(answer);
+        trace!(?turn, "manager turn");
+    }));
+    await_answer(rx, CALLBACK_TIMEOUT, timed_out).await
+}
+
+/// A command CoreBluetooth doesn't answer, issued in a turn on `queue`.
+/// Returns once it has been.
+async fn issue_in_turn(
+    queue: &impl TurnQueue,
+    command: impl FnOnce() + Send + 'static,
+) -> BlewResult<()> {
+    let (issued_tx, issued) = oneshot::channel();
+    queue.run(Box::new(move || {
+        command();
+        let _ = issued_tx.send(());
+    }));
+    issued
+        .await
+        .map_err(|_| BlewError::Internal("the manager queue dropped a turn".into()))
+}
 
 pub struct ApplePeripheral(Arc<PeripheralHandle>);
 
@@ -786,6 +955,7 @@ impl ApplePeripheral {
         let handle = Arc::new(PeripheralHandle {
             manager,
             _delegate: delegate,
+            queue,
             inner,
         });
         Ok(ApplePeripheral(handle))
@@ -818,7 +988,7 @@ impl PeripheralBackend for ApplePeripheral {
         let service = service.clone();
         async move {
             debug!(service_uuid = %service.uuid, characteristics = service.characteristics.len(), "adding GATT service");
-            let rx = {
+            let (cb_service, char_map) = {
                 let svc_uuid = uuid_to_cbuuid(service.uuid);
                 let cb_service = unsafe {
                     CBMutableService::initWithType_primary(
@@ -863,24 +1033,31 @@ impl PeripheralBackend for ApplePeripheral {
                 let char_array = NSArray::from_slice(&retained_refs);
                 unsafe { cb_service.setCharacteristics(Some(&char_array)) };
 
-                {
-                    let mut lock = handle.inner.chars.lock();
-                    lock.extend(char_map);
-                }
-                let (tx, rx) = oneshot::channel();
-                {
-                    let mut lock = handle.inner.add_svc_tx.lock();
-                    lock.insert(service.uuid, tx);
-                }
-
-                unsafe { handle.manager.addService(&cb_service) };
-                rx
-                // All ObjC objects drop here, before .await
+                (ObjcSend(cb_service), char_map)
             };
-
-            rx.await.unwrap_or(Err(BlewError::Internal(
-                "add_service channel dropped".into(),
-            )))
+            let (h, key) = (Arc::clone(&handle), service.uuid);
+            request_in_turn(
+                &*handle.queue,
+                move |answer| {
+                    submit(
+                        &h.inner.add_svc,
+                        powered_on(&h.manager),
+                        key,
+                        char_map,
+                        answer,
+                        || BlewError::Peripheral {
+                            source: "an earlier add_service for this service is still waiting \
+                                     on CoreBluetooth to report it added"
+                                .into(),
+                        },
+                        || unsafe { h.manager.addService(&cb_service) },
+                    )
+                },
+                || BlewError::Peripheral {
+                    source: "CoreBluetooth never reported the GATT service added".into(),
+                },
+            )
+            .await
         }
     }
 
@@ -895,8 +1072,7 @@ impl PeripheralBackend for ApplePeripheral {
                 return Err(BlewError::AlreadyAdvertising);
             }
             debug!(local_name = ?config.local_name, "starting advertising");
-
-            let rx = {
+            let adv_data = {
                 let local_name = config.local_name.name().map(NSString::from_str);
 
                 let service_uuids: Vec<Retained<CBUUID>> = config
@@ -913,17 +1089,28 @@ impl PeripheralBackend for ApplePeripheral {
                     values.push(local_name);
                 }
 
-                let adv_data = NSDictionary::from_slices(&keys, &values);
-
-                let (tx, rx) = oneshot::channel();
-                *handle.inner.adv_tx.lock() = Some(tx);
-                unsafe { handle.manager.startAdvertising(Some(&adv_data)) };
-                rx
+                ObjcSend(NSDictionary::from_slices(&keys, &values))
             };
-
-            rx.await.unwrap_or(Err(BlewError::Internal(
-                "start_advertising channel dropped".into(),
-            )))
+            let h = Arc::clone(&handle);
+            request_in_turn(
+                &*handle.queue,
+                move |answer| {
+                    submit(
+                        &h.inner.adv,
+                        powered_on(&h.manager),
+                        (),
+                        (),
+                        answer,
+                        // A start still owed its answer is advertising, or about to be.
+                        || BlewError::AlreadyAdvertising,
+                        || unsafe { h.manager.startAdvertising(Some(&adv_data)) },
+                    )
+                },
+                || BlewError::Peripheral {
+                    source: "CoreBluetooth never reported whether advertising started".into(),
+                },
+            )
+            .await
         }
     }
 
@@ -931,8 +1118,11 @@ impl PeripheralBackend for ApplePeripheral {
         let handle = Arc::clone(&self.0);
         async move {
             debug!("stopping advertising");
-            unsafe { handle.manager.stopAdvertising() };
-            Ok(())
+            let h = Arc::clone(&handle);
+            issue_in_turn(&*handle.queue, move || unsafe {
+                h.manager.stopAdvertising();
+            })
+            .await
         }
     }
 
@@ -991,15 +1181,33 @@ impl PeripheralBackend for ApplePeripheral {
             let encrypted = publish_encryption_flag(encryption)?;
             debug!(%encryption, "publishing L2CAP CoC channel");
             let (ch_tx, ch_rx) = mpsc::unbounded_channel::<BlewResult<(DeviceId, L2capChannel)>>();
-            let (pub_tx, pub_rx) = oneshot::channel::<BlewResult<Psm>>();
-            {
-                *handle.inner.l2cap_channel_tx.lock() = Some(ch_tx);
-                *handle.inner.l2cap_publish_tx.lock() = Some(pub_tx);
-                unsafe { handle.manager.publishL2CAPChannelWithEncryption(encrypted) };
-            }
-            let psm = pub_rx.await.unwrap_or(Err(BlewError::Internal(
-                "l2cap_publish channel dropped".into(),
-            )))?;
+            let h = Arc::clone(&handle);
+            let psm = request_in_turn(
+                &*handle.queue,
+                move |answer| {
+                    submit(
+                        &h.inner.l2cap_publish,
+                        powered_on(&h.manager),
+                        (),
+                        (),
+                        answer,
+                        || BlewError::L2cap {
+                            source: "an earlier l2cap_listener is still waiting on \
+                                     CoreBluetooth to report its channel published"
+                                .into(),
+                        },
+                        || {
+                            // In the publish's turn, so no power-down lands between them.
+                            *h.inner.l2cap_channel_tx.lock() = Some(ch_tx);
+                            unsafe { h.manager.publishL2CAPChannelWithEncryption(encrypted) };
+                        },
+                    )
+                },
+                || BlewError::L2cap {
+                    source: "CoreBluetooth never reported the L2CAP channel published".into(),
+                },
+            )
+            .await?;
             debug!(psm = psm.0, "L2CAP listener ready");
             Ok((psm, UnboundedReceiverStream::new(ch_rx)))
         }
@@ -1032,6 +1240,241 @@ impl ApplePeripheral {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::callback_slots::Turn;
+
+    const SVC: Uuid = Uuid::from_u128(0x1111);
+    const CHR: Uuid = Uuid::from_u128(0x2222);
+
+    /// A characteristic as `add_service` builds one. Allocating it needs no
+    /// manager, radio, or Bluetooth permission.
+    fn char_map() -> CharMap {
+        let cb_uuid = uuid_to_cbuuid(CHR);
+        let ch = unsafe {
+            CBMutableCharacteristic::initWithType_properties_value_permissions(
+                CBMutableCharacteristic::alloc(),
+                &cb_uuid,
+                CBCharacteristicProperties::Notify,
+                None,
+                CBAttributePermissions::Readable,
+            )
+        };
+        HashMap::from([(CHR, ObjcSend(ch))])
+    }
+
+    fn published(inner: &PeripheralInner) -> bool {
+        inner.chars.lock().contains_key(&CHR)
+    }
+
+    fn busy() -> BlewError {
+        BlewError::Peripheral {
+            source: "busy".into(),
+        }
+    }
+
+    /// An `add_service` turn with the adapter on and no manager to issue to.
+    fn add_turn(inner: &PeripheralInner) -> (Turn, oneshot::Receiver<BlewResult<()>>) {
+        let (answer, rx) = answer_channel();
+        let turn = submit(&inner.add_svc, true, SVC, char_map(), answer, busy, || {});
+        (turn, rx)
+    }
+
+    /// A `start_advertising` or `l2cap_listener` turn, likewise.
+    fn slot_turn<T>(
+        slots: &Mutex<CallbackSlots<(), (), T>>,
+    ) -> (Turn, oneshot::Receiver<BlewResult<T>>) {
+        let (answer, rx) = answer_channel();
+        let turn = submit(slots, true, (), (), answer, busy, || {});
+        (turn, rx)
+    }
+
+    #[tokio::test]
+    async fn a_service_joins_chars_only_once_added() {
+        let (inner, _) = PeripheralInner::new();
+        let (_, mut rx) = add_turn(&inner);
+        assert!(
+            !published(&inner),
+            "not before CoreBluetooth has the service"
+        );
+
+        inner.service_added(SVC, None);
+
+        assert!(rx.try_recv().unwrap().is_ok());
+        assert!(published(&inner));
+    }
+
+    #[tokio::test]
+    async fn a_rejected_service_leaves_nothing_to_notify_on() {
+        let (inner, _) = PeripheralInner::new();
+        let (_, mut rx) = add_turn(&inner);
+
+        inner.service_added(SVC, Some("refused".into()));
+
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Err(BlewError::Internal(_))
+        ));
+        assert!(!published(&inner));
+    }
+
+    #[tokio::test]
+    async fn a_retry_waits_for_the_answer_the_first_attempt_is_owed() {
+        let (inner, _) = PeripheralInner::new();
+        let (_, abandoned) = add_turn(&inner);
+        drop(abandoned);
+
+        assert_eq!(add_turn(&inner).0, Turn::Busy);
+
+        // The late answer is consumed by the attempt it answers. The service
+        // is in the database, so its characteristics are published anyway.
+        inner.service_added(SVC, None);
+        assert!(published(&inner));
+        assert_eq!(add_turn(&inner).0, Turn::Issued);
+    }
+
+    #[tokio::test]
+    async fn a_power_off_fails_every_waiter_and_keeps_the_database() {
+        let (inner, _) = PeripheralInner::new();
+        inner.chars.lock().extend(char_map());
+        let (_, mut add) = add_turn(&inner);
+        let (_, mut adv) = slot_turn(&inner.adv);
+        let (_, mut publish) = slot_turn(&inner.l2cap_publish);
+        let (ch_tx, mut accepts) = mpsc::unbounded_channel();
+        *inner.l2cap_channel_tx.lock() = Some(ch_tx);
+        let (done, mut notify) = oneshot::channel();
+        inner.pending_notifies.lock().push_back(PendingNotify {
+            device_id: DeviceId::from("central"),
+            char_uuid: CHR,
+            value: vec![1],
+            done,
+        });
+
+        inner.power_down(CBManagerState::PoweredOff);
+
+        assert!(matches!(
+            add.try_recv().unwrap(),
+            Err(BlewError::NotPowered)
+        ));
+        assert!(matches!(
+            adv.try_recv().unwrap(),
+            Err(BlewError::NotPowered)
+        ));
+        assert!(matches!(
+            publish.try_recv().unwrap(),
+            Err(BlewError::NotPowered)
+        ));
+        assert!(matches!(
+            notify.try_recv().unwrap(),
+            Err(BlewError::NotPowered)
+        ));
+        assert!(inner.pending_notifies.lock().is_empty());
+        // The accept stream says why, then ends.
+        assert!(matches!(
+            accepts.recv().await,
+            Some(Err(BlewError::NotPowered))
+        ));
+        assert!(accepts.recv().await.is_none());
+
+        // Every slot is free for the requests an application makes next.
+        assert_eq!(add_turn(&inner).0, Turn::Issued);
+        assert_eq!(slot_turn(&inner.adv).0, Turn::Issued);
+        assert_eq!(slot_turn(&inner.l2cap_publish).0, Turn::Issued);
+
+        // Following the header; see `power_down`.
+        assert!(published(&inner));
+    }
+
+    #[tokio::test]
+    async fn a_reset_also_clears_the_database() {
+        for state in [
+            CBManagerState::Resetting,
+            CBManagerState::Unauthorized,
+            CBManagerState::Unsupported,
+            CBManagerState::Unknown,
+        ] {
+            let (inner, _) = PeripheralInner::new();
+            inner.chars.lock().extend(char_map());
+
+            inner.power_down(state);
+
+            assert!(!published(&inner), "state {}", state.0);
+        }
+    }
+
+    /// Pins the residual noted in `util::callback_slots`.
+    #[tokio::test]
+    async fn an_answer_after_a_power_down_is_unclaimed() {
+        let (inner, _) = PeripheralInner::new();
+        let (_, _rx) = add_turn(&inner);
+        inner.power_down(CBManagerState::PoweredOff);
+
+        inner.service_added(SVC, None);
+
+        assert!(!published(&inner));
+    }
+
+    /// A manager queue whose turns run only when told to.
+    #[derive(Default)]
+    struct FakeQueue(Mutex<VecDeque<Box<dyn FnOnce() + Send>>>);
+
+    impl TurnQueue for FakeQueue {
+        fn run(&self, turn: Box<dyn FnOnce() + Send>) {
+            self.0.lock().push_back(turn);
+        }
+    }
+
+    impl FakeQueue {
+        fn run_all(&self) {
+            loop {
+                let next = self.0.lock().pop_front();
+                let Some(turn) = next else { break };
+                turn();
+            }
+        }
+    }
+
+    /// See [`TurnQueue`]. Drives the production scheduling, `request_in_turn`
+    /// and `issue_in_turn`, with the manager's commands recorded instead.
+    #[tokio::test]
+    async fn a_stop_waits_for_a_start_queued_before_it() {
+        let (inner, _) = PeripheralInner::new();
+        let queue = Arc::new(FakeQueue::default());
+        let platform = Arc::new(Mutex::new(Vec::new()));
+
+        let start = tokio::spawn({
+            let (queue, inner, platform) = (queue.clone(), inner.clone(), platform.clone());
+            async move {
+                request_in_turn(
+                    &*queue,
+                    move |answer| {
+                        submit(&inner.adv, true, (), (), answer, busy, move || {
+                            platform.lock().push("start");
+                        })
+                    },
+                    busy,
+                )
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        let stop = tokio::spawn({
+            let (queue, platform) = (queue.clone(), platform.clone());
+            async move { issue_in_turn(&*queue, move || platform.lock().push("stop")).await }
+        });
+        tokio::task::yield_now().await;
+
+        assert!(
+            platform.lock().is_empty(),
+            "nothing is issued before its turn"
+        );
+        assert!(!stop.is_finished(), "stop returns only once it is issued");
+
+        queue.run_all();
+
+        stop.await.unwrap().unwrap();
+        assert_eq!(*platform.lock(), ["start", "stop"], "and so ends stopped");
+        assert!(inner.adv.lock().take(&()).unwrap().answer(Ok(())));
+        start.await.unwrap().unwrap();
+    }
 
     #[test]
     fn encryption_maps_to_the_publish_flag() {
