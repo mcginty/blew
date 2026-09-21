@@ -165,6 +165,38 @@ rx.await...
 
 **RAII responders:** `peripheralManager:didReceiveReadRequest:` and `didReceiveWriteRequests:` build a `ReadResponder`/`WriteResponder` (backed by an `oneshot::Sender`), emit a `PeripheralRequest` on the `mpsc::UnboundedSender` handed out by `take_requests()`, then spawn a task (via `inner.runtime.spawn()`) that awaits the oneshot and calls `respondToRequest:withResult:`. The spawn uses the captured `Handle` because GCD callbacks run outside the Tokio runtime context — bare `tokio::spawn` would panic. All Rust-side synchronization uses `parking_lot::Mutex` (poison-free, faster than `std::sync::Mutex`).
 
+**A power-down is cleaned up before it is reported, to the depth CoreBluetooth
+documents.** `peripheralManagerDidUpdateState:` runs `PeripheralInner::power_down`
+before `AdapterStateChanged { powered: false }` goes out: every waiter fails with
+`NotPowered`, the `l2cap_listener` accept stream ends, and each subscribed
+central is reported unsubscribed. `CBPeripheralManager.h` separates two depths
+and the cleanup follows them exactly: any state below `PoweredOn` pauses
+advertising and disconnects every central, and only a state below `PoweredOff`
+also clears the local database. **Don't clear `chars` on a plain power-off** —
+CoreBluetooth keeps those services, and notifications on them would fail after
+power-on. `chars` also fills only from `didAddService:` on success, so a service
+CoreBluetooth rejected leaves nothing behind. `didUnsubscribeFromCharacteristic:`
+reports only a central it actually removed, since `power_down` has already
+reported the rest.
+
+**A waiter that gave up still owns its slot.** `add_service`, `start_advertising`
+and `l2cap_listener` wait on callbacks that identify their request by the
+service UUID at most. Each registers in a `util::callback_slots::CallbackSlots`,
+and the slot stays held after its caller times out, until CoreBluetooth's
+answer arrives or a power-down frees every slot at once; a request that finds
+its key held is refused. **Don't free a slot on timeout**: the late answer would
+then confirm the next request under the same key. Attribution by object identity
+(`didAddService:` passes a `CBService`) was not used because nothing here has
+verified that CoreBluetooth returns the instance it was given — and if it
+doesn't, every add would time out. Each call also registers *before* checking
+`PoweredOn`, so a power-down either fails the registration or is seen by the
+check; CoreBluetooth ignores a command issued while off and never answers it,
+which would otherwise hold the slot until the next power-down. Residual,
+unverified either way: freeing slots on power-down assumes CoreBluetooth never
+answers a request from before the power-down once the adapter is back on and a
+new request holds the same key. If it ever did, that answer would confirm the
+new request, and without an identity there is nothing to check it against.
+
 **L2CAP reactor** (`platform/apple/l2cap.rs`): one dedicated OS thread owns an `NSRunLoop` and all `NSInputStream`/`NSOutputStream` objects. Channels register via `ReactorCmd::Register`, close via `ReactorCmd::Close`; there is no write command — each channel carries a bounded `outbound_rx` the reactor drains itself, so backpressure lands on the caller's `write()` instead of in a queue. Bytes flow Reactor→App through a bounded `mpsc::Sender<Vec<u8>>`, App→Reactor through a `tokio::io::duplex` + outbound bridge task. No per-channel threads. The loop is event-driven: each channel's streams carry an `NSStreamDelegate` that marks the channel in a shared `ReadySet`, and `pump_channels` services only marked channels plus any that are lingering. The 1s `acceptInputForMode:beforeDate:` timeout is a backstop against a missed wakeup, not the service interval.
 
 **L2CAP reactor wakeup rules.** Two things give a channel work and only one of them is visible to the run loop, so both bridge tasks must mark *and* `wake_reactor()`:
