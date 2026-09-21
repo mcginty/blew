@@ -10,6 +10,8 @@ use crate::peripheral::types::{
 use crate::platform::linux::l2cap::{apply_security, bridge_l2cap};
 use crate::types::DeviceId;
 use crate::util::BroadcastEventStream;
+use crate::util::published::Published;
+use crate::util::service_queue::queue_service;
 use bluer::adv::{Advertisement, SecondaryChannel, Type as AdvType};
 use bluer::gatt::local::{
     Application, ApplicationHandle, Characteristic, CharacteristicControlHandle,
@@ -20,7 +22,7 @@ use bluer::gatt::local::{
 use bluer::{Adapter, Session};
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex;
 use tokio::sync::{broadcast, mpsc};
@@ -44,18 +46,88 @@ const INDICATION_PROBE: std::time::Duration = std::time::Duration::from_secs(1);
 /// one indication is ever outstanding.
 const INDICATION_WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(35);
 
+/// What `start_advertising` has published; see [`util::published`](crate::util::published).
+type PublishedHandles = Published<bluer::adv::AdvertisementHandle, ApplicationHandle>;
+
 struct PeripheralInner {
     _session: Session,
     adapter: Adapter,
     pending_services: Mutex<Vec<GattService>>,
-    adv_handle: Mutex<Option<bluer::adv::AdvertisementHandle>>,
-    app_handle: Mutex<Option<ApplicationHandle>>,
+    published: Mutex<PublishedHandles>,
     notifiers: Mutex<HashMap<Uuid, Vec<SharedNotifier>>>,
     request_tx: mpsc::UnboundedSender<PeripheralRequest>,
     request_rx: Mutex<Option<mpsc::UnboundedReceiver<PeripheralRequest>>>,
     state_tx: broadcast::Sender<PeripheralStateEvent>,
     l2cap_encryption: Mutex<L2capEncryption>,
-    _adapter_task: tokio::task::JoinHandle<()>,
+    adapter_task: tokio::task::JoinHandle<()>,
+}
+
+impl PeripheralInner {
+    /// Drop the published GATT application and advertisement, and the notify
+    /// sessions that belonged to them. `pending_services` is left alone, so the
+    /// next `start_advertising` serves the same services again.
+    fn unpublish(&self) {
+        // Taken under the lock, dropped -- unregistering them -- after it.
+        let taken = self.published.lock().unpublish();
+        drop(taken);
+        self.notifiers.lock().clear();
+    }
+
+    /// The adapter powered off, taking the advertisement and GATT application
+    /// with it. Also fails any `start_advertising` still waiting on BlueZ.
+    fn power_lost(&self) {
+        // Retiring the generation and taking the handles must be one lock
+        // acquisition. Split, a start that began between them captures the
+        // new generation, stores its GATT application, and then loses it to
+        // the take while its advertisement still goes up: advertising a
+        // peripheral with no services behind it.
+        let taken = self.published.lock().power_lost();
+        drop(taken);
+        self.notifiers.lock().clear();
+    }
+}
+
+impl Drop for PeripheralInner {
+    fn drop(&mut self) {
+        // The watcher holds only a `Weak`, so it can't keep this alive, but
+        // dropping a `JoinHandle` doesn't stop the task: without this it would
+        // run on until BlueZ ended the adapter's event stream.
+        self.adapter_task.abort();
+    }
+}
+
+/// Relay the adapter's power state, dropping what a power-off took with it
+/// *before* the event goes out.
+///
+/// The adapter takes the advertisement and GATT application down with it, but
+/// the handles blew holds say otherwise; see [`Published`]. Cleaning up first
+/// means a handler that reacts to the event finds the peripheral ready to
+/// advertise.
+async fn watch_adapter(
+    adapter: Adapter,
+    inner: Weak<PeripheralInner>,
+    state_tx: broadcast::Sender<PeripheralStateEvent>,
+) {
+    use tokio_stream::StreamExt as _;
+    let Ok(events) = adapter.events().await else {
+        warn!("failed to subscribe to adapter events");
+        return;
+    };
+    let mut events = Box::pin(events);
+    while let Some(event) = events.next().await {
+        if let bluer::AdapterEvent::PropertyChanged(bluer::AdapterProperty::Powered(powered)) =
+            event
+        {
+            debug!(powered, "peripheral adapter state changed");
+            // A failed upgrade means nothing is published to drop: the
+            // peripheral is still being constructed, or is being dropped along
+            // with its handles (and `Drop` aborts this task).
+            if !powered && let Some(inner) = inner.upgrade() {
+                inner.power_lost();
+            }
+            let _ = state_tx.send(PeripheralStateEvent::AdapterStateChanged { powered });
+        }
+    }
 }
 
 pub struct LinuxPeripheral(Arc<PeripheralInner>);
@@ -438,38 +510,24 @@ impl PeripheralBackend for LinuxPeripheral {
         debug!(adapter = %adapter.name(), "BLE adapter initialized");
         let (request_tx, request_rx) = mpsc::unbounded_channel();
         let (state_tx, _) = broadcast::channel(256);
-        let state_tx_clone = state_tx.clone();
-        let adapter_clone = adapter.clone();
-        let adapter_task = tokio::spawn(async move {
-            use tokio_stream::StreamExt as _;
-            let Ok(events) = adapter_clone.events().await else {
-                warn!("failed to subscribe to adapter events");
-                return;
-            };
-            let mut events = Box::pin(events);
-            while let Some(event) = events.next().await {
-                if let bluer::AdapterEvent::PropertyChanged(bluer::AdapterProperty::Powered(
-                    powered,
-                )) = event
-                {
-                    debug!(powered, "peripheral adapter state changed");
-                    let _ =
-                        state_tx_clone.send(PeripheralStateEvent::AdapterStateChanged { powered });
-                }
+        Ok(LinuxPeripheral(Arc::new_cyclic(|inner| {
+            let adapter_task = tokio::spawn(watch_adapter(
+                adapter.clone(),
+                inner.clone(),
+                state_tx.clone(),
+            ));
+            PeripheralInner {
+                _session: session,
+                adapter,
+                pending_services: Mutex::new(Vec::new()),
+                published: Mutex::new(PublishedHandles::default()),
+                notifiers: Mutex::new(HashMap::new()),
+                request_tx,
+                request_rx: Mutex::new(Some(request_rx)),
+                state_tx,
+                l2cap_encryption: Mutex::new(L2capEncryption::default()),
+                adapter_task,
             }
-        });
-        Ok(LinuxPeripheral(Arc::new(PeripheralInner {
-            _session: session,
-            adapter,
-            pending_services: Mutex::new(Vec::new()),
-            adv_handle: Mutex::new(None),
-            app_handle: Mutex::new(None),
-            notifiers: Mutex::new(HashMap::new()),
-            request_tx,
-            request_rx: Mutex::new(Some(request_rx)),
-            state_tx,
-            l2cap_encryption: Mutex::new(L2capEncryption::default()),
-            _adapter_task: adapter_task,
         })))
     }
 
@@ -491,7 +549,7 @@ impl PeripheralBackend for LinuxPeripheral {
         let service = service.clone();
         async move {
             debug!(service_uuid = %service.uuid, characteristics = service.characteristics.len(), "queuing GATT service");
-            handle.pending_services.lock().push(service);
+            queue_service(&mut handle.pending_services.lock(), service);
             Ok(())
         }
     }
@@ -503,9 +561,11 @@ impl PeripheralBackend for LinuxPeripheral {
         let handle = Arc::clone(&self.0);
         let config = config.clone();
         async move {
-            if handle.adv_handle.lock().is_some() {
-                return Err(BlewError::AlreadyAdvertising);
-            }
+            let power_generation = handle
+                .published
+                .lock()
+                .begin_start()
+                .ok_or(BlewError::AlreadyAdvertising)?;
             debug!(local_name = ?config.local_name, "starting advertising");
 
             let pending: Vec<GattService> = handle.pending_services.lock().clone();
@@ -539,7 +599,15 @@ impl PeripheralBackend for LinuxPeripheral {
                 .map_err(|e| BlewError::Peripheral {
                     source: Box::new(e),
                 })?;
-            *handle.app_handle.lock() = Some(app_handle);
+            // A handle published before a power-off names nothing BlueZ still
+            // has; dropping it rather than storing it is what keeps a later
+            // start from being refused. The store returns it, so it is dropped
+            // -- unregistering it -- after the lock is released.
+            let stored = handle
+                .published
+                .lock()
+                .store_app(power_generation, app_handle);
+            stored.map_err(|_stale| BlewError::NotPowered)?;
 
             // Prefer BLE 5 extended advertising with a 2M secondary channel so
             // that BLE 5 centrals can connect at 2M PHY from the start.
@@ -574,7 +642,11 @@ impl PeripheralBackend for LinuxPeripheral {
                     h
                 }
             };
-            *handle.adv_handle.lock() = Some(adv_handle);
+            let stored = handle
+                .published
+                .lock()
+                .store_adv(power_generation, adv_handle);
+            stored.map_err(|_stale| BlewError::NotPowered)?;
 
             Ok(())
         }
@@ -584,9 +656,7 @@ impl PeripheralBackend for LinuxPeripheral {
         let handle = Arc::clone(&self.0);
         async move {
             debug!("stopping advertising");
-            handle.adv_handle.lock().take();
-            handle.app_handle.lock().take();
-            handle.notifiers.lock().clear();
+            handle.unpublish();
             Ok(())
         }
     }

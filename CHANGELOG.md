@@ -114,6 +114,27 @@ All notable changes to `blew` are documented here. Format follows
   service's characteristics are only used for notifications once
   CoreBluetooth confirms the service, so one it rejected no longer leaves
   them behind.
+- **Linux: advertising again after a Bluetooth power cycle works, and re-adding
+  a service no longer serves it twice.**
+  ([#46](https://github.com/mcginty/blew/issues/46)) Powering the adapter off
+  takes the advertisement and GATT application down with it, but the
+  peripheral kept its handles to both, and `start_advertising` refuses while
+  it holds one: an application answering `AdapterStateChanged { powered: true }`
+  by advertising again got `AlreadyAdvertising` for the life of the process,
+  with nothing on air. The peripheral now drops both handles and its notify
+  sessions when the adapter powers off, before it reports the event, so a
+  handler reacting to it finds the peripheral ready to advertise. A
+  `start_advertising` still waiting on BlueZ when the power goes fails with
+  `BlewError::NotPowered` instead of keeping what it published.
+
+  `add_service` now replaces a queued service with the same UUID, in place,
+  instead of queueing a second copy. Linux's `add_service` never reaches
+  BlueZ — the queue is served as one application on each `start_advertising`
+  — and nothing removes from it, so an application that re-added its services
+  after a power cycle, which Android requires, served every one of them twice,
+  and once more per cycle. This holds whether or not the adapter cycled. The
+  queue itself survives a power-off, so an application that doesn't re-add
+  gets the same services back on its next `start_advertising`.
 - **Linux: an indication to a central that walked away no longer stalls sends
   for 35 s.** ([#41](https://github.com/mcginty/blew/issues/41)) A bonded
   central keeps its subscription when it disconnects, and BlueZ drops values

@@ -402,6 +402,46 @@ Residual, and not fixable from here: an absent bonded subscriber while some
 carries no device identity, so blew cannot tell which devices subscribed to the
 characteristic.
 
+**A power-off must drop the published handles before the event goes out.**
+BlueZ takes the advertisement and GATT application down with the adapter, but
+`start_advertising` refuses while `Published::adv` is set, so a handle kept
+across the cycle refuses every later start with `AlreadyAdvertising` and
+nothing on air (#46). `watch_adapter` calls `PeripheralInner::power_lost`
+*before* sending `AdapterStateChanged { powered: false }`, so a handler that
+reacts by advertising again finds the peripheral ready. The watcher holds a
+`Weak`, never an `Arc` — a strong reference would keep the peripheral alive
+for as long as the adapter's event stream runs — and `PeripheralInner`'s
+`Drop` aborts it, since dropping a `JoinHandle` doesn't.
+
+`util::published::Published` keeps both handles and a `power_generation` under
+**one** lock, and every transition is one `&mut self` method, so a caller
+holding that lock can't see it half-done. `start_advertising` re-checks the
+generation as it stores each handle (`store_app` / `store_adv`): it awaits
+BlueZ twice between its first check and its last store, and a power-off landing
+in between would otherwise clear the handles and then watch the start store a
+fresh one to an advertisement that is already gone — the same wedge.
+
+The power-off side has the mirror-image rule: `Published::power_lost` retires
+the generation **and** takes both handles in the same call, and it is the only
+thing that can change the generation. Split across two lock acquisitions (as
+first written, and caught in review on #48), a start that began between them
+captures the *new* generation, stores its GATT application, and then loses it
+to the take — while its advertisement still goes up, so the peripheral
+advertises with no services behind it. Taken and refused handles are handed
+back and dropped after the lock is released, since dropping one unregisters
+it over D-Bus. **Don't split the handles back into separate mutexes, don't
+store one without the check, and don't add a way to bump the generation that
+doesn't take the handles with it.** `util::published` is generic over the
+handle types so its tests run on every host without bluer.
+
+**`add_service` replaces a queued service by UUID; it never appends a
+duplicate.** It never reaches BlueZ: `pending_services` is served whole as one
+`Application` on each `start_advertising`, and nothing removes from it (#34),
+so an append would serve a re-added service once per call. The logic lives in
+`util::service_queue` so it runs on every host. `pending_services` is
+deliberately **not** cleared on power-off: with replacement, an application
+that re-adds converges, and one that doesn't keeps its services.
+
 ## Android backend design (`platform/android/`)
 
 Uses `jni 0.22` and `ndk-context 0.1`. The Android BLE API is Java/Kotlin-only, so the backend bridges Rust ↔ Kotlin via JNI.
