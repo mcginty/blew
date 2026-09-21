@@ -12,13 +12,13 @@
 //! So a slot is held from registration until the callback that answers it
 //! arrives, whether or not anyone is still waiting, and a request that finds
 //! its key held is refused rather than queued or allowed to replace it. The
-//! only other way out is [`CallbackSlots::drain`], for when the platform drops
+//! only other way out is `CallbackSlots::drain`, for when the platform drops
 //! every outstanding request at once (CoreBluetooth leaving `PoweredOn`). That
 //! assumes, unverified, that no request from before the drain is answered once
 //! a newer one holds its key: with no identity to check, the answer would be
 //! taken as the newer one's.
 //!
-//! [`submit`], `take` and `drain` on one set of slots must all run on one
+//! `submit`, `take` and `drain` on one set of slots must all run on one
 //! serial queue; the lock makes the slots shareable, not ordered.
 
 use std::collections::HashMap;

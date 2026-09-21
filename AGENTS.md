@@ -167,10 +167,11 @@ rx.await...
 
 **Apple peripheral power cycles and callback waiters.** The reasons live in the
 code; these are the rules.
-- **A power-down is cleaned up before it is reported, to the depth CoreBluetooth
-  documents**: below `PoweredOn` waiters fail, the accept stream ends and
-  subscribers are reported gone; only below `PoweredOff` does `chars` go.
-  **Don't clear `chars` on a plain power-off.** See `PeripheralInner::power_down`.
+- **A power-down is cleaned up before it is reported**: below `PoweredOn`
+  waiters fail, the accept stream ends and subscribers are reported gone.
+  `chars` goes only below `PoweredOff`, following the SDK header, which Apple's
+  online docs contradict; unconfirmed on a device. Read
+  `PeripheralInner::power_down` before changing it either way.
 - **A waiter that gave up keeps its slot** until its own callback or a
   power-down, and a request for a held key is refused. **Don't free a slot on
   timeout.** See `util::callback_slots`, which also records the residual.

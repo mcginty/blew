@@ -251,13 +251,28 @@ impl PeripheralInner {
     }
 
     /// Drop what a state below `PoweredOn` invalidates, before the adapter
-    /// event goes out.
+    /// event goes out: every central disconnects, so waiters fail and
+    /// subscribers go.
     ///
-    /// `CBPeripheralManager.h` documents two depths: below `PoweredOn`
-    /// advertising pauses and every central disconnects; only below
-    /// `PoweredOff` is the local database cleared. `chars` mirrors that
-    /// database, so it goes only then -- clearing it on a plain power-off
-    /// would fail notifications on services CoreBluetooth kept.
+    /// Whether `chars` goes too depends on whether CoreBluetooth kept its local
+    /// database, and Apple's two sources disagree. The SDK header
+    /// (`CBPeripheralManager.h`, `peripheralManagerDidUpdateState:`, the same in
+    /// the macOS and iOS 27 SDKs) clears it only "if the state moves below
+    /// CBPeripheralManagerStatePoweredOff". The online page for
+    /// `peripheralManagerDidUpdateState(_:)` (updated 2026-08-29) says the
+    /// powered-off state itself clears it and all services must be re-added.
+    /// blew follows the header because the one field report does:
+    /// <https://stackoverflow.com/questions/37194937> (2016) saw `isAdvertising`
+    /// still YES after PoweredOff and back, and re-adding the service raise an
+    /// exception because it was already added. So `chars` goes only below
+    /// `PoweredOff`.
+    ///
+    /// If the online page is right, a plain power-off leaves `chars` holding
+    /// characteristics CoreBluetooth dropped. Their subscribers are gone and no
+    /// central can subscribe to a service CoreBluetooth no longer has, so a
+    /// notification on one reports `NoSubscriber` rather than hanging -- but an
+    /// application going by the header won't re-add, and the peripheral serves
+    /// nothing until it does. Unconfirmed on a device either way.
     fn power_down(&self, state: CBManagerState) {
         let database_cleared = state.0 < CBManagerState::PoweredOff.0;
 
@@ -1364,7 +1379,7 @@ mod tests {
         assert_eq!(slot_turn(&inner.adv).0, Turn::Issued);
         assert_eq!(slot_turn(&inner.l2cap_publish).0, Turn::Issued);
 
-        // CoreBluetooth keeps the local database across a power-off.
+        // Following the header; see `power_down`.
         assert!(published(&inner));
     }
 

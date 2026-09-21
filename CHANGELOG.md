@@ -87,10 +87,12 @@ All notable changes to `blew` are documented here. Format follows
   could too. Leaving `PoweredOn` now fails them with `BlewError::NotPowered`,
   ends the `l2cap_listener` accept stream so its consumer knows to publish
   again, and reports every subscribed central as unsubscribed, before
-  `AdapterStateChanged { powered: false }` goes out. A plain power-off keeps
-  CoreBluetooth's services, so notifications work again after power-on without
-  re-adding anything; below `PoweredOff` (`Resetting`, `Unauthorized`,
-  `Unsupported`) they are gone and must be added again.
+  `AdapterStateChanged { powered: false }` goes out. Following the SDK
+  header, blew assumes a plain power-off keeps CoreBluetooth's services, so
+  notifications work again after power-on without re-adding anything, and that
+  below `PoweredOff` (`Resetting`, `Unauthorized`, `Unsupported`) they are gone
+  and must be added again. Apple's online documentation says a plain power-off
+  clears them too; which is right hasn't been confirmed on a device.
 
   The three calls also give up after five seconds (`BlewError::Peripheral`, or
   `L2cap` for `l2cap_listener`), and fail with `NotPowered` straight away while
