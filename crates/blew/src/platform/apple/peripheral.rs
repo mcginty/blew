@@ -60,20 +60,18 @@ use crate::platform::apple::helpers::{
 use crate::platform::apple::l2cap::bridge_l2cap_channel;
 use crate::types::DeviceId;
 use crate::util::BroadcastEventStream;
-use crate::util::callback_slots::{CallbackSlots, answer_channel, await_answer, submit};
+use crate::util::callback_slots::{
+    Answer, CallbackSlots, Turn, answer_channel, await_answer, submit,
+};
 
-/// How long `add_service`, `start_advertising` and `l2cap_listener` wait for
-/// CoreBluetooth's answer. Each normally arrives within milliseconds; this only
-/// bounds one that never does. Giving up leaves the request's slot held until
-/// the answer does arrive -- see `util::callback_slots`.
+/// How long a [`request_in_turn`] waits for CoreBluetooth's answer, which
+/// normally takes milliseconds.
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Characteristics of one service, keyed by UUID, as `chars` holds them.
 type CharMap = HashMap<Uuid, ObjcSend<CBMutableCharacteristic>>;
 
-/// Whether CoreBluetooth will act on a command. It ignores one issued in any
-/// other state and never calls back, so issuing it would only wait out
-/// [`CALLBACK_TIMEOUT`].
+/// CoreBluetooth ignores a command issued in any other state and never answers it.
 fn powered_on(manager: &CBPeripheralManager) -> bool {
     let state = unsafe { manager.state() };
     state == CBManagerState::PoweredOn
@@ -252,17 +250,14 @@ impl PeripheralInner {
         let _ = self.state_tx.send(event);
     }
 
-    /// Drop what a state below `PoweredOn` invalidates. Runs before the
-    /// adapter event goes out, so an application reacting to it finds nothing
-    /// stale.
+    /// Drop what a state below `PoweredOn` invalidates, before the adapter
+    /// event goes out.
     ///
-    /// CoreBluetooth distinguishes two depths (`peripheralManagerDidUpdateState:`
-    /// in `CBPeripheralManager.h`): any state below `PoweredOn` pauses
-    /// advertising and disconnects every central, and one below `PoweredOff`
-    /// also clears the local database, so every service must be re-added.
-    /// `chars` mirrors that database, so it goes only in the second case;
-    /// clearing it on a plain power-off would fail notifications on the
-    /// services CoreBluetooth kept.
+    /// `CBPeripheralManager.h` documents two depths: below `PoweredOn`
+    /// advertising pauses and every central disconnects; only below
+    /// `PoweredOff` is the local database cleared. `chars` mirrors that
+    /// database, so it goes only then -- clearing it on a plain power-off
+    /// would fail notifications on services CoreBluetooth kept.
     fn power_down(&self, state: CBManagerState) {
         let database_cleared = state.0 < CBManagerState::PoweredOff.0;
 
@@ -279,15 +274,13 @@ impl PeripheralInner {
         for pending in publishes {
             pending.answer(Err(BlewError::NotPowered));
         }
-        // Whether a published PSM survives a power-off is undocumented. Ending
-        // the accept stream tells its consumer to publish again; left open, a
-        // PSM that didn't survive would have it wait for channels forever.
+        // Whether a PSM survives a power-off is undocumented; ending the stream
+        // tells its consumer to publish again rather than wait forever.
         if let Some(tx) = self.l2cap_channel_tx.lock().take() {
             let _ = tx.send(Err(BlewError::NotPowered));
         }
 
-        // Held throughout, in the documented order, so a notification can't
-        // queue behind a subscriber this is about to drop.
+        // Held throughout, so no notification queues behind a dropped subscriber.
         let lost: Vec<(DeviceId, Uuid)> = {
             let mut queue = self.pending_notifies.lock();
             for pending in queue.drain(..) {
@@ -325,9 +318,8 @@ impl PeripheralInner {
             Err(BlewError::Internal(e))
         } else {
             debug!(service_uuid = %svc_uuid, "GATT service added");
-            // Published before the caller is woken, so it can notify at once
-            // -- and even when it gave up waiting, since the service is in the
-            // database all the same.
+            // Before the caller wakes, so it can notify at once. Even if it gave
+            // up, the service is in the database.
             self.chars.lock().extend(chars);
             Ok(())
         };
@@ -562,8 +554,7 @@ define_class!(
                 }
                 removed
             };
-            // `power_down` reports every central it drops, so one CoreBluetooth
-            // reports afterwards has already been reported.
+            // `power_down` has already reported the rest.
             if removed {
                 inner.emit_state(PeripheralStateEvent::SubscriptionChanged {
                     client_id,
@@ -816,8 +807,7 @@ struct PeripheralHandle {
     manager: ObjcSend<CBPeripheralManager>,
     /// Held here so the CB manager's weak-ref delegate stays alive.
     _delegate: ObjcSend<PeripheralDelegate>,
-    /// The serial queue every delegate callback runs on. Requests that wait on
-    /// a callback take their turn here too; see `util::callback_slots::submit`.
+    /// The delegate's serial queue; see [`TurnQueue`].
     queue: DispatchRetained<DispatchQueue>,
     inner: Arc<PeripheralInner>,
 }
@@ -825,94 +815,58 @@ struct PeripheralHandle {
 unsafe impl Send for PeripheralHandle {}
 unsafe impl Sync for PeripheralHandle {}
 
-/// What starting and stopping advertising need from the manager and its queue.
-/// [`PeripheralHandle`] implements it; the tests implement it over a fake
-/// serial queue to check the order commands reach the platform in.
-trait Advertiser: Send + Sync + 'static {
-    type Data: Send + 'static;
-    fn is_advertising(&self) -> bool;
-    fn is_powered_on(&self) -> bool;
-    fn slots(&self) -> &Mutex<CallbackSlots<(), (), ()>>;
-    fn start(&self, data: &Self::Data);
-    fn stop(&self);
-    /// Run `turn` on the manager's serial queue.
-    fn queue_turn(&self, turn: Box<dyn FnOnce() + Send>);
-}
-
-impl Advertiser for PeripheralHandle {
-    type Data = ObjcSend<NSDictionary<NSString, AnyObject>>;
-
-    fn is_advertising(&self) -> bool {
-        unsafe { self.manager.isAdvertising() }
-    }
-
-    fn is_powered_on(&self) -> bool {
-        powered_on(&self.manager)
-    }
-
-    fn slots(&self) -> &Mutex<CallbackSlots<(), (), ()>> {
-        &self.inner.adv
-    }
-
-    fn start(&self, data: &Self::Data) {
-        unsafe { self.manager.startAdvertising(Some(&*data.0)) };
-    }
-
-    fn stop(&self) {
-        unsafe { self.manager.stopAdvertising() };
-    }
-
-    fn queue_turn(&self, turn: Box<dyn FnOnce() + Send>) {
-        self.queue.exec_async(turn);
-    }
-}
-
-async fn start_advertising_in_turn<A: Advertiser>(adv: Arc<A>, data: A::Data) -> BlewResult<()> {
-    if adv.is_advertising() {
-        return Err(BlewError::AlreadyAdvertising);
-    }
-    let (answer, rx) = answer_channel();
-    let turn_adv = Arc::clone(&adv);
-    adv.queue_turn(Box::new(move || {
-        let adv = turn_adv;
-        // A start still owed its answer, even one whose caller gave up
-        // waiting, is advertising or about to be as far as anyone can tell.
-        let turn = submit(
-            adv.slots(),
-            adv.is_powered_on(),
-            (),
-            (),
-            answer,
-            || BlewError::AlreadyAdvertising,
-            || adv.start(&data),
-        );
-        trace!(?turn, "start_advertising turn");
-    }));
-    await_answer(rx, CALLBACK_TIMEOUT, || BlewError::Peripheral {
-        source: "CoreBluetooth never reported whether advertising started".into(),
-    })
-    .await
-}
-
-/// Stop advertising in a turn of its own, returning once the stop has been
-/// issued.
+/// Where a turn runs: the manager's serial queue, which the delegate -- and so
+/// `power_down` -- runs on too.
 ///
-/// A start queues its turn and yields, so a stop issued from the calling
-/// thread could overtake one still waiting in the queue, and advertising would
-/// begin after this had returned. In the queue it runs after any start queued
-/// before it. The pending start is left alone: its own callback still answers
-/// it, and freeing its slot early would let that late answer reach a newer
-/// start.
-async fn stop_advertising_in_turn<A: Advertiser>(adv: Arc<A>) -> BlewResult<()> {
+/// A command whose order matters against a callback or another command is
+/// issued in a turn here, never from the calling thread. Otherwise a request
+/// can pass `submit`'s power check, lose its slot to `power_down`, and still
+/// issue its command after power returns, completing a newer request's wait;
+/// and a stop can overtake a start still waiting for its turn. Don't close
+/// those windows with a lock the delegate queue also takes, held across the
+/// command: CoreBluetooth waiting on its own queue would deadlock. Calls that
+/// order against nothing queued stay on the calling thread: `updateValue:`
+/// (serialized against `power_down` by `pending_notifies`),
+/// `respondToRequest:withResult:`, and state reads.
+trait TurnQueue {
+    fn run(&self, turn: Box<dyn FnOnce() + Send>);
+}
+
+impl TurnQueue for DispatchQueue {
+    fn run(&self, turn: Box<dyn FnOnce() + Send>) {
+        self.exec_async(turn);
+    }
+}
+
+/// A request CoreBluetooth answers with a delegate callback. `turn` submits it
+/// on `queue`; the wait covers the time the turn spends queued.
+async fn request_in_turn<T: Send + 'static>(
+    queue: &impl TurnQueue,
+    turn: impl FnOnce(Answer<T>) -> Turn + Send + 'static,
+    timed_out: impl FnOnce() -> BlewError,
+) -> BlewResult<T> {
+    let (answer, rx) = answer_channel();
+    queue.run(Box::new(move || {
+        let turn = turn(answer);
+        trace!(?turn, "manager turn");
+    }));
+    await_answer(rx, CALLBACK_TIMEOUT, timed_out).await
+}
+
+/// A command CoreBluetooth doesn't answer, issued in a turn on `queue`.
+/// Returns once it has been.
+async fn issue_in_turn(
+    queue: &impl TurnQueue,
+    command: impl FnOnce() + Send + 'static,
+) -> BlewResult<()> {
     let (issued_tx, issued) = oneshot::channel();
-    let turn_adv = Arc::clone(&adv);
-    adv.queue_turn(Box::new(move || {
-        turn_adv.stop();
+    queue.run(Box::new(move || {
+        command();
         let _ = issued_tx.send(());
     }));
-    issued.await.map_err(|_| {
-        BlewError::Internal("the manager queue dropped stop_advertising's turn".into())
-    })
+    issued
+        .await
+        .map_err(|_| BlewError::Internal("the manager queue dropped a turn".into()))
 }
 
 pub struct ApplePeripheral(Arc<PeripheralHandle>);
@@ -1019,8 +973,7 @@ impl PeripheralBackend for ApplePeripheral {
         let service = service.clone();
         async move {
             debug!(service_uuid = %service.uuid, characteristics = service.characteristics.len(), "adding GATT service");
-            let (answer, rx) = answer_channel();
-            {
+            let (cb_service, char_map) = {
                 let svc_uuid = uuid_to_cbuuid(service.uuid);
                 let cb_service = unsafe {
                     CBMutableService::initWithType_primary(
@@ -1065,15 +1018,13 @@ impl PeripheralBackend for ApplePeripheral {
                 let char_array = NSArray::from_slice(&retained_refs);
                 unsafe { cb_service.setCharacteristics(Some(&char_array)) };
 
-                // The turn owns the service, so nothing Retained crosses the
-                // await below. Its characteristics join `chars` from
-                // `didAddService:` once the service is in the database.
-                let cb_service = ObjcSend(cb_service);
-                let key = service.uuid;
-                let turn_handle = Arc::clone(&handle);
-                handle.queue.exec_async(move || {
-                    let h = turn_handle;
-                    let turn = submit(
+                (ObjcSend(cb_service), char_map)
+            };
+            let (h, key) = (Arc::clone(&handle), service.uuid);
+            request_in_turn(
+                &*handle.queue,
+                move |answer| {
+                    submit(
                         &h.inner.add_svc,
                         powered_on(&h.manager),
                         key,
@@ -1085,15 +1036,12 @@ impl PeripheralBackend for ApplePeripheral {
                                 .into(),
                         },
                         || unsafe { h.manager.addService(&cb_service) },
-                    );
-                    trace!(service_uuid = %key, ?turn, "add_service turn");
-                });
-                // All ObjC objects drop here, before .await
-            }
-
-            await_answer(rx, CALLBACK_TIMEOUT, || BlewError::Peripheral {
-                source: "CoreBluetooth never reported the GATT service added".into(),
-            })
+                    )
+                },
+                || BlewError::Peripheral {
+                    source: "CoreBluetooth never reported the GATT service added".into(),
+                },
+            )
             .await
         }
     }
@@ -1105,6 +1053,9 @@ impl PeripheralBackend for ApplePeripheral {
         let handle = Arc::clone(&self.0);
         let config = config.clone();
         async move {
+            if unsafe { handle.manager.isAdvertising() } {
+                return Err(BlewError::AlreadyAdvertising);
+            }
             debug!(local_name = ?config.local_name, "starting advertising");
             let adv_data = {
                 let local_name = config.local_name.name().map(NSString::from_str);
@@ -1123,10 +1074,28 @@ impl PeripheralBackend for ApplePeripheral {
                     values.push(local_name);
                 }
 
-                // Every ObjC temporary but the dictionary drops here.
                 ObjcSend(NSDictionary::from_slices(&keys, &values))
             };
-            start_advertising_in_turn(handle, adv_data).await
+            let h = Arc::clone(&handle);
+            request_in_turn(
+                &*handle.queue,
+                move |answer| {
+                    submit(
+                        &h.inner.adv,
+                        powered_on(&h.manager),
+                        (),
+                        (),
+                        answer,
+                        // A start still owed its answer is advertising, or about to be.
+                        || BlewError::AlreadyAdvertising,
+                        || unsafe { h.manager.startAdvertising(Some(&adv_data)) },
+                    )
+                },
+                || BlewError::Peripheral {
+                    source: "CoreBluetooth never reported whether advertising started".into(),
+                },
+            )
+            .await
         }
     }
 
@@ -1134,7 +1103,11 @@ impl PeripheralBackend for ApplePeripheral {
         let handle = Arc::clone(&self.0);
         async move {
             debug!("stopping advertising");
-            stop_advertising_in_turn(handle).await
+            let h = Arc::clone(&handle);
+            issue_in_turn(&*handle.queue, move || unsafe {
+                h.manager.stopAdvertising();
+            })
+            .await
         }
     }
 
@@ -1192,35 +1165,33 @@ impl PeripheralBackend for ApplePeripheral {
             let encryption = handle.inner.l2cap_config.lock().encryption;
             let encrypted = publish_encryption_flag(encryption)?;
             debug!(%encryption, "publishing L2CAP CoC channel");
-            let (answer, pub_rx) = answer_channel();
             let (ch_tx, ch_rx) = mpsc::unbounded_channel::<BlewResult<(DeviceId, L2capChannel)>>();
-            let turn_handle = Arc::clone(&handle);
-            handle.queue.exec_async(move || {
-                let h = turn_handle;
-                let turn = submit(
-                    &h.inner.l2cap_publish,
-                    powered_on(&h.manager),
-                    (),
-                    (),
-                    answer,
-                    || BlewError::L2cap {
-                        source: "an earlier l2cap_listener is still waiting on CoreBluetooth \
-                                 to report its channel published"
-                            .into(),
-                    },
-                    || {
-                        // Installed in the same turn as the publish, so a
-                        // power-down can't slip between them and leave a
-                        // stream that no power-down will end.
-                        *h.inner.l2cap_channel_tx.lock() = Some(ch_tx);
-                        unsafe { h.manager.publishL2CAPChannelWithEncryption(encrypted) };
-                    },
-                );
-                trace!(?turn, "l2cap_listener turn");
-            });
-            let psm = await_answer(pub_rx, CALLBACK_TIMEOUT, || BlewError::L2cap {
-                source: "CoreBluetooth never reported the L2CAP channel published".into(),
-            })
+            let h = Arc::clone(&handle);
+            let psm = request_in_turn(
+                &*handle.queue,
+                move |answer| {
+                    submit(
+                        &h.inner.l2cap_publish,
+                        powered_on(&h.manager),
+                        (),
+                        (),
+                        answer,
+                        || BlewError::L2cap {
+                            source: "an earlier l2cap_listener is still waiting on \
+                                     CoreBluetooth to report its channel published"
+                                .into(),
+                        },
+                        || {
+                            // In the publish's turn, so no power-down lands between them.
+                            *h.inner.l2cap_channel_tx.lock() = Some(ch_tx);
+                            unsafe { h.manager.publishL2CAPChannelWithEncryption(encrypted) };
+                        },
+                    )
+                },
+                || BlewError::L2cap {
+                    source: "CoreBluetooth never reported the L2CAP channel published".into(),
+                },
+            )
             .await?;
             debug!(psm = psm.0, "L2CAP listener ready");
             Ok((psm, UnboundedReceiverStream::new(ch_rx)))
@@ -1285,8 +1256,7 @@ mod tests {
         }
     }
 
-    /// An `add_service` turn as the manager's queue takes it, with the adapter
-    /// on and nothing to hand the service to.
+    /// An `add_service` turn with the adapter on and no manager to issue to.
     fn add_turn(inner: &PeripheralInner) -> (Turn, oneshot::Receiver<BlewResult<()>>) {
         let (answer, rx) = answer_channel();
         let turn = submit(&inner.add_svc, true, SVC, char_map(), answer, busy, || {});
@@ -1331,8 +1301,6 @@ mod tests {
         assert!(!published(&inner));
     }
 
-    /// An add whose caller timed out still owns its UUID, so a retry can't be
-    /// confirmed by the first attempt's late answer.
     #[tokio::test]
     async fn a_retry_waits_for_the_answer_the_first_attempt_is_owed() {
         let (inner, _) = PeripheralInner::new();
@@ -1400,8 +1368,6 @@ mod tests {
         assert!(published(&inner));
     }
 
-    /// Below `PoweredOff` CoreBluetooth clears the local database, so a
-    /// notification can no longer reach those characteristics.
     #[tokio::test]
     async fn a_reset_also_clears_the_database() {
         for state in [
@@ -1419,8 +1385,7 @@ mod tests {
         }
     }
 
-    /// Documents the residual: once a power-down has freed a slot, a late
-    /// answer to the request it held is unclaimed, even a success.
+    /// Pins the residual noted in `util::callback_slots`.
     #[tokio::test]
     async fn an_answer_after_a_power_down_is_unclaimed() {
         let (inner, _) = PeripheralInner::new();
@@ -1432,81 +1397,67 @@ mod tests {
         assert!(!published(&inner));
     }
 
-    /// A manager whose serial queue runs only when told to, recording what
-    /// reaches the platform and whether it ends up advertising.
+    /// A manager queue whose turns run only when told to.
     #[derive(Default)]
-    struct FakeAdvertiser {
-        queue: Mutex<VecDeque<Box<dyn FnOnce() + Send>>>,
-        platform: Mutex<Vec<&'static str>>,
-        advertising: Mutex<bool>,
-        slots: Mutex<CallbackSlots<(), (), ()>>,
-    }
+    struct FakeQueue(Mutex<VecDeque<Box<dyn FnOnce() + Send>>>);
 
-    impl Advertiser for FakeAdvertiser {
-        type Data = ();
-
-        fn is_advertising(&self) -> bool {
-            *self.advertising.lock()
-        }
-
-        fn is_powered_on(&self) -> bool {
-            true
-        }
-
-        fn slots(&self) -> &Mutex<CallbackSlots<(), (), ()>> {
-            &self.slots
-        }
-
-        fn start(&self, (): &()) {
-            self.platform.lock().push("start");
-            *self.advertising.lock() = true;
-        }
-
-        fn stop(&self) {
-            self.platform.lock().push("stop");
-            *self.advertising.lock() = false;
-        }
-
-        fn queue_turn(&self, turn: Box<dyn FnOnce() + Send>) {
-            self.queue.lock().push_back(turn);
+    impl TurnQueue for FakeQueue {
+        fn run(&self, turn: Box<dyn FnOnce() + Send>) {
+            self.0.lock().push_back(turn);
         }
     }
 
-    impl FakeAdvertiser {
-        /// Run every queued turn in order, as the serial queue would.
-        fn run_queue(&self) {
+    impl FakeQueue {
+        fn run_all(&self) {
             loop {
-                let next = self.queue.lock().pop_front();
+                let next = self.0.lock().pop_front();
                 let Some(turn) = next else { break };
                 turn();
             }
         }
     }
 
-    /// A start queues its turn and yields; a stop issued after it has to land
-    /// after it, or advertising begins once the stop has already returned.
+    /// See [`TurnQueue`]. Drives the production scheduling, `request_in_turn`
+    /// and `issue_in_turn`, with the manager's commands recorded instead.
     #[tokio::test]
     async fn a_stop_waits_for_a_start_queued_before_it() {
-        let adv = Arc::new(FakeAdvertiser::default());
-        let start = tokio::spawn(start_advertising_in_turn(Arc::clone(&adv), ()));
+        let (inner, _) = PeripheralInner::new();
+        let queue = Arc::new(FakeQueue::default());
+        let platform = Arc::new(Mutex::new(Vec::new()));
+
+        let start = tokio::spawn({
+            let (queue, inner, platform) = (queue.clone(), inner.clone(), platform.clone());
+            async move {
+                request_in_turn(
+                    &*queue,
+                    move |answer| {
+                        submit(&inner.adv, true, (), (), answer, busy, move || {
+                            platform.lock().push("start");
+                        })
+                    },
+                    busy,
+                )
+                .await
+            }
+        });
         tokio::task::yield_now().await;
-        let stop = tokio::spawn(stop_advertising_in_turn(Arc::clone(&adv)));
+        let stop = tokio::spawn({
+            let (queue, platform) = (queue.clone(), platform.clone());
+            async move { issue_in_turn(&*queue, move || platform.lock().push("stop")).await }
+        });
         tokio::task::yield_now().await;
 
         assert!(
-            adv.platform.lock().is_empty(),
-            "nothing reaches the platform before the queue runs"
+            platform.lock().is_empty(),
+            "nothing is issued before its turn"
         );
         assert!(!stop.is_finished(), "stop returns only once it is issued");
 
-        adv.run_queue();
+        queue.run_all();
 
         stop.await.unwrap().unwrap();
-        assert_eq!(*adv.platform.lock(), ["start", "stop"]);
-        assert!(!*adv.advertising.lock());
-
-        // The start is still answered by its own callback.
-        assert!(adv.slots.lock().take(&()).unwrap().answer(Ok(())));
+        assert_eq!(*platform.lock(), ["start", "stop"], "and so ends stopped");
+        assert!(inner.adv.lock().take(&()).unwrap().answer(Ok(())));
         start.await.unwrap().unwrap();
     }
 

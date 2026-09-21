@@ -81,39 +81,26 @@ All notable changes to `blew` are documented here. Format follows
 
 - **Apple: a Bluetooth power cycle no longer strands the peripheral's pending
   operations.** ([#45](https://github.com/mcginty/blew/issues/45))
-  `peripheralManagerDidUpdateState:` only emitted `AdapterStateChanged`, and
-  `add_service`, `start_advertising` and `l2cap_listener` each waited on a
-  delegate callback with no timeout. Powering off while one was in flight left
-  its caller waiting forever, and a queued `notify_characteristic` could do the
-  same. Leaving `PoweredOn` now fails every pending call with
-  `BlewError::NotPowered`, ends the `l2cap_listener` accept stream (with a
-  `NotPowered` item) so its consumer knows to publish again, and reports each
-  subscribed central as unsubscribed — CoreBluetooth disconnects them all —
-  before `AdapterStateChanged { powered: false }` goes out. A central is
-  reported once, whether its loss comes from the power cycle or from a later
-  `didUnsubscribeFromCharacteristic:`.
+  `add_service`, `start_advertising` and `l2cap_listener` each waited, with no
+  timeout, on a delegate callback that never comes once the adapter powers
+  off, so a call in flight waited forever; a queued `notify_characteristic`
+  could too. Leaving `PoweredOn` now fails them with `BlewError::NotPowered`,
+  ends the `l2cap_listener` accept stream so its consumer knows to publish
+  again, and reports every subscribed central as unsubscribed, before
+  `AdapterStateChanged { powered: false }` goes out. A plain power-off keeps
+  CoreBluetooth's services, so notifications work again after power-on without
+  re-adding anything; below `PoweredOff` (`Resetting`, `Unauthorized`,
+  `Unsupported`) they are gone and must be added again.
 
-  What a power cycle takes follows CoreBluetooth's own two cases. A plain
-  power-off keeps the local database, so services stay registered and
-  notifications keep working after power-on without re-adding anything. A
-  state below `PoweredOff` — `Resetting`, `Unauthorized`, `Unsupported` —
-  clears it, and blew then forgets the characteristics too; those services
-  have to be added again.
-
-  The three calls now also give up after five seconds
-  (`BlewError::Peripheral`, or `BlewError::L2cap` for `l2cap_listener`)
-  rather than waiting indefinitely, and refuse up front with `NotPowered`
-  when the adapter is off — CoreBluetooth ignores a command issued then and
-  never answers it. A call that gave up still holds its place until
-  CoreBluetooth does answer, because that late answer would otherwise
-  confirm the next request: meanwhile another `add_service` for the same
-  service is refused with `BlewError::Peripheral`, and another
-  `start_advertising` with `AlreadyAdvertising`. That also replaces the old
-  behaviour for two overlapping calls, where the second silently displaced
-  the first and woke it with `Internal("… channel dropped")`. Finally, a
-  service's characteristics are only used for notifications once
-  CoreBluetooth confirms the service, so one it rejected no longer leaves
-  them behind.
+  The three calls also give up after five seconds (`BlewError::Peripheral`, or
+  `L2cap` for `l2cap_listener`), and fail with `NotPowered` straight away while
+  the adapter is off. A call that gave up keeps its place until CoreBluetooth
+  answers it, so the late answer can't confirm a newer request: meanwhile a
+  second `add_service` for the same service is refused with
+  `BlewError::Peripheral`, and a second `start_advertising` with
+  `AlreadyAdvertising`, where before the second call silently displaced the
+  first. A service's characteristics are used for notifications only once
+  CoreBluetooth confirms it.
 - **Linux: advertising again after a Bluetooth power cycle works, and re-adding
   a service no longer serves it twice.**
   ([#46](https://github.com/mcginty/blew/issues/46)) Powering the adapter off

@@ -131,7 +131,7 @@ let mut requests = peripheral.take_requests()                // single-consumer;
 **Threading model:**
 - Each manager (`CBCentralManager`, `CBPeripheralManager`) is initialized with a dedicated GCD serial queue via `initWithDelegate_queue(Some(&queue))`.
 - All CB delegate callbacks fire exclusively on that queue.
-- Tokio tasks call CB methods directly from the thread pool; CoreBluetooth is documented thread-safe on macOS 10.15+ / iOS 13+.
+- Tokio tasks call CB methods directly from the thread pool; CoreBluetooth is documented thread-safe on macOS 10.15+ / iOS 13+. The exception is peripheral commands that must order against a callback, which run on the manager queue (see below).
 - Results flow back to Tokio via `tokio::sync::oneshot` channels (set in the delegate callback, awaited in the async method).
 
 **Key patterns:**
@@ -165,71 +165,20 @@ rx.await...
 
 **RAII responders:** `peripheralManager:didReceiveReadRequest:` and `didReceiveWriteRequests:` build a `ReadResponder`/`WriteResponder` (backed by an `oneshot::Sender`), emit a `PeripheralRequest` on the `mpsc::UnboundedSender` handed out by `take_requests()`, then spawn a task (via `inner.runtime.spawn()`) that awaits the oneshot and calls `respondToRequest:withResult:`. The spawn uses the captured `Handle` because GCD callbacks run outside the Tokio runtime context — bare `tokio::spawn` would panic. All Rust-side synchronization uses `parking_lot::Mutex` (poison-free, faster than `std::sync::Mutex`).
 
-**A power-down is cleaned up before it is reported, to the depth CoreBluetooth
-documents.** `peripheralManagerDidUpdateState:` runs `PeripheralInner::power_down`
-before `AdapterStateChanged { powered: false }` goes out: every waiter fails with
-`NotPowered`, the `l2cap_listener` accept stream ends, and each subscribed
-central is reported unsubscribed. `CBPeripheralManager.h` separates two depths
-and the cleanup follows them exactly: any state below `PoweredOn` pauses
-advertising and disconnects every central, and only a state below `PoweredOff`
-also clears the local database. **Don't clear `chars` on a plain power-off** —
-CoreBluetooth keeps those services, and notifications on them would fail after
-power-on. `chars` also fills only from `didAddService:` on success, so a service
-CoreBluetooth rejected leaves nothing behind. `didUnsubscribeFromCharacteristic:`
-reports only a central it actually removed, since `power_down` has already
-reported the rest.
-
-**A waiter that gave up still owns its slot.** `add_service`, `start_advertising`
-and `l2cap_listener` wait on callbacks that identify their request by the
-service UUID at most. Each registers in a `util::callback_slots::CallbackSlots`,
-and the slot stays held after its caller times out, until CoreBluetooth's
-answer arrives or a power-down frees every slot at once; a request that finds
-its key held is refused. **Don't free a slot on timeout**: the late answer would
-then confirm the next request under the same key. Attribution by object identity
-(`didAddService:` passes a `CBService`) was not used because nothing here has
-verified that CoreBluetooth returns the instance it was given — and if it
-doesn't, every add would time out.
-
-**Submission and cleanup share the manager's queue.** Each of those calls takes
-one turn on `PeripheralHandle::queue` — the serial queue the delegate, and so
-`power_down`, runs on — through `callback_slots::submit`, which checks
-`PoweredOn`, registers, and issues the command with nothing in between, and
-refuses through the same oneshot the async side awaits. Done from a Tokio
-thread, as it was first written, a request could pass the check, lose its slot
-to `power_down` (its caller already told `NotPowered`), and issue its command
-after power returned: that answer completed a newer request under the same key,
-and the service the first caller was told failed was added anyway. **Don't fix
-this with a mutex** that `power_down` also takes, held across `addService:` /
-`startAdvertising:` / `publishL2CAPChannelWithEncryption:`: calling into
-CoreBluetooth while holding a lock the delegate queue needs deadlocks the moment
-CoreBluetooth waits on that queue internally, and the slots' mutex is released
-before the command for that reason. The turn owns its ObjC objects through
-`ObjcSend`, so nothing `Retained` crosses the await; the timeout starts before
-the turn is queued, so it bounds queueing too; and a turn whose caller already
-gave up issues nothing, since carrying it out would contradict what that caller
-was told. `CallbackSlots::register` is private so a registration can't be made
-outside a turn.
-
-**Every command that must order against a queued turn goes through the queue —
-`stopAdvertising` included.** A start queues its turn and yields, so a stop
-issued straight from the calling thread overtook a start still waiting there,
-and advertising began after `stop_advertising` returned `Ok`.
-`stop_advertising_in_turn` queues the stop and returns only once it has been
-issued, after any start queued before it. It deliberately leaves a pending
-start's slot alone: the start's own `didStartAdvertising:` still answers it,
-and freeing the slot early would let that late answer reach a newer start. Both
-go through the private `Advertiser` trait so the order is tested against a
-fake queue. Calls that stay on the calling thread don't order against a turn:
-`updateValue:` targets characteristics and centrals the delegate queue already
-recorded, and serializes against `power_down` through `pending_notifies`;
-`respondToRequest:withResult:` answers the specific `CBATTRequest` it was
-handed; `isAdvertising` and `state` are reads, and the slot inside the turn,
-not the pre-check, decides whether a start goes ahead.
-
-Residual, unverified either way: freeing slots on power-down still assumes
-CoreBluetooth never *answers* a request from before the power-down once the
-adapter is back on and a new request holds the same key — without an identity
-there would be nothing to check such an answer against.
+**Apple peripheral power cycles and callback waiters.** The reasons live in the
+code; these are the rules.
+- **A power-down is cleaned up before it is reported, to the depth CoreBluetooth
+  documents**: below `PoweredOn` waiters fail, the accept stream ends and
+  subscribers are reported gone; only below `PoweredOff` does `chars` go.
+  **Don't clear `chars` on a plain power-off.** See `PeripheralInner::power_down`.
+- **A waiter that gave up keeps its slot** until its own callback or a
+  power-down, and a request for a held key is refused. **Don't free a slot on
+  timeout.** See `util::callback_slots`, which also records the residual.
+- **Commands that order against a callback or another command run in a turn on
+  the manager queue** (`addService:`, `startAdvertising:`, `stopAdvertising`,
+  `publishL2CAPChannelWithEncryption:`), via `request_in_turn` /
+  `issue_in_turn`. **Don't replace this with a lock held across the command.**
+  See `TurnQueue` in `platform/apple/peripheral.rs`.
 
 **L2CAP reactor** (`platform/apple/l2cap.rs`): one dedicated OS thread owns an `NSRunLoop` and all `NSInputStream`/`NSOutputStream` objects. Channels register via `ReactorCmd::Register`, close via `ReactorCmd::Close`; there is no write command — each channel carries a bounded `outbound_rx` the reactor drains itself, so backpressure lands on the caller's `write()` instead of in a queue. Bytes flow Reactor→App through a bounded `mpsc::Sender<Vec<u8>>`, App→Reactor through a `tokio::io::duplex` + outbound bridge task. No per-channel threads. The loop is event-driven: each channel's streams carry an `NSStreamDelegate` that marks the channel in a shared `ReadySet`, and `pump_channels` services only marked channels plus any that are lingering. The 1s `acceptInputForMode:beforeDate:` timeout is a backstop against a missed wakeup, not the service interval.
 

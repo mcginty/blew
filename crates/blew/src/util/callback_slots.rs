@@ -12,14 +12,14 @@
 //! So a slot is held from registration until the callback that answers it
 //! arrives, whether or not anyone is still waiting, and a request that finds
 //! its key held is refused rather than queued or allowed to replace it. The
-//! only other way out is the platform dropping every outstanding request at
-//! once, which CoreBluetooth does when the adapter leaves `PoweredOn`; see
-//! [`CallbackSlots::drain`].
+//! only other way out is [`CallbackSlots::drain`], for when the platform drops
+//! every outstanding request at once (CoreBluetooth leaving `PoweredOn`). That
+//! assumes, unverified, that no request from before the drain is answered once
+//! a newer one holds its key: with no identity to check, the answer would be
+//! taken as the newer one's.
 //!
-//! Every [`submit`], [`CallbackSlots::take`] and [`CallbackSlots::drain`] on
-//! one set of slots must run on the same serial queue -- for CoreBluetooth,
-//! the manager's delegate queue. The mutex only makes the slots shareable; it
-//! is the queue that keeps a `drain` from landing inside a `submit`.
+//! [`submit`], `take` and `drain` on one set of slots must all run on one
+//! serial queue; the lock makes the slots shareable, not ordered.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -134,15 +134,9 @@ pub(crate) enum Turn {
 }
 
 /// One request's turn: register it and `issue` it, or refuse it through
-/// `answer`.
-///
-/// Must run on the serial queue every `take` and `drain` on `slots` runs on.
-/// The check, the registration and `issue` then happen with nothing between
-/// them, so a request can't pass the check, lose its slot to a `drain`, and
-/// issue its command anyway after power returns -- where its answer would
-/// complete a newer request under the same key, and the command its caller
-/// was told failed would take effect. The lock is released before `issue`,
-/// which calls into the platform.
+/// `answer`. Run on the slots' queue, nothing lands between the power check,
+/// the registration and `issue`. The lock is released before `issue`, which
+/// calls into the platform.
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub(crate) fn submit<K: Eq + Hash, P, T>(
     slots: &Mutex<CallbackSlots<K, P, T>>,
@@ -153,8 +147,7 @@ pub(crate) fn submit<K: Eq + Hash, P, T>(
     busy: impl FnOnce() -> BlewError,
     issue: impl FnOnce(),
 ) -> Turn {
-    // Issuing a request whose caller already gave up would carry out what
-    // that caller was told didn't happen.
+    // Its caller was told it didn't happen.
     if answer.is_closed() {
         return Turn::Abandoned;
     }
@@ -171,12 +164,7 @@ pub(crate) fn submit<K: Eq + Hash, P, T>(
     Turn::Issued
 }
 
-/// Wait at most `limit` for a request's answer, counting any time its turn
-/// spends queued.
-///
-/// Giving up leaves the slot held: the platform still owes the answer, and it
-/// has to be consumed by this registration rather than by the next one under
-/// the same key.
+/// Wait at most `limit` for a request's answer. Giving up leaves its slot held.
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub(crate) async fn await_answer<T>(
     rx: oneshot::Receiver<BlewResult<T>>,
@@ -310,8 +298,6 @@ mod tests {
         assert_eq!(turn(&slots, true, "again").0, Turn::Issued);
     }
 
-    /// A request whose caller stopped waiting still owns its key, so its late
-    /// answer can't confirm the next one.
     #[test]
     fn a_late_answer_is_consumed_by_the_request_it_answers() {
         let slots = Slots::default();
@@ -340,12 +326,7 @@ mod tests {
         assert_eq!(turn(&slots, true, "b").0, Turn::Issued);
     }
 
-    /// The race the serial queue exists to rule out. Everything that touches
-    /// the slots runs on one queue, one step at a time, so a request's turn
-    /// lands either before a power-down or after it, never across it. Played
-    /// out in both orders, the first request's command is only ever issued
-    /// while it holds its slot, and a newer request's slot is never taken by
-    /// it.
+    /// A turn lands before a power-down or after it, never across it.
     #[test]
     fn a_turn_queued_across_a_power_cycle_cannot_take_a_newer_request() {
         fn queued<'a>(
@@ -366,9 +347,8 @@ mod tests {
         let (answer_a, mut rx_a) = answer_channel();
         let (answer_b, _rx_b) = answer_channel();
 
-        // A was queued before the power-down, but its turn comes after power
-        // returns and after B has taken the key: the ordering in which A used
-        // to issue its command and take B's answer.
+        // A was queued before the power-down but runs after power returns
+        // and B has taken the key.
         let queue = vec![
             Box::new(|| power_down(&slots)) as Box<dyn FnOnce()>,
             queued(&slots, &issued, "b", answer_b),
