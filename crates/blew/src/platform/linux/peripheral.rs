@@ -10,6 +10,7 @@ use crate::peripheral::types::{
 use crate::platform::linux::l2cap::{apply_security, bridge_l2cap};
 use crate::types::DeviceId;
 use crate::util::BroadcastEventStream;
+use crate::util::published::Published;
 use crate::util::service_queue::queue_service;
 use bluer::adv::{Advertisement, SecondaryChannel, Type as AdvType};
 use bluer::gatt::local::{
@@ -45,27 +46,14 @@ const INDICATION_PROBE: std::time::Duration = std::time::Duration::from_secs(1);
 /// one indication is ever outstanding.
 const INDICATION_WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(35);
 
-/// What `start_advertising` has published, and which power-on it belongs to.
-///
-/// Dropping a handle unregisters what it names, and `start_advertising` refuses
-/// while `adv` is set, so a handle kept after the adapter took its
-/// advertisement down refuses every later start. The generation lives under
-/// the same lock as the handles so that a start, which awaits BlueZ between
-/// publishing and storing, can't store a handle after a power-off has already
-/// cleared them.
-#[derive(Default)]
-struct Published {
-    app: Option<ApplicationHandle>,
-    adv: Option<bluer::adv::AdvertisementHandle>,
-    /// Bumped on every power-off.
-    power_generation: u64,
-}
+/// What `start_advertising` has published; see [`util::published`](crate::util::published).
+type PublishedHandles = Published<bluer::adv::AdvertisementHandle, ApplicationHandle>;
 
 struct PeripheralInner {
     _session: Session,
     adapter: Adapter,
     pending_services: Mutex<Vec<GattService>>,
-    published: Mutex<Published>,
+    published: Mutex<PublishedHandles>,
     notifiers: Mutex<HashMap<Uuid, Vec<SharedNotifier>>>,
     request_tx: mpsc::UnboundedSender<PeripheralRequest>,
     request_rx: Mutex<Option<mpsc::UnboundedReceiver<PeripheralRequest>>>,
@@ -79,19 +67,23 @@ impl PeripheralInner {
     /// sessions that belonged to them. `pending_services` is left alone, so the
     /// next `start_advertising` serves the same services again.
     fn unpublish(&self) {
-        {
-            let mut published = self.published.lock();
-            published.adv = None;
-            published.app = None;
-        }
+        // Taken under the lock, dropped -- unregistering them -- after it.
+        let taken = self.published.lock().unpublish();
+        drop(taken);
         self.notifiers.lock().clear();
     }
 
     /// The adapter powered off, taking the advertisement and GATT application
     /// with it. Also fails any `start_advertising` still waiting on BlueZ.
     fn power_lost(&self) {
-        self.published.lock().power_generation += 1;
-        self.unpublish();
+        // Retiring the generation and taking the handles must be one lock
+        // acquisition. Split, a start that began between them captures the
+        // new generation, stores its GATT application, and then loses it to
+        // the take while its advertisement still goes up: advertising a
+        // peripheral with no services behind it.
+        let taken = self.published.lock().power_lost();
+        drop(taken);
+        self.notifiers.lock().clear();
     }
 }
 
@@ -528,7 +520,7 @@ impl PeripheralBackend for LinuxPeripheral {
                 _session: session,
                 adapter,
                 pending_services: Mutex::new(Vec::new()),
-                published: Mutex::new(Published::default()),
+                published: Mutex::new(PublishedHandles::default()),
                 notifiers: Mutex::new(HashMap::new()),
                 request_tx,
                 request_rx: Mutex::new(Some(request_rx)),
@@ -569,13 +561,11 @@ impl PeripheralBackend for LinuxPeripheral {
         let handle = Arc::clone(&self.0);
         let config = config.clone();
         async move {
-            let power_generation = {
-                let published = handle.published.lock();
-                if published.adv.is_some() {
-                    return Err(BlewError::AlreadyAdvertising);
-                }
-                published.power_generation
-            };
+            let power_generation = handle
+                .published
+                .lock()
+                .begin_start()
+                .ok_or(BlewError::AlreadyAdvertising)?;
             debug!(local_name = ?config.local_name, "starting advertising");
 
             let pending: Vec<GattService> = handle.pending_services.lock().clone();
@@ -609,16 +599,15 @@ impl PeripheralBackend for LinuxPeripheral {
                 .map_err(|e| BlewError::Peripheral {
                     source: Box::new(e),
                 })?;
-            {
-                // A handle published before a power-off names nothing BlueZ
-                // still has; dropping it here rather than storing it is what
-                // keeps a later start from being refused.
-                let mut published = handle.published.lock();
-                if published.power_generation != power_generation {
-                    return Err(BlewError::NotPowered);
-                }
-                published.app = Some(app_handle);
-            }
+            // A handle published before a power-off names nothing BlueZ still
+            // has; dropping it rather than storing it is what keeps a later
+            // start from being refused. The store returns it, so it is dropped
+            // -- unregistering it -- after the lock is released.
+            let stored = handle
+                .published
+                .lock()
+                .store_app(power_generation, app_handle);
+            stored.map_err(|_stale| BlewError::NotPowered)?;
 
             // Prefer BLE 5 extended advertising with a 2M secondary channel so
             // that BLE 5 centrals can connect at 2M PHY from the start.
@@ -653,13 +642,11 @@ impl PeripheralBackend for LinuxPeripheral {
                     h
                 }
             };
-            {
-                let mut published = handle.published.lock();
-                if published.power_generation != power_generation {
-                    return Err(BlewError::NotPowered);
-                }
-                published.adv = Some(adv_handle);
-            }
+            let stored = handle
+                .published
+                .lock()
+                .store_adv(power_generation, adv_handle);
+            stored.map_err(|_stale| BlewError::NotPowered)?;
 
             Ok(())
         }
