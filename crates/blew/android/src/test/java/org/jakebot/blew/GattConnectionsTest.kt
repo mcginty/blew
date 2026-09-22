@@ -408,4 +408,33 @@ class GattConnectionsTest {
             verifyNoInteractions(f.events)
             f.connections.forceClose(ADDR, 1)
         }
+
+    @Test
+    fun aTimedOutWriteKeepsItsKeySoItsLateCallbackCannotCompleteTheNext() =
+        runTest {
+            val (f, client) = connectedFixture()
+            f.writeNoResponse(1)
+            runCurrent()
+            advanceTimeBy(5001)
+            runCurrent()
+            clearInvocations(f.events)
+
+            f.writeNoResponse(2)
+            runCurrent()
+            verify(f.events).onCharacteristicWrite(ADDR, 1, UUID_VALUE.toString(), BluetoothGatt.GATT_FAILURE)
+            verify(client.gatt, times(1)).writeCharacteristic(any(), any(), anyInt())
+            clearInvocations(f.events)
+
+            client.callback.onCharacteristicWrite(client.gatt, client.characteristic, 0)
+            runCurrent()
+            verifyNoInteractions(f.events)
+
+            f.writeNoResponse(3)
+            runCurrent()
+            verify(client.gatt, times(2)).writeCharacteristic(any(), any(), anyInt())
+            client.callback.onCharacteristicWrite(client.gatt, client.characteristic, 0)
+            runCurrent()
+            verify(f.events).onCharacteristicWrite(ADDR, 1, UUID_VALUE.toString(), 0)
+            f.connections.forceClose(ADDR, 1)
+        }
 }

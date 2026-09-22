@@ -510,9 +510,18 @@ waits for it too, which is also the only way a refused write reaches the caller
 (#52). **Don't complete a no-response write when the kick returns**: that is
 what made the next operation fail, and made `write_characteristic` return `Ok`
 for a packet that never went out. The callback isn't optional: without it the
-platform itself stays busy. `completeOp` accepts a callback only for the
-operation currently running, so one that arrives after its timeout is dropped
-rather than completing a later operation.
+platform itself stays busy.
+
+A GATT result names only device, generation and characteristic, so each key
+has at most one operation in flight on both sides of the bridge, and it keeps
+the key until its own result arrives, even after its caller gave up. In Kotlin,
+an operation that timed out keeps its `pendingNonces` entry until its late
+callback consumes it, and `claimKey` refuses a new operation on that key
+meanwhile. In Rust, `util::op_slots` makes a second read or write on a key
+wait for the first one's result, and it keeps the slot if the caller drops.
+**Don't free either on timeout or cancellation, and don't let a new operation
+replace the holder**: the old callback would then complete the new operation.
+This is the same rule as the notification gate below.
 
 **Local-name invariant.** `AdvertisingConfig::local_name` (`LocalName`) is a
 permission, not just a value. Android has no per-advertisement name, so

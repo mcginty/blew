@@ -127,8 +127,15 @@ All notable changes to `blew` are documented here. Format follows
   no-response write now waits for its callback like any other, so
   `write_characteristic` returns once the local stack has taken the write
   (not once the peer has it) and returns the error if it didn't. That wait
-  also gives back-to-back writes backpressure. A callback that arrives
-  after its operation timed out can no longer complete a later one.
+  also gives back-to-back writes backpressure.
+
+  Reads and writes on one characteristic now also wait for each other.
+  Previously a second operation evicted the first one's waiter with
+  `GattBusy`, while the first one stayed queued, so its result then completed
+  the second. Now the second waits for the first one's result. After a
+  timeout, an operation keeps its characteristic until its late callback
+  arrives. Until then, a new operation on that characteristic fails instead
+  of taking the late callback as its own result.
 
 - **Apple: a Bluetooth power cycle no longer strands the peripheral's pending
   operations.** ([#45](https://github.com/mcginty/blew/issues/45))

@@ -206,6 +206,23 @@ internal class GattConnections(
 
     fun getMtu(deviceAddr: String): Int = synchronized(lock) { attempts[deviceAddr]?.mtu ?: 23 }
 
+    /**
+     * Hold [key] for the running operation until its callback arrives. A callback names
+     * only its characteristic, so an operation that timed out keeps the key until its
+     * late callback comes: a newer one registered under it would take that callback as
+     * its own. Only the callback or retirement frees the key.
+     */
+    private fun claimKey(
+        attempt: Attempt,
+        key: String,
+        nonce: Long,
+    ) {
+        if (key in attempt.pendingNonces) {
+            throw KickRefused("$key still owes its callback to an operation that timed out")
+        }
+        attempt.pendingNonces[key] = nonce
+    }
+
     private fun <T> completeOp(
         attempt: Attempt,
         key: String,
@@ -213,7 +230,7 @@ internal class GattConnections(
     ): Boolean {
         if (!isLive(attempt)) return false
         val nonce = attempt.pendingNonces.remove(key) ?: return false
-        // A callback for an operation that already timed out has been reported.
+        // The operation that held the key timed out and has been reported; see claimKey.
         if (attempt.queue.currentNonce() != nonce) {
             Log.d(TAG, "late callback $key after its operation finished; dropped")
             return false
@@ -254,7 +271,7 @@ internal class GattConnections(
                                     synchronized(lock) {
                                         if (!isLive(attempt) || attempt.disconnecting) return@enqueue false
                                         val nonce = q.currentNonce() ?: return@enqueue false
-                                        attempt.pendingNonces["${attempt.addr}:mtu"] = nonce
+                                        claimKey(attempt, "${attempt.addr}:mtu", nonce)
                                         gatt.requestMtu(512)
                                     }
                                 })
@@ -375,7 +392,7 @@ internal class GattConnections(
                                 if (!isLive(attempt) || attempt.disconnecting) return@enqueue false
                                 val nonce = q.currentNonce() ?: return@enqueue false
                                 val key = "$deviceAddr:services"
-                                attempt.pendingNonces[key] = nonce
+                                claimKey(attempt, key, nonce)
                                 val started = gatt.discoverServices()
                                 if (!started) {
                                     attempt.pendingNonces.remove(key)
@@ -418,7 +435,7 @@ internal class GattConnections(
                                 if (!isLive(attempt) || attempt.disconnecting) return@enqueue false
                                 val nonce = q.currentNonce() ?: return@enqueue false
                                 val key = "$deviceAddr:read:$charUuid"
-                                attempt.pendingNonces[key] = nonce
+                                claimKey(attempt, key, nonce)
                                 val started = gatt.readCharacteristic(char)
                                 if (!started) {
                                     attempt.pendingNonces.remove(key)
@@ -465,7 +482,7 @@ internal class GattConnections(
                                 val nonceKey = "$deviceAddr:write:$charUuid"
                                 // Android holds every write, no-response included, busy until
                                 // onCharacteristicWrite; the next kick before it is refused.
-                                attempt.pendingNonces[nonceKey] = nonce
+                                claimKey(attempt, nonceKey, nonce)
                                 val ret = gatt.writeCharacteristic(char, value, writeType)
                                 if (ret != BluetoothStatusCodes.SUCCESS) {
                                     attempt.pendingNonces.remove(nonceKey)
@@ -516,7 +533,7 @@ internal class GattConnections(
                                 if (!isLive(attempt) || attempt.disconnecting) return@enqueue false
                                 val nonce = q.currentNonce() ?: return@enqueue false
                                 val key = "$deviceAddr:cccd:$charUuid"
-                                attempt.pendingNonces[key] = nonce
+                                claimKey(attempt, key, nonce)
                                 val ret =
                                     gatt.writeDescriptor(
                                         descriptor,
@@ -571,7 +588,7 @@ internal class GattConnections(
                                     if (!isLive(attempt) || attempt.disconnecting) return@enqueue false
                                     val nonce = q.currentNonce() ?: return@enqueue false
                                     val key = "$deviceAddr:cccd:$charUuid"
-                                    attempt.pendingNonces[key] = nonce
+                                    claimKey(attempt, key, nonce)
                                     val ret =
                                         gatt.writeDescriptor(
                                             descriptor,
