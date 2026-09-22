@@ -521,7 +521,11 @@ meanwhile. In Rust, `util::op_slots` makes a second read or write on a key
 wait for the first one's result, and it keeps the slot if the caller drops.
 **Don't free either on timeout or cancellation, and don't let a new operation
 replace the holder**: the old callback would then complete the new operation.
-This is the same rule as the notification gate below.
+This is the same rule as the notification gate below. Subscribe and
+unsubscribe follow it too, under a `cccd` key: Kotlin reports the descriptor
+write through `nativeOnDescriptorWrite`, including the unsubscribe that has no
+CCCD to write, since `op_slots` expects every operation Kotlin accepted to be
+reported exactly once.
 
 **Local-name invariant.** `AdvertisingConfig::local_name` (`LocalName`) is a
 permission, not just a value. Android has no per-advertisement name, so

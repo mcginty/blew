@@ -626,11 +626,16 @@ impl CentralBackend for AndroidCentral {
         let addr = device_id.as_str().to_owned();
         let did = device_id.clone();
         async move {
-            let generation = state()
-                .connects
-                .lock()
-                .generation(&addr)
-                .ok_or_else(|| BlewError::NotConnected(did.clone()))?;
+            let s = state();
+            // Done once the peer has taken the CCCD write, as on the other backends.
+            let mut generation = 0;
+            let (key, rx) = s
+                .pending_ops
+                .claim(|| {
+                    generation = live_generation(s, &addr, &did)?;
+                    Ok::<_, BlewError>(format!("{addr}:{generation}:cccd:{char_uuid}"))
+                })
+                .await?;
             let status = jvm()
                 .attach_current_thread(|env| {
                     let j_addr = env.new_string(&addr)?;
@@ -645,12 +650,11 @@ impl CentralBackend for AndroidCentral {
 
                     result.i()
                 })
-                .map_err(|e| jni_err(&e))?;
+                .map_err(|e| jni_err(&e));
+            dispatched(s, &key, status, &did, char_uuid)?;
 
-            if status != STATUS_SUCCESS {
-                return Err(gatt_status_to_error(status, &did, char_uuid));
-            }
-
+            rx.await
+                .map_err(|_| BlewError::DisconnectedDuringOperation(did))??;
             Ok(())
         }
     }
@@ -663,11 +667,16 @@ impl CentralBackend for AndroidCentral {
         let addr = device_id.as_str().to_owned();
         let did = device_id.clone();
         async move {
-            let generation = state()
-                .connects
-                .lock()
-                .generation(&addr)
-                .ok_or_else(|| BlewError::NotConnected(did.clone()))?;
+            let s = state();
+            // Done once the peer has taken the CCCD write, as on the other backends.
+            let mut generation = 0;
+            let (key, rx) = s
+                .pending_ops
+                .claim(|| {
+                    generation = live_generation(s, &addr, &did)?;
+                    Ok::<_, BlewError>(format!("{addr}:{generation}:cccd:{char_uuid}"))
+                })
+                .await?;
             let status = jvm()
                 .attach_current_thread(|env| {
                     let j_addr = env.new_string(&addr)?;
@@ -682,12 +691,11 @@ impl CentralBackend for AndroidCentral {
 
                     result.i()
                 })
-                .map_err(|e| jni_err(&e))?;
+                .map_err(|e| jni_err(&e));
+            dispatched(s, &key, status, &did, char_uuid)?;
 
-            if status != STATUS_SUCCESS {
-                return Err(gatt_status_to_error(status, &did, char_uuid));
-            }
-
+            rx.await
+                .map_err(|_| BlewError::DisconnectedDuringOperation(did))??;
             Ok(())
         }
     }

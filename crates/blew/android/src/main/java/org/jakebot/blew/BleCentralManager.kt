@@ -77,6 +77,13 @@ object BleCentralManager {
                         status: Int,
                     ) = nativeOnCharacteristicWrite(deviceAddr, generation, charUuid, status)
 
+                    override fun onDescriptorWrite(
+                        deviceAddr: String,
+                        generation: Int,
+                        charUuid: String,
+                        status: Int,
+                    ) = nativeOnDescriptorWrite(deviceAddr, generation, charUuid, status)
+
                     override fun onCharacteristicChanged(
                         deviceAddr: String,
                         generation: Int,
@@ -138,6 +145,14 @@ object BleCentralManager {
 
     @JvmStatic
     external fun nativeOnCharacteristicWrite(
+        deviceAddr: String,
+        generation: Int,
+        charUuid: String,
+        status: Int,
+    )
+
+    @JvmStatic
+    external fun nativeOnDescriptorWrite(
         deviceAddr: String,
         generation: Int,
         charUuid: String,

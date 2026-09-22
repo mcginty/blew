@@ -137,6 +137,14 @@ All notable changes to `blew` are documented here. Format follows
   arrives. Until then, a new operation on that characteristic fails instead
   of taking the late callback as its own result.
 
+- **Android: `subscribe_characteristic` and `unsubscribe_characteristic`
+  return once the peer has accepted the CCCD write, and fail if it refused.**
+  They used to return `Ok` as soon as the descriptor write was queued. A write
+  the stack refused, or one the peer rejected, then showed up only in logcat,
+  and the caller went on waiting for notifications that would never come.
+  They now wait for `onDescriptorWrite`, as Apple waits for
+  `didUpdateNotificationState` and Linux waits for `notify_io`.
+
 - **Apple: a Bluetooth power cycle no longer strands the peripheral's pending
   operations.** ([#45](https://github.com/mcginty/blew/issues/45))
   `add_service`, `start_advertising` and `l2cap_listener` each waited, with no

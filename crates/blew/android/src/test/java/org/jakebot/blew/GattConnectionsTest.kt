@@ -437,4 +437,46 @@ class GattConnectionsTest {
             verify(f.events).onCharacteristicWrite(ADDR, 1, UUID_VALUE.toString(), 0)
             f.connections.forceClose(ADDR, 1)
         }
+
+    @Test
+    fun subscribeReportsTheCccdWriteResult() =
+        runTest {
+            val (f, client) = connectedFixture()
+            assertEquals(0, f.connections.subscribeCharacteristic(ADDR, 1, UUID_VALUE.toString()))
+            runCurrent()
+            verifyNoInteractions(f.events)
+
+            client.callback.onDescriptorWrite(client.gatt, client.descriptor, 0)
+            runCurrent()
+            verify(f.events).onDescriptorWrite(ADDR, 1, UUID_VALUE.toString(), 0)
+
+            f.connections.subscribeCharacteristic(ADDR, 1, UUID_VALUE.toString())
+            runCurrent()
+            client.callback.onDescriptorWrite(client.gatt, client.descriptor, 3)
+            runCurrent()
+            verify(f.events).onDescriptorWrite(ADDR, 1, UUID_VALUE.toString(), 3)
+            f.connections.forceClose(ADDR, 1)
+        }
+
+    @Test
+    fun aRefusedCccdWriteReportsFailure() =
+        runTest {
+            val (f, client) = connectedFixture()
+            `when`(client.gatt.writeDescriptor(any(), any()))
+                .thenReturn(BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY)
+            f.connections.subscribeCharacteristic(ADDR, 1, UUID_VALUE.toString())
+            runCurrent()
+            verify(f.events).onDescriptorWrite(ADDR, 1, UUID_VALUE.toString(), BluetoothGatt.GATT_FAILURE)
+            f.connections.forceClose(ADDR, 1)
+        }
+
+    @Test
+    fun unsubscribeWithoutACccdReportsAtOnce() =
+        runTest {
+            val (f, client) = connectedFixture()
+            `when`(client.characteristic.getDescriptor(any(UUID::class.java))).thenReturn(null)
+            assertEquals(0, f.connections.unsubscribeCharacteristic(ADDR, 1, UUID_VALUE.toString()))
+            verify(f.events).onDescriptorWrite(ADDR, 1, UUID_VALUE.toString(), 0)
+            f.connections.forceClose(ADDR, 1)
+        }
 }

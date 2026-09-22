@@ -354,9 +354,10 @@ internal class GattConnections(
                 status: Int,
             ) {
                 synchronized(lock) {
-                    val uuid = descriptor.characteristic.uuid
+                    val uuid = descriptor.characteristic.uuid.toString()
                     if (!completeOp(attempt, "${attempt.addr}:cccd:$uuid", Unit)) return
                     if (status != BluetoothGatt.GATT_SUCCESS) Log.w(TAG, "CCCD write for $uuid failed: status=$status")
+                    events.onDescriptorWrite(attempt.addr, attempt.generation, uuid, status)
                 }
             }
 
@@ -551,6 +552,7 @@ internal class GattConnections(
                     if (!isLive(attempt)) return@launch
                     if (result.isFailure) {
                         Log.w(TAG, "subscribe $charUuid queue failed: ${result.exceptionOrNull()?.message}")
+                        events.onDescriptorWrite(deviceAddr, generation, charUuid, BluetoothGatt.GATT_FAILURE)
                     }
                 }
             }
@@ -606,9 +608,13 @@ internal class GattConnections(
                         if (!isLive(attempt)) return@launch
                         if (result.isFailure) {
                             Log.w(TAG, "unsubscribe $charUuid queue failed: ${result.exceptionOrNull()?.message}")
+                            events.onDescriptorWrite(deviceAddr, generation, charUuid, BluetoothGatt.GATT_FAILURE)
                         }
                     }
                 }
+            } else {
+                // Nothing to write, and so no callback to wait for: report it done here.
+                events.onDescriptorWrite(deviceAddr, generation, charUuid, BluetoothGatt.GATT_SUCCESS)
             }
             return STATUS_SUCCESS
         }
@@ -676,6 +682,14 @@ internal interface GattEvents {
     )
 
     fun onCharacteristicWrite(
+        deviceAddr: String,
+        generation: Int,
+        charUuid: String,
+        status: Int,
+    )
+
+    /** The CCCD write a subscribe or unsubscribe issued for [charUuid] finished. */
+    fun onDescriptorWrite(
         deviceAddr: String,
         generation: Int,
         charUuid: String,
