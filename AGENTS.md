@@ -180,9 +180,13 @@ lands wholly before the turn (the write fails with `NotConnected`) or wholly
 after it (the write went out on the old connection). Checking on the calling
 thread leaves a gap in which a disconnect and reconnect send the old payload on
 the new connection, and so does checking again after the send. The same turn
-also keeps two writers from passing one `canSendWriteWithoutResponse`. **Don't
-move the check or the send off the queue, and don't go back to writing
-unconditionally.** `TurnQueue` lives in `helpers.rs`, shared with the
+also keeps two writers from passing one `canSendWriteWithoutResponse`. The
+5 s deadline covers a turn's wait for the queue as well as the wait for room,
+and a turn whose caller gave up, by the deadline or by dropping the write,
+never sends: `TurnClaim` lets exactly one of the turn starting and the caller
+abandoning it win, and a caller that loses waits for the started turn's
+result. **Don't move the check or the send off the queue, don't await a turn
+without the deadline, and don't go back to writing unconditionally.** `TurnQueue` lives in `helpers.rs`, shared with the
 peripheral.
 
 **Apple peripheral power cycles and callback waiters.** The reasons live in the

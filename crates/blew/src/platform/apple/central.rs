@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -256,6 +257,10 @@ type SendAttempt = Arc<dyn Fn() -> BlewResult<bool> + Send + Sync>;
 /// with `NotConnected`, rather than go out on whichever connection replaced it.
 /// Only one turn runs at a time, so two writers can't both pass one
 /// `canSendWriteWithoutResponse`.
+///
+/// The deadline covers a turn's wait for the queue too. A turn its caller has
+/// given up on, by the deadline or by dropping the write, never sends: see
+/// [`TurnClaim`].
 async fn send_when_ready(
     queue: &impl TurnQueue,
     ready: &Notify,
@@ -265,14 +270,19 @@ async fn send_when_ready(
     send: SendAttempt,
 ) -> BlewResult<bool> {
     let connection = disconnects.current(device_id);
-    retry_when_ready(ready, timeout, || {
-        let (tx, rx) = oneshot::channel();
-        let (disconnects, device_id, send) = (
+    retry_when_ready(ready, timeout, |deadline| {
+        let (tx, mut rx) = oneshot::channel();
+        let claim = TurnClaim::default();
+        let (turn_claim, disconnects, device_id, send) = (
+            Arc::clone(&claim.0),
             Arc::clone(disconnects),
             device_id.clone(),
             Arc::clone(&send),
         );
         queue.run(Box::new(move || {
+            if !TurnClaim::start(&turn_claim) {
+                return;
+            }
             let result = if disconnects.current(&device_id) == connection {
                 send()
             } else {
@@ -281,29 +291,79 @@ async fn send_when_ready(
             let _ = tx.send(result);
         }));
         async move {
-            rx.await.unwrap_or_else(|_| {
+            let dropped = || {
                 Err(BlewError::Internal(
                     "the manager queue dropped a turn".into(),
                 ))
-            })
+            };
+            match tokio::time::timeout_at(deadline, &mut rx).await {
+                Ok(result) => result.unwrap_or_else(|_| dropped()),
+                Err(_) if claim.abandon() => Ok(false),
+                // Already running on the queue: its result is moments away.
+                Err(_) => rx.await.unwrap_or_else(|_| dropped()),
+            }
         }
     })
     .await
 }
 
+/// Decides, once, between a queued turn and the caller waiting for it: the
+/// turn runs only if it starts before the caller abandons it, and a caller
+/// that finds it already started waits for its result. Dropping the claim
+/// abandons the turn, so a cancelled write never goes out.
+#[derive(Default)]
+struct TurnClaim(Arc<AtomicU8>);
+
+impl TurnClaim {
+    const QUEUED: u8 = 0;
+    const STARTED: u8 = 1;
+    const ABANDONED: u8 = 2;
+
+    /// Called by the turn. `false` means its caller gave up: do nothing.
+    fn start(state: &AtomicU8) -> bool {
+        state
+            .compare_exchange(
+                Self::QUEUED,
+                Self::STARTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Called by the caller. `false` means the turn has already started.
+    fn abandon(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::QUEUED,
+                Self::ABANDONED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+impl Drop for TurnClaim {
+    fn drop(&mut self) {
+        self.abandon();
+    }
+}
+
 /// Run `attempt` until it succeeds, again each time `ready` is notified.
-/// `Ok(false)` once `timeout` passes without success. The wait is created before
+/// `Ok(false)` once `timeout` passes without success; `attempt` is handed the
+/// deadline to bound its own wait by. The wait for `ready` is created before
 /// each attempt: `notify_waiters` reaches every `Notified` that already exists,
 /// so a notification landing between a failed attempt and the wait isn't missed.
 async fn retry_when_ready<F: Future<Output = BlewResult<bool>>>(
     ready: &Notify,
     timeout: Duration,
-    mut attempt: impl FnMut() -> F,
+    mut attempt: impl FnMut(tokio::time::Instant) -> F,
 ) -> BlewResult<bool> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let notified = ready.notified();
-        if attempt().await? {
+        if attempt(deadline).await? {
             return Ok(true);
         }
         if tokio::time::timeout_at(deadline, notified).await.is_err() {
@@ -1344,7 +1404,7 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::future::ready as done;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1372,7 +1432,7 @@ mod tests {
     async fn a_ready_write_goes_out_at_once() {
         let ready = Notify::new();
         assert!(
-            retry_when_ready(&ready, TIMEOUT, || done(Ok(true)))
+            retry_when_ready(&ready, TIMEOUT, |_| done(Ok(true)))
                 .await
                 .unwrap()
         );
@@ -1386,7 +1446,7 @@ mod tests {
         let write = tokio::spawn({
             let (ready, room, attempts) = (ready.clone(), room.clone(), attempts.clone());
             async move {
-                retry_when_ready(&ready, TIMEOUT, || {
+                retry_when_ready(&ready, TIMEOUT, |_| {
                     attempts.fetch_add(1, Ordering::SeqCst);
                     done(Ok(room.load(Ordering::SeqCst)))
                 })
@@ -1407,7 +1467,7 @@ mod tests {
     async fn a_ready_callback_between_attempt_and_wait_is_not_missed() {
         let ready = Notify::new();
         let mut first = true;
-        let sent = retry_when_ready(&ready, TIMEOUT, || {
+        let sent = retry_when_ready(&ready, TIMEOUT, |_| {
             if first {
                 first = false;
                 ready.notify_waiters();
@@ -1424,7 +1484,7 @@ mod tests {
     async fn a_ready_callback_that_never_comes_times_out() {
         let ready = Notify::new();
         assert!(
-            !retry_when_ready(&ready, TIMEOUT, || done(Ok(false)))
+            !retry_when_ready(&ready, TIMEOUT, |_| done(Ok(false)))
                 .await
                 .unwrap()
         );
@@ -1433,7 +1493,7 @@ mod tests {
     #[tokio::test]
     async fn an_attempt_error_ends_the_wait() {
         let ready = Notify::new();
-        let err = retry_when_ready(&ready, TIMEOUT, || {
+        let err = retry_when_ready(&ready, TIMEOUT, |_| {
             done(Err(BlewError::NotConnected(DeviceId::from("gone"))))
         })
         .await;
@@ -1593,5 +1653,40 @@ mod tests {
 
         central.queue.run_all();
         assert!(write.await.unwrap().unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_queue_ends_the_write_at_the_deadline_and_never_sends() {
+        let central = Central::new();
+        let peer = Peer::new(true);
+        let write = central.write(peer.send());
+        tokio::time::sleep(TIMEOUT + Duration::from_secs(1)).await;
+
+        assert!(!write.await.unwrap().unwrap(), "gave up at the deadline");
+        central.queue.run_all();
+        assert_eq!(peer.sends(), 0, "the expired turn doesn't send later");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_write_never_sends() {
+        let central = Central::new();
+        let peer = Peer::new(true);
+        let write = central.write(peer.send());
+        tokio::task::yield_now().await;
+        write.abort();
+        let _ = write.await;
+
+        central.queue.run_all();
+        assert_eq!(peer.sends(), 0);
+    }
+
+    #[test]
+    fn a_started_turn_cannot_be_abandoned() {
+        let claim = TurnClaim::default();
+        assert!(TurnClaim::start(&claim.0));
+        assert!(
+            !claim.abandon(),
+            "the caller must wait for the result instead"
+        );
     }
 }
