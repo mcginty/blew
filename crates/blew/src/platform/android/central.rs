@@ -110,13 +110,6 @@ pub(crate) fn connection_changed(
     }
 }
 
-fn live_generation(s: &CentralState, addr: &str, did: &DeviceId) -> BlewResult<i32> {
-    s.connects
-        .lock()
-        .generation(addr)
-        .ok_or_else(|| BlewError::NotConnected(did.clone()))
-}
-
 /// Free `key` unless Kotlin accepted the operation and so owes it a result.
 fn dispatched(
     s: &CentralState,
@@ -529,12 +522,16 @@ impl CentralBackend for AndroidCentral {
         let did = device_id.clone();
         async move {
             let s = state();
-            let mut generation = 0;
-            let (key, rx) = s
+            let (generation, key, rx) = s
                 .pending_ops
-                .claim(|| {
-                    generation = live_generation(s, &addr, &did)?;
-                    Ok::<_, BlewError>(format!("{addr}:{generation}:read:{char_uuid}"))
+                .claim(|slots| {
+                    // Under `connects`, so the attempt can't retire before its slot exists.
+                    let connects = s.connects.lock();
+                    let generation = connects
+                        .generation(&addr)
+                        .ok_or_else(|| BlewError::NotConnected(did.clone()))?;
+                    let key = format!("{addr}:{generation}:read:{char_uuid}");
+                    Ok::<_, BlewError>(slots.try_claim(key).map(|(key, rx)| (generation, key, rx)))
                 })
                 .await?;
 
@@ -578,12 +575,16 @@ impl CentralBackend for AndroidCentral {
             // Android holds every write busy until onCharacteristicWrite, so a
             // write without response waits for it too: the next one would be
             // refused, and this is the only way its failure reaches the caller.
-            let mut generation = 0;
-            let (key, rx) = s
+            let (generation, key, rx) = s
                 .pending_ops
-                .claim(|| {
-                    generation = live_generation(s, &addr, &did)?;
-                    Ok::<_, BlewError>(format!("{addr}:{generation}:write:{char_uuid}"))
+                .claim(|slots| {
+                    // Under `connects`, so the attempt can't retire before its slot exists.
+                    let connects = s.connects.lock();
+                    let generation = connects
+                        .generation(&addr)
+                        .ok_or_else(|| BlewError::NotConnected(did.clone()))?;
+                    let key = format!("{addr}:{generation}:write:{char_uuid}");
+                    Ok::<_, BlewError>(slots.try_claim(key).map(|(key, rx)| (generation, key, rx)))
                 })
                 .await?;
 
@@ -628,12 +629,16 @@ impl CentralBackend for AndroidCentral {
         async move {
             let s = state();
             // Done once the peer has taken the CCCD write, as on the other backends.
-            let mut generation = 0;
-            let (key, rx) = s
+            let (generation, key, rx) = s
                 .pending_ops
-                .claim(|| {
-                    generation = live_generation(s, &addr, &did)?;
-                    Ok::<_, BlewError>(format!("{addr}:{generation}:cccd:{char_uuid}"))
+                .claim(|slots| {
+                    // Under `connects`, so the attempt can't retire before its slot exists.
+                    let connects = s.connects.lock();
+                    let generation = connects
+                        .generation(&addr)
+                        .ok_or_else(|| BlewError::NotConnected(did.clone()))?;
+                    let key = format!("{addr}:{generation}:cccd:{char_uuid}");
+                    Ok::<_, BlewError>(slots.try_claim(key).map(|(key, rx)| (generation, key, rx)))
                 })
                 .await?;
             let status = jvm()
@@ -669,12 +674,16 @@ impl CentralBackend for AndroidCentral {
         async move {
             let s = state();
             // Done once the peer has taken the CCCD write, as on the other backends.
-            let mut generation = 0;
-            let (key, rx) = s
+            let (generation, key, rx) = s
                 .pending_ops
-                .claim(|| {
-                    generation = live_generation(s, &addr, &did)?;
-                    Ok::<_, BlewError>(format!("{addr}:{generation}:cccd:{char_uuid}"))
+                .claim(|slots| {
+                    // Under `connects`, so the attempt can't retire before its slot exists.
+                    let connects = s.connects.lock();
+                    let generation = connects
+                        .generation(&addr)
+                        .ok_or_else(|| BlewError::NotConnected(did.clone()))?;
+                    let key = format!("{addr}:{generation}:cccd:{char_uuid}");
+                    Ok::<_, BlewError>(slots.try_claim(key).map(|(key, rx)| (generation, key, rx)))
                 })
                 .await?;
             let status = jvm()

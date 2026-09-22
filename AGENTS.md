@@ -519,6 +519,10 @@ an operation that timed out keeps its `pendingNonces` entry until its late
 callback consumes it, and `claimKey` refuses a new operation on that key
 meanwhile. In Rust, `util::op_slots` makes a second read or write on a key
 wait for the first one's result, and it keeps the slot if the caller drops.
+The generation check and the slot registration happen together under
+`connects`, the lock `clear_attempt` runs under. Otherwise a reconnect landing
+between them registers a slot the retirement has already swept, for a result
+`with_generation` will drop as stale.
 **Don't free either on timeout or cancellation, and don't let a new operation
 replace the holder**: the old callback would then complete the new operation.
 This is the same rule as the notification gate below. Subscribe and

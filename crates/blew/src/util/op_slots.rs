@@ -9,9 +9,14 @@
 //! key waits for the slot rather than replacing it. Kotlin reports every
 //! operation it accepted exactly once, and a disconnect frees the attempt's
 //! slots through [`OpSlots::release_where`], so a wait always ends.
+//!
+//! That last part holds only if a slot can't be registered for an attempt
+//! that has already been retired: its retirement would have missed the slot,
+//! and its result would be dropped as stale. So [`OpSlots::claim`] leaves
+//! both the liveness check and [`OpSlots::try_claim`] to the caller, which
+//! does them under the lock that retirement takes.
 
 use std::collections::HashMap;
-use std::pin::pin;
 
 use parking_lot::Mutex;
 use tokio::sync::{Notify, oneshot};
@@ -33,27 +38,32 @@ impl<T> Default for OpSlots<T> {
 
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 impl<T> OpSlots<T> {
-    /// Hold the slot `key` names once it is free. `key` runs again after each
-    /// wait, so it sees a generation that changed meanwhile, and its error
-    /// ends the wait.
-    pub(crate) async fn claim<E>(
+    /// Wait until `attempt` claims a slot. `attempt` checks that its operation
+    /// is still live and calls [`Self::try_claim`], holding the lock that
+    /// retirement takes throughout. It runs again after every release, and its
+    /// error ends the wait.
+    pub(crate) async fn claim<R, E>(
         &self,
-        mut key: impl FnMut() -> Result<String, E>,
-    ) -> Result<(String, oneshot::Receiver<T>), E> {
+        mut attempt: impl FnMut(&Self) -> Result<Option<R>, E>,
+    ) -> Result<R, E> {
         loop {
-            let mut released = pin!(self.released.notified());
-            released.as_mut().enable();
-            let key = key()?;
-            {
-                let mut slots = self.slots.lock();
-                if !slots.contains_key(&key) {
-                    let (tx, rx) = oneshot::channel();
-                    slots.insert(key.clone(), tx);
-                    return Ok((key, rx));
-                }
+            let released = self.released.notified();
+            if let Some(claimed) = attempt(self)? {
+                return Ok(claimed);
             }
             released.await;
         }
+    }
+
+    /// Hold `key` if it is free.
+    pub(crate) fn try_claim(&self, key: String) -> Option<(String, oneshot::Receiver<T>)> {
+        let mut slots = self.slots.lock();
+        if slots.contains_key(&key) {
+            return None;
+        }
+        let (tx, rx) = oneshot::channel();
+        slots.insert(key.clone(), tx);
+        Some((key, rx))
     }
 
     /// Deliver the result for `key` and free its slot. `false` when no slot
@@ -82,8 +92,10 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    fn ok(key: &str) -> impl FnMut() -> Result<String, ()> + '_ {
-        move || Ok(key.to_owned())
+    type Claimed<T> = (String, oneshot::Receiver<T>);
+
+    fn ok<T>(key: &str) -> impl FnMut(&OpSlots<T>) -> Result<Option<Claimed<T>>, ()> + '_ {
+        move |slots| Ok(slots.try_claim(key.to_owned()))
     }
 
     #[tokio::test]
@@ -143,9 +155,9 @@ mod tests {
             let (slots, connected) = (slots.clone(), connected.clone());
             async move {
                 slots
-                    .claim(|| {
+                    .claim(|slots| {
                         if *connected.lock() {
-                            Ok("dev:1:x".to_owned())
+                            Ok(slots.try_claim("dev:1:x".to_owned()))
                         } else {
                             Err("not connected")
                         }
@@ -161,5 +173,28 @@ mod tests {
 
         assert!(first.await.is_err(), "the channel closes");
         assert_eq!(second.await.unwrap(), Err("not connected"));
+    }
+
+    /// The caller's lock (here `live`) covers the check and the registration,
+    /// and retirement takes it too, so there is no moment when an attempt has
+    /// retired but a slot can still be registered for it.
+    #[tokio::test]
+    async fn a_claim_for_a_retired_attempt_leaves_no_slot() {
+        let slots = OpSlots::<u8>::default();
+        let live = Mutex::new(Some(1));
+        let claim = |slots: &OpSlots<u8>| {
+            let live = live.lock();
+            let generation = live.ok_or("not connected")?;
+            Ok(slots.try_claim(format!("dev:{generation}:x")))
+        };
+
+        {
+            let mut live = live.lock();
+            *live = None;
+            slots.release_where(|key| key.starts_with("dev:1:"));
+        }
+
+        assert_eq!(slots.claim(claim).await.map(|_| ()), Err("not connected"));
+        assert!(slots.slots.lock().is_empty());
     }
 }
