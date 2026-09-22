@@ -31,7 +31,7 @@ use jni::objects::{JByteArray, JClass, JString};
 use jni::sys::{JNI_TRUE, jboolean, jint};
 use jni::{EnvUnowned, jni_sig, jni_str};
 use tokio::sync::oneshot;
-use tracing::trace;
+use tracing::{debug, trace};
 use uuid::Uuid;
 
 use crate::central::types::{CentralEvent, DisconnectCause};
@@ -421,6 +421,13 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnConnect
             let Some(addr) = jstring_to_string(env, &device_addr) else {
                 return Ok::<_, jni::errors::Error>(());
             };
+            debug!(
+                addr,
+                generation,
+                connected = connected == JNI_TRUE,
+                gatt_status,
+                "GATT connection state changed"
+            );
             let cause = match gatt_status {
                 0 | 22 => DisconnectCause::LocalClose,
                 8 => DisconnectCause::LinkLoss,
@@ -490,6 +497,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnCharact
             let result = if status == 0 {
                 Ok(data)
             } else {
+                debug!(addr, generation, char_uuid = %chr, status, "GATT read failed");
                 Err(crate::error::BlewError::Gatt {
                     device_id: DeviceId::from(addr.as_str()),
                     source: format!("GATT read failed: status {status}").into(),
@@ -528,6 +536,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnCharact
             let result = if status == 0 {
                 Ok(vec![])
             } else {
+                debug!(addr, generation, char_uuid = %chr, status, "GATT write failed");
                 Err(crate::error::BlewError::Gatt {
                     device_id: DeviceId::from(addr.as_str()),
                     source: format!("GATT write failed: status {status}").into(),
@@ -535,6 +544,45 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnCharact
             };
 
             let key = format!("{addr}:{generation}:write:{chr}");
+            super::central::with_generation(&addr, generation, || {
+                super::central::complete_pending(&key, result);
+            });
+
+            Ok(())
+        })
+        .into_outcome();
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnDescriptorWrite(
+    mut env: EnvUnowned,
+    _class: JClass,
+    device_addr: JString,
+    generation: jint,
+    char_uuid: JString,
+    status: jint,
+) {
+    guard("nativeOnDescriptorWrite", || {
+        env.with_env(|env| {
+            let Some(addr) = jstring_to_string(env, &device_addr) else {
+                return Ok::<_, jni::errors::Error>(());
+            };
+            let Some(chr) = jstring_to_string(env, &char_uuid) else {
+                return Ok::<_, jni::errors::Error>(());
+            };
+
+            let result = if status == 0 {
+                Ok(vec![])
+            } else {
+                debug!(addr, generation, char_uuid = %chr, status, "CCCD write failed");
+                Err(crate::error::BlewError::Gatt {
+                    device_id: DeviceId::from(addr.as_str()),
+                    source: format!("CCCD write failed: status {status}").into(),
+                })
+            };
+
+            let key = format!("{addr}:{generation}:cccd:{chr}");
             super::central::with_generation(&addr, generation, || {
                 super::central::complete_pending(&key, result);
             });
@@ -566,6 +614,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnCharact
                 return Ok::<_, jni::errors::Error>(());
             };
             let data = jbytes_to_vec(env, &value);
+            trace!(addr, generation, %char_id, len = data.len(), "notification received");
 
             super::central::with_generation(&addr, generation, || {
                 super::central::send_event(CentralEvent::CharacteristicNotification {

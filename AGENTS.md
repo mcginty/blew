@@ -501,6 +501,36 @@ on `onNotificationSent`, Kotlin could only echo whichever send is current, which
 is the same flaw. A device whose callback never comes fails later sends with a
 timeout (the deadline covers waiting for the gate), not hangs and not overlaps.
 
+**A write without response holds the GATT client until `onCharacteristicWrite`.**
+`BluetoothGatt` sets `mDeviceBusy` on every write, no-response included, and
+clears it only in that callback; a write or read kicked before it is refused
+(`ERROR_GATT_WRITE_REQUEST_BUSY`, or `false`). So `GattConnections` waits for
+the callback before freeing the queue, and the Rust `write_characteristic`
+waits for it too, which is also the only way a refused write reaches the caller
+(#52). **Don't complete a no-response write when the kick returns**: that is
+what made the next operation fail, and made `write_characteristic` return `Ok`
+for a packet that never went out. The callback isn't optional: without it the
+platform itself stays busy.
+
+A GATT result names only device, generation and characteristic, so each key
+has at most one operation in flight on both sides of the bridge, and it keeps
+the key until its own result arrives, even after its caller gave up. In Kotlin,
+an operation that timed out keeps its `pendingNonces` entry until its late
+callback consumes it, and `claimKey` refuses a new operation on that key
+meanwhile. In Rust, `util::op_slots` makes a second read or write on a key
+wait for the first one's result, and it keeps the slot if the caller drops.
+The generation check and the slot registration happen together under
+`connects`, the lock `clear_attempt` runs under. Otherwise a reconnect landing
+between them registers a slot the retirement has already swept, for a result
+`with_generation` will drop as stale.
+**Don't free either on timeout or cancellation, and don't let a new operation
+replace the holder**: the old callback would then complete the new operation.
+This is the same rule as the notification gate below. Subscribe and
+unsubscribe follow it too, under a `cccd` key: Kotlin reports the descriptor
+write through `nativeOnDescriptorWrite`, including the unsubscribe that has no
+CCCD to write, since `op_slots` expects every operation Kotlin accepted to be
+reported exactly once.
+
 **Local-name invariant.** `AdvertisingConfig::local_name` (`LocalName`) is a
 permission, not just a value. Android has no per-advertisement name, so
 `AllowPermanent` is the only variant that reaches `BluetoothAdapter.setName`,

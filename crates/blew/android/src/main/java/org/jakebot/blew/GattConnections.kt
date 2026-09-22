@@ -16,6 +16,27 @@ internal fun interface GattFactory {
     ): BluetoothGatt?
 }
 
+/** A kick the platform refused, with the status code it gave. */
+private class KickRefused(
+    message: String,
+) : IllegalStateException(message)
+
+private fun statusName(code: Int): String {
+    val name =
+        when (code) {
+            BluetoothStatusCodes.ERROR_BLUETOOTH_NOT_ENABLED -> "ERROR_BLUETOOTH_NOT_ENABLED"
+            BluetoothStatusCodes.ERROR_BLUETOOTH_NOT_ALLOWED -> "ERROR_BLUETOOTH_NOT_ALLOWED"
+            BluetoothStatusCodes.ERROR_DEVICE_NOT_BONDED -> "ERROR_DEVICE_NOT_BONDED"
+            BluetoothStatusCodes.ERROR_MISSING_BLUETOOTH_CONNECT_PERMISSION -> "ERROR_MISSING_BLUETOOTH_CONNECT_PERMISSION"
+            BluetoothStatusCodes.ERROR_PROFILE_SERVICE_NOT_BOUND -> "ERROR_PROFILE_SERVICE_NOT_BOUND"
+            BluetoothStatusCodes.ERROR_GATT_WRITE_NOT_ALLOWED -> "ERROR_GATT_WRITE_NOT_ALLOWED"
+            BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY -> "ERROR_GATT_WRITE_REQUEST_BUSY"
+            BluetoothStatusCodes.ERROR_UNKNOWN -> "ERROR_UNKNOWN"
+            else -> return code.toString()
+        }
+    return "$name ($code)"
+}
+
 /**
  * The monitor orders admission, callbacks, operation kicks and retirement, including
  * delivery to Rust. Rust must never hold its lifecycle lock across a JNI call.
@@ -47,7 +68,6 @@ internal class GattConnections(
         var mtu = 23
         val queue = GattOperationQueue("gatt-$addr-$generation", scope.coroutineContext)
         val pendingNonces = mutableMapOf<String, Long>()
-        var noResponseHandled = false
     }
 
     private val lock = Any()
@@ -186,6 +206,23 @@ internal class GattConnections(
 
     fun getMtu(deviceAddr: String): Int = synchronized(lock) { attempts[deviceAddr]?.mtu ?: 23 }
 
+    /**
+     * Hold [key] for the running operation until its callback arrives. A callback names
+     * only its characteristic, so an operation that timed out keeps the key until its
+     * late callback comes: a newer one registered under it would take that callback as
+     * its own. Only the callback or retirement frees the key.
+     */
+    private fun claimKey(
+        attempt: Attempt,
+        key: String,
+        nonce: Long,
+    ) {
+        if (key in attempt.pendingNonces) {
+            throw KickRefused("$key still owes its callback to an operation that timed out")
+        }
+        attempt.pendingNonces[key] = nonce
+    }
+
     private fun <T> completeOp(
         attempt: Attempt,
         key: String,
@@ -193,6 +230,11 @@ internal class GattConnections(
     ): Boolean {
         if (!isLive(attempt)) return false
         val nonce = attempt.pendingNonces.remove(key) ?: return false
+        // The operation that held the key timed out and has been reported; see claimKey.
+        if (attempt.queue.currentNonce() != nonce) {
+            Log.d(TAG, "late callback $key after its operation finished; dropped")
+            return false
+        }
         attempt.queue.completeCurrent(nonce, value)
         return true
     }
@@ -204,6 +246,7 @@ internal class GattConnections(
                 status: Int,
                 newState: Int,
             ) {
+                Log.i(TAG, "connection state ${attempt.addr} gen ${attempt.generation}: newState=$newState status=$status")
                 synchronized(lock) {
                     attempt.gatt = gatt
                     if (!isLive(attempt)) {
@@ -223,14 +266,18 @@ internal class GattConnections(
                         attempt.connected = true
                         val q = attempt.queue
                         scope.launch {
-                            q.enqueue<Int>("request-mtu", 5000L, kick = {
-                                synchronized(lock) {
-                                    if (!isLive(attempt) || attempt.disconnecting) return@enqueue false
-                                    val nonce = q.currentNonce() ?: return@enqueue false
-                                    attempt.pendingNonces["${attempt.addr}:mtu"] = nonce
-                                    gatt.requestMtu(512)
-                                }
-                            })
+                            val mtuResult =
+                                q.enqueue<Int>("request-mtu", 5000L, kick = {
+                                    synchronized(lock) {
+                                        if (!isLive(attempt) || attempt.disconnecting) return@enqueue false
+                                        val nonce = q.currentNonce() ?: return@enqueue false
+                                        claimKey(attempt, "${attempt.addr}:mtu", nonce)
+                                        gatt.requestMtu(512)
+                                    }
+                                })
+                            if (mtuResult.isFailure) {
+                                Log.w(TAG, "MTU request failed for ${attempt.addr}: ${mtuResult.exceptionOrNull()?.message}")
+                            }
                             synchronized(lock) {
                                 if (!isLive(attempt) || attempt.disconnecting) return@launch
                                 events.onConnectionStateChanged(attempt.addr, attempt.generation, true, 0)
@@ -250,6 +297,8 @@ internal class GattConnections(
                     if (status == BluetoothGatt.GATT_SUCCESS) {
                         attempt.mtu = mtu
                         events.onMtuChanged(attempt.addr, attempt.generation, mtu)
+                    } else {
+                        Log.w(TAG, "MTU change failed for ${attempt.addr}: status=$status mtu=$mtu")
                     }
                     completeOp(attempt, "${attempt.addr}:mtu", mtu)
                 }
@@ -261,6 +310,9 @@ internal class GattConnections(
             ) {
                 synchronized(lock) {
                     if (!completeOp(attempt, "${attempt.addr}:services", Unit)) return
+                    if (status != BluetoothGatt.GATT_SUCCESS) {
+                        Log.w(TAG, "service discovery failed for ${attempt.addr}: status=$status")
+                    }
                     events.onServicesDiscovered(
                         attempt.addr,
                         attempt.generation,
@@ -278,6 +330,7 @@ internal class GattConnections(
                 synchronized(lock) {
                     val uuid = characteristic.uuid.toString()
                     if (!completeOp(attempt, "${attempt.addr}:read:$uuid", Unit)) return
+                    if (status != BluetoothGatt.GATT_SUCCESS) Log.w(TAG, "read $uuid failed: status=$status")
                     events.onCharacteristicRead(attempt.addr, attempt.generation, uuid, value, status)
                 }
             }
@@ -288,13 +341,9 @@ internal class GattConnections(
                 status: Int,
             ) {
                 synchronized(lock) {
-                    if (!isLive(attempt)) return
-                    if (attempt.noResponseHandled) {
-                        attempt.noResponseHandled = false
-                        return
-                    }
                     val uuid = characteristic.uuid.toString()
                     if (!completeOp(attempt, "${attempt.addr}:write:$uuid", status)) return
+                    if (status != BluetoothGatt.GATT_SUCCESS) Log.w(TAG, "write $uuid failed: status=$status")
                     events.onCharacteristicWrite(attempt.addr, attempt.generation, uuid, status)
                 }
             }
@@ -305,7 +354,10 @@ internal class GattConnections(
                 status: Int,
             ) {
                 synchronized(lock) {
-                    completeOp(attempt, "${attempt.addr}:cccd:${descriptor.characteristic.uuid}", Unit)
+                    val uuid = descriptor.characteristic.uuid.toString()
+                    if (!completeOp(attempt, "${attempt.addr}:cccd:$uuid", Unit)) return
+                    if (status != BluetoothGatt.GATT_SUCCESS) Log.w(TAG, "CCCD write for $uuid failed: status=$status")
+                    events.onDescriptorWrite(attempt.addr, attempt.generation, uuid, status)
                 }
             }
 
@@ -341,7 +393,7 @@ internal class GattConnections(
                                 if (!isLive(attempt) || attempt.disconnecting) return@enqueue false
                                 val nonce = q.currentNonce() ?: return@enqueue false
                                 val key = "$deviceAddr:services"
-                                attempt.pendingNonces[key] = nonce
+                                claimKey(attempt, key, nonce)
                                 val started = gatt.discoverServices()
                                 if (!started) {
                                     attempt.pendingNonces.remove(key)
@@ -384,7 +436,7 @@ internal class GattConnections(
                                 if (!isLive(attempt) || attempt.disconnecting) return@enqueue false
                                 val nonce = q.currentNonce() ?: return@enqueue false
                                 val key = "$deviceAddr:read:$charUuid"
-                                attempt.pendingNonces[key] = nonce
+                                claimKey(attempt, key, nonce)
                                 val started = gatt.readCharacteristic(char)
                                 if (!started) {
                                     attempt.pendingNonces.remove(key)
@@ -429,22 +481,13 @@ internal class GattConnections(
                                 if (!isLive(attempt) || attempt.disconnecting) return@enqueue false
                                 val nonce = q.currentNonce() ?: return@enqueue false
                                 val nonceKey = "$deviceAddr:write:$charUuid"
-                                if (writeType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) {
-                                    // Mark before the framework can fire onCharacteristicWrite.
-                                    attempt.noResponseHandled = true
-                                } else {
-                                    attempt.pendingNonces[nonceKey] = nonce
-                                }
+                                // Android holds every write, no-response included, busy until
+                                // onCharacteristicWrite; the next kick before it is refused.
+                                claimKey(attempt, nonceKey, nonce)
                                 val ret = gatt.writeCharacteristic(char, value, writeType)
                                 if (ret != BluetoothStatusCodes.SUCCESS) {
-                                    attempt.noResponseHandled = false
                                     attempt.pendingNonces.remove(nonceKey)
-                                    return@enqueue false
-                                }
-                                if (writeType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) {
-                                    // Don't wait for a callback the platform may not deliver.
-                                    q.completeCurrent<Int>(nonce, BluetoothGatt.GATT_SUCCESS)
-                                    attempt.noResponseHandled = false
+                                    throw KickRefused("writeCharacteristic returned ${statusName(ret)}")
                                 }
                                 true
                             }
@@ -455,11 +498,8 @@ internal class GattConnections(
                     if (result.isFailure) {
                         Log.w(TAG, "write $charUuid queue failed: ${result.exceptionOrNull()?.message}")
                         events.onCharacteristicWrite(deviceAddr, generation, charUuid, BluetoothGatt.GATT_FAILURE)
-                    } else if (writeType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) {
-                        events.onCharacteristicWrite(deviceAddr, generation, charUuid, BluetoothGatt.GATT_SUCCESS)
                     }
-                    // For write-with-response, onCharacteristicWrite fires the native
-                    // callback after calling completeCurrent — don't duplicate here.
+                    // On success onCharacteristicWrite has already reported.
                 }
             }
             return STATUS_SUCCESS
@@ -494,7 +534,7 @@ internal class GattConnections(
                                 if (!isLive(attempt) || attempt.disconnecting) return@enqueue false
                                 val nonce = q.currentNonce() ?: return@enqueue false
                                 val key = "$deviceAddr:cccd:$charUuid"
-                                attempt.pendingNonces[key] = nonce
+                                claimKey(attempt, key, nonce)
                                 val ret =
                                     gatt.writeDescriptor(
                                         descriptor,
@@ -502,8 +542,9 @@ internal class GattConnections(
                                     )
                                 if (ret != BluetoothStatusCodes.SUCCESS) {
                                     attempt.pendingNonces.remove(key)
+                                    throw KickRefused("writeDescriptor returned ${statusName(ret)}")
                                 }
-                                ret == BluetoothStatusCodes.SUCCESS
+                                true
                             }
                         },
                     )
@@ -511,6 +552,7 @@ internal class GattConnections(
                     if (!isLive(attempt)) return@launch
                     if (result.isFailure) {
                         Log.w(TAG, "subscribe $charUuid queue failed: ${result.exceptionOrNull()?.message}")
+                        events.onDescriptorWrite(deviceAddr, generation, charUuid, BluetoothGatt.GATT_FAILURE)
                     }
                 }
             }
@@ -548,7 +590,7 @@ internal class GattConnections(
                                     if (!isLive(attempt) || attempt.disconnecting) return@enqueue false
                                     val nonce = q.currentNonce() ?: return@enqueue false
                                     val key = "$deviceAddr:cccd:$charUuid"
-                                    attempt.pendingNonces[key] = nonce
+                                    claimKey(attempt, key, nonce)
                                     val ret =
                                         gatt.writeDescriptor(
                                             descriptor,
@@ -556,8 +598,9 @@ internal class GattConnections(
                                         )
                                     if (ret != BluetoothStatusCodes.SUCCESS) {
                                         attempt.pendingNonces.remove(key)
+                                        throw KickRefused("writeDescriptor returned ${statusName(ret)}")
                                     }
-                                    ret == BluetoothStatusCodes.SUCCESS
+                                    true
                                 }
                             },
                         )
@@ -565,9 +608,13 @@ internal class GattConnections(
                         if (!isLive(attempt)) return@launch
                         if (result.isFailure) {
                             Log.w(TAG, "unsubscribe $charUuid queue failed: ${result.exceptionOrNull()?.message}")
+                            events.onDescriptorWrite(deviceAddr, generation, charUuid, BluetoothGatt.GATT_FAILURE)
                         }
                     }
                 }
+            } else {
+                // Nothing to write, and so no callback to wait for: report it done here.
+                events.onDescriptorWrite(deviceAddr, generation, charUuid, BluetoothGatt.GATT_SUCCESS)
             }
             return STATUS_SUCCESS
         }
@@ -635,6 +682,14 @@ internal interface GattEvents {
     )
 
     fun onCharacteristicWrite(
+        deviceAddr: String,
+        generation: Int,
+        charUuid: String,
+        status: Int,
+    )
+
+    /** The CCCD write a subscribe or unsubscribe issued for [charUuid] finished. */
+    fun onDescriptorWrite(
         deviceAddr: String,
         generation: Int,
         charUuid: String,
