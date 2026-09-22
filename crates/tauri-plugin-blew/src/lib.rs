@@ -23,6 +23,9 @@ static AUTO_REQUEST_PERMISSIONS: AtomicBool = AtomicBool::new(true);
 #[cfg(target_os = "android")]
 static PERMISSIONS_TX: OnceLock<broadcast::Sender<BlePermissionStatus>> = OnceLock::new();
 
+#[cfg(target_os = "android")]
+static ADAPTER_TX: OnceLock<broadcast::Sender<BleAdapterStatus>> = OnceLock::new();
+
 /// Current status of the aggregate Android BLE runtime permissions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlePermissionStatus {
@@ -37,6 +40,22 @@ impl BlePermissionStatus {
     #[must_use]
     pub fn is_granted(self) -> bool {
         matches!(self, BlePermissionStatus::Granted)
+    }
+}
+
+/// Power state of the Android Bluetooth adapter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BleAdapterStatus {
+    /// The adapter finished powering on.
+    PoweredOn,
+    /// The adapter finished powering off.
+    PoweredOff,
+}
+
+impl BleAdapterStatus {
+    #[must_use]
+    pub fn is_powered(self) -> bool {
+        matches!(self, BleAdapterStatus::PoweredOn)
     }
 }
 
@@ -145,6 +164,29 @@ pub fn permission_events() -> blew::util::BroadcastEventStream<BlePermissionStat
     blew::util::BroadcastEventStream::new(tx.subscribe())
 }
 
+/// Subscribe to Android Bluetooth adapter power-state events.
+///
+/// Emits a [`BleAdapterStatus`] each time the adapter finishes turning on or
+/// off, whether from [`request_enable_bluetooth`], quick settings or system
+/// Settings. Unlike the `AdapterStateChanged` events on blew's Central and
+/// Peripheral streams, this needs neither role to exist, which suits UI such
+/// as a "turn Bluetooth on" prompt. The current state is not replayed on
+/// subscribe.
+///
+/// This stream is fed by the plugin's own broadcast receiver, so it is **not**
+/// ordered against the backends' power-cycle cleanup. Re-adding services or
+/// restarting advertising belongs on the Peripheral's `AdapterStateChanged`,
+/// which is emitted only after that cleanup.
+///
+/// **Android only** — this function does not exist on other targets, so
+/// cross-platform callers must `#[cfg]`-gate the call, as with
+/// [`permission_events`].
+#[cfg(target_os = "android")]
+pub fn adapter_events() -> blew::util::BroadcastEventStream<BleAdapterStatus> {
+    let tx = ADAPTER_TX.get_or_init(|| broadcast::channel(16).0);
+    blew::util::BroadcastEventStream::new(tx.subscribe())
+}
+
 /// Check whether the app is running on an emulator or simulator.
 ///
 /// Returns `true` on Android emulators and iOS simulators, `false` on real devices
@@ -172,6 +214,7 @@ pub fn init_with_config<R: Runtime>(config: BlewPluginConfig) -> TauriPlugin<R> 
     {
         AUTO_REQUEST_PERMISSIONS.store(config.auto_request_permissions, Ordering::Relaxed);
         let _ = PERMISSIONS_TX.get_or_init(|| broadcast::channel(16).0);
+        let _ = ADAPTER_TX.get_or_init(|| broadcast::channel(16).0);
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -291,6 +334,31 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BlewPluginNative_onPermissionsCha
         BlePermissionStatus::Denied
     };
     if let Some(tx) = PERMISSIONS_TX.get() {
+        let _ = tx.send(status);
+    }
+}
+
+/// JNI entry point invoked from `BlewPluginNative.onAdapterStateChanged(powered)`
+/// on Android when the plugin's receiver sees the adapter reach `STATE_ON` or
+/// `STATE_OFF`.
+///
+/// # Safety
+///
+/// Invoked by the JVM through the normal JNI calling convention; safe provided
+/// the signature matches the Kotlin `external fun` declaration.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_org_jakebot_blew_BlewPluginNative_onAdapterStateChanged(
+    _env: jni::EnvUnowned,
+    _class: jni::objects::JClass,
+    powered: jni::sys::jboolean,
+) {
+    let status = if powered {
+        BleAdapterStatus::PoweredOn
+    } else {
+        BleAdapterStatus::PoweredOff
+    };
+    if let Some(tx) = ADAPTER_TX.get() {
         let _ = tx.send(status);
     }
 }

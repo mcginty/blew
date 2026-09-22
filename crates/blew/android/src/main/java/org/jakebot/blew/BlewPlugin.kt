@@ -4,8 +4,10 @@ import android.Manifest
 import android.app.Activity
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
@@ -36,6 +38,27 @@ class BlewPlugin(
         // `null` means no snapshot recorded yet (initial state).
         @Volatile
         private var lastPermissionsGranted: Boolean? = null
+
+        // Holds no Activity: it is registered on the application context and
+        // outlives every recreation.
+        private val adapterStateReceiver =
+            object : BroadcastReceiver() {
+                override fun onReceive(
+                    context: Context,
+                    intent: Intent,
+                ) {
+                    if (intent.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
+                    when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                        BluetoothAdapter.STATE_ON -> BlewPluginNative.onAdapterStateChanged(true)
+                        BluetoothAdapter.STATE_OFF -> BlewPluginNative.onAdapterStateChanged(false)
+                    }
+                }
+            }
+
+        // load() runs again for every recreated Activity; registering twice
+        // would deliver every change twice.
+        @Volatile
+        private var adapterReceiverRegistered = false
 
         @JvmStatic
         fun requestBlePermissions() {
@@ -143,6 +166,14 @@ class BlewPlugin(
 
         lastPermissionsGranted = computeAggregateGranted(activity)
 
+        if (!adapterReceiverRegistered) {
+            ctx.registerReceiver(
+                adapterStateReceiver,
+                IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
+            )
+            adapterReceiverRegistered = true
+        }
+
         if (BlewPluginNative.autoRequestPermissionsEnabled()) {
             requestOnActivity(activity)
         }
@@ -165,4 +196,6 @@ internal object BlewPluginNative {
     @JvmStatic external fun autoRequestPermissionsEnabled(): Boolean
 
     @JvmStatic external fun onPermissionsChanged(granted: Boolean)
+
+    @JvmStatic external fun onAdapterStateChanged(powered: Boolean)
 }
