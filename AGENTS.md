@@ -501,6 +501,19 @@ on `onNotificationSent`, Kotlin could only echo whichever send is current, which
 is the same flaw. A device whose callback never comes fails later sends with a
 timeout (the deadline covers waiting for the gate), not hangs and not overlaps.
 
+**A write without response holds the GATT client until `onCharacteristicWrite`.**
+`BluetoothGatt` sets `mDeviceBusy` on every write, no-response included, and
+clears it only in that callback; a write or read kicked before it is refused
+(`ERROR_GATT_WRITE_REQUEST_BUSY`, or `false`). So `GattConnections` waits for
+the callback before freeing the queue, and the Rust `write_characteristic`
+waits for it too, which is also the only way a refused write reaches the caller
+(#52). **Don't complete a no-response write when the kick returns**: that is
+what made the next operation fail, and made `write_characteristic` return `Ok`
+for a packet that never went out. The callback isn't optional: without it the
+platform itself stays busy. `completeOp` accepts a callback only for the
+operation currently running, so one that arrives after its timeout is dropped
+rather than completing a later operation.
+
 **Local-name invariant.** `AdvertisingConfig::local_name` (`LocalName`) is a
 permission, not just a value. Android has no per-advertisement name, so
 `AllowPermanent` is the only variant that reaches `BluetoothAdapter.setName`,

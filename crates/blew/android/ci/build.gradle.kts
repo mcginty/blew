@@ -8,7 +8,7 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        minSdk = 24
+        minSdk = 33
     }
 
     // Compile the real sources in place rather than copying them.

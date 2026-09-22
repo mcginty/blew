@@ -141,10 +141,16 @@ pub(crate) fn complete_discover_services(addr: &str, result: BlewResult<Vec<Gatt
 }
 
 pub(crate) fn complete_pending(key: &str, result: BlewResult<Vec<u8>>) {
-    if let Some(s) = STATE.get()
-        && let Some(tx) = s.pending_ops.lock().remove(&key.to_owned())
-    {
+    let Some(s) = STATE.get() else { return };
+    let pending = s.pending_ops.lock().remove(&key.to_owned());
+    if let Some(tx) = pending {
         let _ = tx.send(result);
+    } else {
+        debug!(
+            key,
+            ok = result.is_ok(),
+            "GATT result arrived with no waiter"
+        );
     }
 }
 
@@ -568,19 +574,16 @@ impl CentralBackend for AndroidCentral {
                 let generation = connects
                     .generation(&addr)
                     .ok_or_else(|| BlewError::NotConnected(did.clone()))?;
-                // For write-without-response, don't wait for a callback.
-                let (rx, pending_key) = if write_type == WriteType::WithResponse {
-                    let (tx, rx) = oneshot::channel();
-                    let key = format!("{addr}:{generation}:write:{char_uuid}");
-                    if let Some(evicted) = s.pending_ops.lock().insert(key.clone(), tx) {
-                        let _ = evicted.send(Err(BlewError::GattBusy(did.clone())));
-                    }
-                    (Some(rx), Some(key))
-                } else {
-                    (None, None)
-                };
+                // Android holds every write busy until onCharacteristicWrite, so a
+                // write without response waits for it too: the next one would be
+                // refused, and this is the only way its failure reaches the caller.
+                let (tx, rx) = oneshot::channel();
+                let key = format!("{addr}:{generation}:write:{char_uuid}");
+                if let Some(evicted) = s.pending_ops.lock().insert(key.clone(), tx) {
+                    let _ = evicted.send(Err(BlewError::GattBusy(did.clone())));
+                }
 
-                (generation, rx, pending_key)
+                (generation, rx, key)
             };
 
             let status = jvm()
@@ -607,16 +610,12 @@ impl CentralBackend for AndroidCentral {
                 .map_err(|e| jni_err(&e))?;
 
             if status != STATUS_SUCCESS {
-                if let Some(key) = pending_key {
-                    s.pending_ops.lock().remove(&key);
-                }
+                s.pending_ops.lock().remove(&pending_key);
                 return Err(gatt_status_to_error(status, &did, char_uuid));
             }
 
-            if let Some(rx) = rx {
-                rx.await
-                    .map_err(|_| BlewError::DisconnectedDuringOperation(did))??;
-            }
+            rx.await
+                .map_err(|_| BlewError::DisconnectedDuringOperation(did))??;
 
             Ok(())
         }

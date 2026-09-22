@@ -31,7 +31,7 @@ use jni::objects::{JByteArray, JClass, JString};
 use jni::sys::{JNI_TRUE, jboolean, jint};
 use jni::{EnvUnowned, jni_sig, jni_str};
 use tokio::sync::oneshot;
-use tracing::trace;
+use tracing::{debug, trace};
 use uuid::Uuid;
 
 use crate::central::types::{CentralEvent, DisconnectCause};
@@ -421,6 +421,13 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnConnect
             let Some(addr) = jstring_to_string(env, &device_addr) else {
                 return Ok::<_, jni::errors::Error>(());
             };
+            debug!(
+                addr,
+                generation,
+                connected = connected == JNI_TRUE,
+                gatt_status,
+                "GATT connection state changed"
+            );
             let cause = match gatt_status {
                 0 | 22 => DisconnectCause::LocalClose,
                 8 => DisconnectCause::LinkLoss,
@@ -490,6 +497,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnCharact
             let result = if status == 0 {
                 Ok(data)
             } else {
+                debug!(addr, generation, char_uuid = %chr, status, "GATT read failed");
                 Err(crate::error::BlewError::Gatt {
                     device_id: DeviceId::from(addr.as_str()),
                     source: format!("GATT read failed: status {status}").into(),
@@ -528,6 +536,7 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnCharact
             let result = if status == 0 {
                 Ok(vec![])
             } else {
+                debug!(addr, generation, char_uuid = %chr, status, "GATT write failed");
                 Err(crate::error::BlewError::Gatt {
                     device_id: DeviceId::from(addr.as_str()),
                     source: format!("GATT write failed: status {status}").into(),
