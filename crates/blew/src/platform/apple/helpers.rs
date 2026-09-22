@@ -1,11 +1,29 @@
 //! Shared helpers for Apple platform backends.
 
+use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2_core_bluetooth::CBUUID;
 use objc2_foundation::NSString;
 use uuid::Uuid;
 
 use crate::types::DeviceId;
+
+/// Where a turn runs: a manager's serial queue, which its delegate runs on too.
+///
+/// Code issued in a turn is ordered against every delegate callback, which is
+/// how a backend orders a command against the state those callbacks change.
+/// Don't get that ordering from a lock the delegate queue also takes, held
+/// across a CoreBluetooth call instead: CoreBluetooth waiting on its own queue
+/// would deadlock.
+pub(crate) trait TurnQueue {
+    fn run(&self, turn: Box<dyn FnOnce() + Send>);
+}
+
+impl TurnQueue for DispatchQueue {
+    fn run(&self, turn: Box<dyn FnOnce() + Send>) {
+        self.exec_async(turn);
+    }
+}
 
 /// Wraps `Retained<T>` to assert `Send + Sync`.
 ///

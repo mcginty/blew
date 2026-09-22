@@ -168,15 +168,22 @@ rx.await...
 **Apple central: a write without response waits for `canSendWriteWithoutResponse`.**
 When it is false, CoreBluetooth may drop the write and reports nothing, so
 `write_without_response` waits for `peripheralIsReadyToSendWriteWithoutResponse:`
-(or a disconnect) through `write_ready`, bounded at 5 s. The check and the write
-it admits happen under `write_gate`, so two writers can't both pass one check.
-The wait is created before each check, since `notify_waiters` reaches only a
-`Notified` that already exists. A waiting write belongs to the connection it
-was issued on: `send_when_ready` records the device's `disconnects` count first
-and fails with `NotConnected` once it moves. Waking the waiter isn't enough,
-because a `DeviceId` survives a reconnect and the retry would otherwise send
-the old payload on the new connection. **Don't go back to writing
-unconditionally.**
+(or a disconnect) through `write_ready`, bounded at 5 s. The wait is created
+before each attempt, since `notify_waiters` reaches only a `Notified` that
+already exists.
+
+A waiting write belongs to the connection it was issued on, and a `DeviceId`
+survives a reconnect. So `send_when_ready` records the device's `disconnects`
+count, and each attempt checks it and sends in **one turn on the manager
+queue**, where `didDisconnectPeripheral:` bumps it. A disconnect therefore
+lands wholly before the turn (the write fails with `NotConnected`) or wholly
+after it (the write went out on the old connection). Checking on the calling
+thread leaves a gap in which a disconnect and reconnect send the old payload on
+the new connection, and so does checking again after the send. The same turn
+also keeps two writers from passing one `canSendWriteWithoutResponse`. **Don't
+move the check or the send off the queue, and don't go back to writing
+unconditionally.** `TurnQueue` lives in `helpers.rs`, shared with the
+peripheral.
 
 **Apple peripheral power cycles and callback waiters.** The reasons live in the
 code; these are the rules.
