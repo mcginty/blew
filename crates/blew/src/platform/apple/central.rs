@@ -109,6 +109,9 @@ struct CentralInner {
     /// Held across the readiness check and the write it admits, so two writers
     /// can't both pass one check.
     write_gate: Mutex<()>,
+    /// Bumped by every disconnect, so a write waiting for room can tell that
+    /// the connection it was issued on has gone, even if the device is back.
+    disconnects: DisconnectCounts,
     /// Pending `open_l2cap_channel` results, keyed by device ID.
     l2cap_pendings: KeyedRequestMap<DeviceId, oneshot::Sender<BlewResult<L2capChannel>>>,
     event_tx: broadcast::Sender<CentralEvent>,
@@ -139,6 +142,7 @@ impl CentralInner {
             notify_states: Default::default(),
             write_ready: Notify::new(),
             write_gate: Mutex::new(()),
+            disconnects: DisconnectCounts::default(),
             l2cap_pendings: Default::default(),
             event_tx,
             restored: Mutex::new(None),
@@ -208,9 +212,13 @@ async fn write_without_response(
     char_uuid: Uuid,
     value: &[u8],
 ) -> BlewResult<()> {
-    let sent = retry_when_ready(&inner.write_ready, WRITE_READY_TIMEOUT, || {
-        try_write_without_response(inner, device_id, char_uuid, value)
-    })
+    let sent = send_when_ready(
+        &inner.write_ready,
+        &inner.disconnects,
+        device_id,
+        WRITE_READY_TIMEOUT,
+        || try_write_without_response(inner, device_id, char_uuid, value),
+    )
     .await?;
     if !sent {
         warn!(%device_id, %char_uuid, "CoreBluetooth never had room for a write without response");
@@ -220,6 +228,41 @@ async fn write_without_response(
         });
     }
     Ok(())
+}
+
+/// How many times each device has disconnected. A `DeviceId` survives a
+/// reconnect, so this is what tells one connection from the next.
+#[derive(Default)]
+struct DisconnectCounts(Mutex<HashMap<DeviceId, u64>>);
+
+impl DisconnectCounts {
+    fn current(&self, device_id: &DeviceId) -> u64 {
+        self.0.lock().get(device_id).copied().unwrap_or(0)
+    }
+
+    fn bump(&self, device_id: &DeviceId) {
+        *self.0.lock().entry(device_id.clone()).or_default() += 1;
+    }
+}
+
+/// [`retry_when_ready`] for a write issued on the connection `device_id` has
+/// now: once that connection drops, the write fails with `NotConnected` rather
+/// than go out on whichever connection replaced it.
+async fn send_when_ready(
+    ready: &Notify,
+    disconnects: &DisconnectCounts,
+    device_id: &DeviceId,
+    timeout: Duration,
+    mut send: impl FnMut() -> BlewResult<bool>,
+) -> BlewResult<bool> {
+    let connection = disconnects.current(device_id);
+    retry_when_ready(ready, timeout, || {
+        if disconnects.current(device_id) != connection {
+            return Err(BlewError::NotConnected(device_id.clone()));
+        }
+        send()
+    })
+    .await
 }
 
 /// Run `attempt` until it succeeds, again each time `ready` is notified.
@@ -435,6 +478,7 @@ define_class!(
             debug!(device_id = %id, "device disconnected");
             let inner = self.ivars();
             inner.peripherals.lock().remove(&id);
+            inner.disconnects.bump(&id);
             inner.fail_pending(&id);
             inner.write_ready.notify_waiters();
             let cause = if central.state() == CBManagerState::PoweredOn {
@@ -1343,5 +1387,68 @@ mod tests {
         })
         .await;
         assert!(matches!(err, Err(BlewError::NotConnected(_))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_waiting_across_a_reconnect_fails_instead_of_sending() {
+        let ready = Arc::new(Notify::new());
+        let disconnects = Arc::new(DisconnectCounts::default());
+        let device = DeviceId::from("peer");
+        let room = Arc::new(AtomicBool::new(false));
+        let sends = Arc::new(AtomicUsize::new(0));
+        let write = tokio::spawn({
+            let (ready, disconnects, device, room, sends) = (
+                ready.clone(),
+                disconnects.clone(),
+                device.clone(),
+                room.clone(),
+                sends.clone(),
+            );
+            async move {
+                send_when_ready(&ready, &disconnects, &device, TIMEOUT, || {
+                    if !room.load(Ordering::SeqCst) {
+                        return Ok(false);
+                    }
+                    sends.fetch_add(1, Ordering::SeqCst);
+                    Ok(true)
+                })
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!write.is_finished());
+
+        // Disconnect, then a reconnect with room to send, all before the
+        // waiter runs again.
+        disconnects.bump(&device);
+        ready.notify_waiters();
+        room.store(true, Ordering::SeqCst);
+
+        assert!(matches!(
+            write.await.unwrap(),
+            Err(BlewError::NotConnected(_))
+        ));
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            0,
+            "nothing goes out on the new connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn another_devices_disconnect_leaves_a_write_alone() {
+        let ready = Notify::new();
+        let disconnects = DisconnectCounts::default();
+        disconnects.bump(&DeviceId::from("other"));
+        let sent = send_when_ready(
+            &ready,
+            &disconnects,
+            &DeviceId::from("peer"),
+            TIMEOUT,
+            || Ok(true),
+        )
+        .await
+        .unwrap();
+        assert!(sent);
     }
 }

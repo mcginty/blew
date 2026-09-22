@@ -106,7 +106,8 @@ All notable changes to `blew` are documented here. Format follows
   writes could lose some without an error. `write_characteristic(..,
   WithoutResponse)` now waits for `peripheralIsReadyToSendWriteWithoutResponse:`
   when the queue is full. It fails with `BlewError::Gatt` if no room comes
-  within 5 s, and with `NotConnected` if the peripheral disconnects meanwhile.
+  within 5 s, and with `NotConnected` if the peripheral disconnects meanwhile, even if
+  it has reconnected by the time the write would go out.
 
 - **Apple: a Bluetooth power cycle no longer strands the peripheral's pending
   operations.** ([#45](https://github.com/mcginty/blew/issues/45))
