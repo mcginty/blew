@@ -331,4 +331,152 @@ class GattConnectionsTest {
             client.disconnected()
             verify(f.events).onConnectionStateChanged(ADDR, 1, false, 0)
         }
+
+    private fun TestScope.connectedFixture(): Pair<Fixture, Client> {
+        val f = Fixture(this)
+        f.connections.connect(ADDR, 1)
+        val client = f.factory.clients.single()
+        client.connected()
+        runCurrent()
+        client.mtu()
+        runCurrent()
+        clearInvocations(f.events)
+        return f to client
+    }
+
+    private fun Fixture.writeNoResponse(value: Byte) =
+        connections.writeCharacteristic(
+            ADDR,
+            1,
+            UUID_VALUE.toString(),
+            byteArrayOf(value),
+            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE,
+        )
+
+    @Test
+    fun noResponseWriteHoldsTheQueueUntilItsCallback() =
+        runTest {
+            val (f, client) = connectedFixture()
+            assertEquals(0, f.writeNoResponse(1))
+            assertEquals(0, f.writeNoResponse(2))
+            f.connections.readCharacteristic(ADDR, 1, UUID_VALUE.toString())
+            runCurrent()
+            verify(client.gatt, times(1)).writeCharacteristic(any(), any(), anyInt())
+            verify(client.gatt, never()).readCharacteristic(client.characteristic)
+            verifyNoInteractions(f.events)
+
+            client.callback.onCharacteristicWrite(client.gatt, client.characteristic, 0)
+            runCurrent()
+            verify(f.events, times(1)).onCharacteristicWrite(ADDR, 1, UUID_VALUE.toString(), 0)
+            verify(client.gatt, times(2)).writeCharacteristic(any(), any(), anyInt())
+            verify(client.gatt, never()).readCharacteristic(client.characteristic)
+
+            client.callback.onCharacteristicWrite(client.gatt, client.characteristic, 0)
+            runCurrent()
+            verify(f.events, times(2)).onCharacteristicWrite(ADDR, 1, UUID_VALUE.toString(), 0)
+            verify(client.gatt).readCharacteristic(client.characteristic)
+            f.connections.forceClose(ADDR, 1)
+        }
+
+    @Test
+    fun refusedWriteKickFailsAndTheQueueMovesOn() =
+        runTest {
+            val (f, client) = connectedFixture()
+            `when`(client.gatt.writeCharacteristic(any(), any(), anyInt()))
+                .thenReturn(BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY)
+            f.writeNoResponse(1)
+            f.connections.readCharacteristic(ADDR, 1, UUID_VALUE.toString())
+            runCurrent()
+            verify(f.events).onCharacteristicWrite(ADDR, 1, UUID_VALUE.toString(), BluetoothGatt.GATT_FAILURE)
+            verify(client.gatt).readCharacteristic(client.characteristic)
+            f.connections.forceClose(ADDR, 1)
+        }
+
+    @Test
+    fun writeCallbackAfterTimeoutIsNotReportedAgain() =
+        runTest {
+            val (f, client) = connectedFixture()
+            f.writeNoResponse(1)
+            runCurrent()
+            advanceTimeBy(5001)
+            runCurrent()
+            verify(f.events).onCharacteristicWrite(ADDR, 1, UUID_VALUE.toString(), BluetoothGatt.GATT_FAILURE)
+            clearInvocations(f.events)
+
+            client.callback.onCharacteristicWrite(client.gatt, client.characteristic, 0)
+            runCurrent()
+            verifyNoInteractions(f.events)
+            f.connections.forceClose(ADDR, 1)
+        }
+
+    @Test
+    fun aTimedOutWriteKeepsItsKeySoItsLateCallbackCannotCompleteTheNext() =
+        runTest {
+            val (f, client) = connectedFixture()
+            f.writeNoResponse(1)
+            runCurrent()
+            advanceTimeBy(5001)
+            runCurrent()
+            clearInvocations(f.events)
+
+            f.writeNoResponse(2)
+            runCurrent()
+            verify(f.events).onCharacteristicWrite(ADDR, 1, UUID_VALUE.toString(), BluetoothGatt.GATT_FAILURE)
+            verify(client.gatt, times(1)).writeCharacteristic(any(), any(), anyInt())
+            clearInvocations(f.events)
+
+            client.callback.onCharacteristicWrite(client.gatt, client.characteristic, 0)
+            runCurrent()
+            verifyNoInteractions(f.events)
+
+            f.writeNoResponse(3)
+            runCurrent()
+            verify(client.gatt, times(2)).writeCharacteristic(any(), any(), anyInt())
+            client.callback.onCharacteristicWrite(client.gatt, client.characteristic, 0)
+            runCurrent()
+            verify(f.events).onCharacteristicWrite(ADDR, 1, UUID_VALUE.toString(), 0)
+            f.connections.forceClose(ADDR, 1)
+        }
+
+    @Test
+    fun subscribeReportsTheCccdWriteResult() =
+        runTest {
+            val (f, client) = connectedFixture()
+            assertEquals(0, f.connections.subscribeCharacteristic(ADDR, 1, UUID_VALUE.toString()))
+            runCurrent()
+            verifyNoInteractions(f.events)
+
+            client.callback.onDescriptorWrite(client.gatt, client.descriptor, 0)
+            runCurrent()
+            verify(f.events).onDescriptorWrite(ADDR, 1, UUID_VALUE.toString(), 0)
+
+            f.connections.subscribeCharacteristic(ADDR, 1, UUID_VALUE.toString())
+            runCurrent()
+            client.callback.onDescriptorWrite(client.gatt, client.descriptor, 3)
+            runCurrent()
+            verify(f.events).onDescriptorWrite(ADDR, 1, UUID_VALUE.toString(), 3)
+            f.connections.forceClose(ADDR, 1)
+        }
+
+    @Test
+    fun aRefusedCccdWriteReportsFailure() =
+        runTest {
+            val (f, client) = connectedFixture()
+            `when`(client.gatt.writeDescriptor(any(), any()))
+                .thenReturn(BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY)
+            f.connections.subscribeCharacteristic(ADDR, 1, UUID_VALUE.toString())
+            runCurrent()
+            verify(f.events).onDescriptorWrite(ADDR, 1, UUID_VALUE.toString(), BluetoothGatt.GATT_FAILURE)
+            f.connections.forceClose(ADDR, 1)
+        }
+
+    @Test
+    fun unsubscribeWithoutACccdReportsAtOnce() =
+        runTest {
+            val (f, client) = connectedFixture()
+            `when`(client.characteristic.getDescriptor(any(UUID::class.java))).thenReturn(null)
+            assertEquals(0, f.connections.unsubscribeCharacteristic(ADDR, 1, UUID_VALUE.toString()))
+            verify(f.events).onDescriptorWrite(ADDR, 1, UUID_VALUE.toString(), 0)
+            f.connections.forceClose(ADDR, 1)
+        }
 }

@@ -61,6 +61,22 @@ All notable changes to `blew` are documented here. Format follows
 
 ### Changed
 
+- **Android: the module's `minSdk` is now 33 (Android 13).** The GATT client
+  already called `writeCharacteristic(char, value, type)` and
+  `writeDescriptor(desc, value)`, which exist only from API 33, so on Android
+  7–12 the first write threw `NoSuchMethodError`. The manifest now says so, and
+  a host app below 33 fails its manifest merge instead of crashing at runtime.
+  See the upgrade guide below.
+
+- **Android: more GATT client diagnostics.** Every connection state change is
+  logged with its status (`GattConnections` in logcat, and a `debug!` in Rust).
+  So are failed MTU, service-discovery, read, write and CCCD-write callbacks,
+  whose status used to be ignored or never logged at all. A refused kick now
+  names the platform's code (`writeCharacteristic returned
+  ERROR_GATT_WRITE_REQUEST_BUSY (201)` rather than `kick returned false`).
+  Callbacks that arrive after their operation timed out, and results nobody on
+  the Rust side is waiting for, are logged at debug and dropped.
+
 - **`AdvertisingConfig::local_name` is now a `LocalName`, defaulting to no
   name.** ([#29](https://github.com/mcginty/blew/issues/29),
   [#21](https://github.com/mcginty/blew/pull/21)) Every advertisement used to
@@ -108,6 +124,35 @@ All notable changes to `blew` are documented here. Format follows
   when the queue is full. It fails with `BlewError::Gatt` if no room comes
   within 5 s, and with `NotConnected` if the peripheral disconnects meanwhile, even if
   it has reconnected by the time the write would go out.
+- **Android: writes without response no longer fail the next GATT operation,
+  and their failures reach the caller.**
+  ([#52](https://github.com/mcginty/blew/issues/52)) Android holds a
+  `BluetoothGatt` busy after every write, no-response included, until
+  `onCharacteristicWrite`. blew completed a no-response write as soon as it
+  was handed to the stack, so the next write or read was refused with
+  `ERROR_GATT_WRITE_REQUEST_BUSY`. And because `write_characteristic(..,
+  WithoutResponse)` returned `Ok` once the write was queued, that failure was
+  dropped: the caller saw success for a packet that was never sent. A
+  no-response write now waits for its callback like any other, so
+  `write_characteristic` returns once the local stack has taken the write
+  (not once the peer has it) and returns the error if it didn't. That wait
+  also gives back-to-back writes backpressure.
+
+  Reads and writes on one characteristic now also wait for each other.
+  Previously a second operation evicted the first one's waiter with
+  `GattBusy`, while the first one stayed queued, so its result then completed
+  the second. Now the second waits for the first one's result. After a
+  timeout, an operation keeps its characteristic until its late callback
+  arrives. Until then, a new operation on that characteristic fails instead
+  of taking the late callback as its own result.
+
+- **Android: `subscribe_characteristic` and `unsubscribe_characteristic`
+  return once the peer has accepted the CCCD write, and fail if it refused.**
+  They used to return `Ok` as soon as the descriptor write was queued. A write
+  the stack refused, or one the peer rejected, then showed up only in logcat,
+  and the caller went on waiting for notifications that would never come.
+  They now wait for `onDescriptorWrite`, as Apple waits for
+  `didUpdateNotificationState` and Linux waits for `notify_io`.
 
 - **Apple: a Bluetooth power cycle no longer strands the peripheral's pending
   operations.** ([#45](https://github.com/mcginty/blew/issues/45))
@@ -1116,6 +1161,31 @@ match peripheral.notify_characteristic(&client, CHAR_UUID, value).await? {
 
 A future you were spawning and awaiting as `JoinHandle<BlewResult<()>>` now
 yields `BlewResult<Delivery>`.
+
+## Upgrade guide — Android `minSdk` 33
+
+**If your Android app's `minSdk` is below 33**, raise it. For a Tauri app that
+is `bundle.android.minSdkVersion` in `tauri.conf.json`:
+
+```json
+// Before
+"android": { "minSdkVersion": 24 }
+
+// After
+"android": { "minSdkVersion": 33 }
+```
+
+and for a plain Gradle app, `defaultConfig`:
+
+```kotlin
+// Before
+defaultConfig { minSdk = 24 }
+
+// After
+defaultConfig { minSdk = 33 }
+```
+
+blew never worked below 33: its first GATT write threw `NoSuchMethodError`.
 
 ---
 
