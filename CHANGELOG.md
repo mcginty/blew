@@ -51,6 +51,14 @@ All notable changes to `blew` are documented here. Format follows
   the platform rejects the request without that permission. On other platforms
   the plugin function does nothing.
 
+- **tauri-plugin-blew: `adapter_events()` reports the Android adapter turning
+  on and off.** It sits next to `permission_events()` and, like it, exists only
+  on Android. It yields `BleAdapterStatus::PoweredOn` / `PoweredOff` without
+  needing a Central or Peripheral, so a UI can follow the adapter — for example
+  to see the answer to `request_enable_bluetooth()`. It isn't ordered against
+  the backends' power-cycle cleanup, so keep re-adding services and restarting
+  advertising on the Peripheral's `AdapterStateChanged`.
+
 ### Changed
 
 - **`AdvertisingConfig::local_name` is now a `LocalName`, defaulting to no
