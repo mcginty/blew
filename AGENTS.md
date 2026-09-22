@@ -165,6 +165,14 @@ rx.await...
 
 **RAII responders:** `peripheralManager:didReceiveReadRequest:` and `didReceiveWriteRequests:` build a `ReadResponder`/`WriteResponder` (backed by an `oneshot::Sender`), emit a `PeripheralRequest` on the `mpsc::UnboundedSender` handed out by `take_requests()`, then spawn a task (via `inner.runtime.spawn()`) that awaits the oneshot and calls `respondToRequest:withResult:`. The spawn uses the captured `Handle` because GCD callbacks run outside the Tokio runtime context — bare `tokio::spawn` would panic. All Rust-side synchronization uses `parking_lot::Mutex` (poison-free, faster than `std::sync::Mutex`).
 
+**Apple central: a write without response waits for `canSendWriteWithoutResponse`.**
+When it is false, CoreBluetooth may drop the write and reports nothing, so
+`write_without_response` waits for `peripheralIsReadyToSendWriteWithoutResponse:`
+(or a disconnect) through `write_ready`, bounded at 5 s. The check and the write
+it admits happen under `write_gate`, so two writers can't both pass one check.
+The wait is created before each check, since `notify_waiters` reaches only a
+`Notified` that already exists. **Don't go back to writing unconditionally.**
+
 **Apple peripheral power cycles and callback waiters.** The reasons live in the
 code; these are the rules.
 - **A power-down is cleaned up before it is reported**: below `PoweredOn`

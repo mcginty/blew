@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
@@ -40,7 +41,7 @@ use objc2_foundation::{
     NSArray, NSData, NSDictionary, NSError, NSNumber, NSObjectProtocol, NSString,
 };
 use tokio::runtime::Handle;
-use tokio::sync::{broadcast, oneshot, watch};
+use tokio::sync::{Notify, broadcast, oneshot, watch};
 use uuid::Uuid;
 
 use tracing::{debug, trace, warn};
@@ -102,6 +103,12 @@ struct CentralInner {
     reads: KeyedRequestMap<(DeviceId, Uuid), oneshot::Sender<BlewResult<Vec<u8>>>>,
     writes: KeyedRequestMap<(DeviceId, Uuid), oneshot::Sender<BlewResult<()>>>,
     notify_states: KeyedRequestMap<(DeviceId, Uuid), oneshot::Sender<BlewResult<()>>>,
+    /// Woken by `peripheralIsReadyToSendWriteWithoutResponse:` and by a
+    /// disconnect, for writes waiting on `canSendWriteWithoutResponse`.
+    write_ready: Notify,
+    /// Held across the readiness check and the write it admits, so two writers
+    /// can't both pass one check.
+    write_gate: Mutex<()>,
     /// Pending `open_l2cap_channel` results, keyed by device ID.
     l2cap_pendings: KeyedRequestMap<DeviceId, oneshot::Sender<BlewResult<L2capChannel>>>,
     event_tx: broadcast::Sender<CentralEvent>,
@@ -130,6 +137,8 @@ impl CentralInner {
             reads: Default::default(),
             writes: Default::default(),
             notify_states: Default::default(),
+            write_ready: Notify::new(),
+            write_gate: Mutex::new(()),
             l2cap_pendings: Default::default(),
             event_tx,
             restored: Mutex::new(None),
@@ -182,6 +191,92 @@ impl CentralInner {
             )));
         }
     }
+}
+
+/// How long a write without response waits for CoreBluetooth to have room for
+/// it. Normally one connection event; this bound is only a backstop for a
+/// `peripheralIsReadyToSendWriteWithoutResponse:` that never comes.
+const WRITE_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Send a write without response once CoreBluetooth has room for it. Sent while
+/// `canSendWriteWithoutResponse` is false, delivery is best-effort (the
+/// `writeValue:forCharacteristic:type:` header), so the write would be lost
+/// with nothing reported.
+async fn write_without_response(
+    inner: &CentralInner,
+    device_id: &DeviceId,
+    char_uuid: Uuid,
+    value: &[u8],
+) -> BlewResult<()> {
+    let sent = retry_when_ready(&inner.write_ready, WRITE_READY_TIMEOUT, || {
+        try_write_without_response(inner, device_id, char_uuid, value)
+    })
+    .await?;
+    if !sent {
+        warn!(%device_id, %char_uuid, "CoreBluetooth never had room for a write without response");
+        return Err(BlewError::Gatt {
+            device_id: device_id.clone(),
+            source: "CoreBluetooth never became ready to send a write without response".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Run `attempt` until it succeeds, again each time `ready` is notified.
+/// `Ok(false)` once `timeout` passes without success. The wait is created before
+/// each attempt: `notify_waiters` reaches every `Notified` that already exists,
+/// so a notification landing between a failed attempt and the wait isn't missed.
+async fn retry_when_ready(
+    ready: &Notify,
+    timeout: Duration,
+    mut attempt: impl FnMut() -> BlewResult<bool>,
+) -> BlewResult<bool> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let notified = ready.notified();
+        if attempt()? {
+            return Ok(true);
+        }
+        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            return Ok(false);
+        }
+    }
+}
+
+/// One attempt: `false` when CoreBluetooth has no room yet.
+fn try_write_without_response(
+    inner: &CentralInner,
+    device_id: &DeviceId,
+    char_uuid: Uuid,
+    value: &[u8],
+) -> BlewResult<bool> {
+    let peripheral = inner
+        .peripherals
+        .lock()
+        .get(device_id)
+        .map(|p| unsafe { retain_send(&**p) })
+        .ok_or_else(|| BlewError::NotConnected(device_id.clone()))?;
+    let characteristic =
+        unsafe { find_characteristic(&peripheral, char_uuid) }.ok_or_else(|| {
+            BlewError::CharacteristicNotFound {
+                device_id: device_id.clone(),
+                char_uuid,
+            }
+        })?;
+    let cb_type = CBCharacteristicWriteType::WithoutResponse;
+    // Oversized payloads raise NSInvalidArgumentException; see write_characteristic.
+    let got = value.len();
+    let max = unsafe { peripheral.maximumWriteValueLengthForType(cb_type) };
+    if got > max {
+        return Err(BlewError::ValueTooLarge { got, max });
+    }
+    let _gate = inner.write_gate.lock();
+    if !unsafe { peripheral.canSendWriteWithoutResponse() } {
+        return Ok(false);
+    }
+    let data = NSData::with_bytes(value);
+    unsafe { peripheral.writeValue_forCharacteristic_type(&data, &characteristic, cb_type) };
+    Ok(true)
 }
 
 define_class!(
@@ -341,6 +436,7 @@ define_class!(
             let inner = self.ivars();
             inner.peripherals.lock().remove(&id);
             inner.fail_pending(&id);
+            inner.write_ready.notify_waiters();
             let cause = if central.state() == CBManagerState::PoweredOn {
                 match error {
                     Some(err) => {
@@ -578,6 +674,11 @@ define_class!(
                 });
                 let _ = tx.send(result);
             }
+        }
+
+        #[unsafe(method(peripheralIsReadyToSendWriteWithoutResponse:))]
+        unsafe fn peripheralIsReadyToSendWriteWithoutResponse(&self, _peripheral: &CBPeripheral) {
+            self.ivars().write_ready.notify_waiters();
         }
 
         #[unsafe(method(peripheral:didUpdateNotificationStateForCharacteristic:error:))]
@@ -878,6 +979,9 @@ impl CentralBackend for AppleCentral {
         let device_id = device_id.clone();
         async move {
             trace!(device_id = %device_id, %char_uuid, len = value.len(), ?write_type, "writing characteristic");
+            if write_type == WriteType::WithoutResponse {
+                return write_without_response(&handle.inner, &device_id, char_uuid, &value).await;
+            }
             let id_for_err = device_id.clone();
             let rx = {
                 let peripheral = handle
@@ -913,17 +1017,6 @@ impl CentralBackend for AppleCentral {
                 }
 
                 let data = NSData::from_vec(value);
-
-                if write_type == WriteType::WithoutResponse {
-                    unsafe {
-                        peripheral.writeValue_forCharacteristic_type(
-                            &data,
-                            &characteristic,
-                            cb_type,
-                        );
-                    };
-                    return Ok(());
-                }
 
                 let (tx, rx) = oneshot::channel();
                 let evicted = handle.inner.writes.insert((device_id, char_uuid), tx);
@@ -1171,4 +1264,84 @@ unsafe fn find_characteristic(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    const TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[tokio::test]
+    async fn a_ready_write_goes_out_at_once() {
+        let ready = Notify::new();
+        assert!(
+            retry_when_ready(&ready, TIMEOUT, || Ok(true))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_waits_for_the_ready_callback() {
+        let ready = Arc::new(Notify::new());
+        let room = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let write = tokio::spawn({
+            let (ready, room, attempts) = (ready.clone(), room.clone(), attempts.clone());
+            async move {
+                retry_when_ready(&ready, TIMEOUT, || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Ok(room.load(Ordering::SeqCst))
+                })
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(!write.is_finished());
+
+        room.store(true, Ordering::SeqCst);
+        ready.notify_waiters();
+        assert!(write.await.unwrap().unwrap());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_ready_callback_between_attempt_and_wait_is_not_missed() {
+        let ready = Notify::new();
+        let mut first = true;
+        let sent = retry_when_ready(&ready, TIMEOUT, || {
+            if first {
+                first = false;
+                ready.notify_waiters();
+                return Ok(false);
+            }
+            Ok(true)
+        })
+        .await
+        .unwrap();
+        assert!(sent);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_ready_callback_that_never_comes_times_out() {
+        let ready = Notify::new();
+        assert!(
+            !retry_when_ready(&ready, TIMEOUT, || Ok(false))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_attempt_error_ends_the_wait() {
+        let ready = Notify::new();
+        let err = retry_when_ready(&ready, TIMEOUT, || {
+            Err(BlewError::NotConnected(DeviceId::from("gone")))
+        })
+        .await;
+        assert!(matches!(err, Err(BlewError::NotConnected(_))));
+    }
 }
