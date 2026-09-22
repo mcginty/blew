@@ -165,6 +165,30 @@ rx.await...
 
 **RAII responders:** `peripheralManager:didReceiveReadRequest:` and `didReceiveWriteRequests:` build a `ReadResponder`/`WriteResponder` (backed by an `oneshot::Sender`), emit a `PeripheralRequest` on the `mpsc::UnboundedSender` handed out by `take_requests()`, then spawn a task (via `inner.runtime.spawn()`) that awaits the oneshot and calls `respondToRequest:withResult:`. The spawn uses the captured `Handle` because GCD callbacks run outside the Tokio runtime context — bare `tokio::spawn` would panic. All Rust-side synchronization uses `parking_lot::Mutex` (poison-free, faster than `std::sync::Mutex`).
 
+**Apple central: a write without response waits for `canSendWriteWithoutResponse`.**
+When it is false, CoreBluetooth may drop the write and reports nothing, so
+`write_without_response` waits for `peripheralIsReadyToSendWriteWithoutResponse:`
+(or a disconnect) through `write_ready`, bounded at 5 s. The wait is created
+before each attempt, since `notify_waiters` reaches only a `Notified` that
+already exists.
+
+A waiting write belongs to the connection it was issued on, and a `DeviceId`
+survives a reconnect. So `send_when_ready` records the device's `disconnects`
+count, and each attempt checks it and sends in **one turn on the manager
+queue**, where `didDisconnectPeripheral:` bumps it. A disconnect therefore
+lands wholly before the turn (the write fails with `NotConnected`) or wholly
+after it (the write went out on the old connection). Checking on the calling
+thread leaves a gap in which a disconnect and reconnect send the old payload on
+the new connection, and so does checking again after the send. The same turn
+also keeps two writers from passing one `canSendWriteWithoutResponse`. The
+5 s deadline covers a turn's wait for the queue as well as the wait for room,
+and a turn whose caller gave up, by the deadline or by dropping the write,
+never sends: `TurnClaim` lets exactly one of the turn starting and the caller
+abandoning it win, and a caller that loses waits for the started turn's
+result. **Don't move the check or the send off the queue, don't await a turn
+without the deadline, and don't go back to writing unconditionally.** `TurnQueue` lives in `helpers.rs`, shared with the
+peripheral.
+
 **Apple peripheral power cycles and callback waiters.** The reasons live in the
 code; these are the rules.
 - **A power-down is cleaned up before it is reported**: below `PoweredOn`

@@ -55,7 +55,7 @@ use crate::peripheral::types::{
     ReadResponder, WriteResponder,
 };
 use crate::platform::apple::helpers::{
-    ObjcSend, cbuuid_to_uuid, central_device_id, retain_send, uuid_to_cbuuid,
+    ObjcSend, TurnQueue, cbuuid_to_uuid, central_device_id, retain_send, uuid_to_cbuuid,
 };
 use crate::platform::apple::l2cap::bridge_l2cap_channel;
 use crate::types::DeviceId;
@@ -830,28 +830,15 @@ struct PeripheralHandle {
 unsafe impl Send for PeripheralHandle {}
 unsafe impl Sync for PeripheralHandle {}
 
-/// Where a turn runs: the manager's serial queue, which the delegate -- and so
-/// `power_down` -- runs on too.
-///
-/// A command whose order matters against a callback or another command is
-/// issued in a turn here, never from the calling thread. Otherwise a request
-/// can pass `submit`'s power check, lose its slot to `power_down`, and still
-/// issue its command after power returns, completing a newer request's wait;
-/// and a stop can overtake a start still waiting for its turn. Don't close
-/// those windows with a lock the delegate queue also takes, held across the
-/// command: CoreBluetooth waiting on its own queue would deadlock. Calls that
-/// order against nothing queued stay on the calling thread: `updateValue:`
-/// (serialized against `power_down` by `pending_notifies`),
-/// `respondToRequest:withResult:`, and state reads.
-trait TurnQueue {
-    fn run(&self, turn: Box<dyn FnOnce() + Send>);
-}
-
-impl TurnQueue for DispatchQueue {
-    fn run(&self, turn: Box<dyn FnOnce() + Send>) {
-        self.exec_async(turn);
-    }
-}
+// Turns ([`TurnQueue`]) run on the manager's queue, which `power_down` runs on
+// too. A command whose order matters against a callback or another command is
+// issued in a turn, never from the calling thread. Otherwise a request can pass
+// `submit`'s power check, lose its slot to `power_down`, and still issue its
+// command after power returns, completing a newer request's wait; and a stop
+// can overtake a start still waiting for its turn. Calls that order against
+// nothing queued stay on the calling thread: `updateValue:` (serialized against
+// `power_down` by `pending_notifies`), `respondToRequest:withResult:`, and state
+// reads.
 
 /// A request CoreBluetooth answers with a delegate callback. `turn` submits it
 /// on `queue`; the wait covers the time the turn spends queued.

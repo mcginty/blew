@@ -115,6 +115,15 @@ All notable changes to `blew` are documented here. Format follows
 
 ### Fixed
 
+- **Apple: writes without response wait for CoreBluetooth to have room,
+  instead of being dropped.** The central sent every no-response write at
+  once and returned `Ok`. When `canSendWriteWithoutResponse` is false,
+  CoreBluetooth's delivery is best-effort (in its own words), so a burst of
+  writes could lose some without an error. `write_characteristic(..,
+  WithoutResponse)` now waits for `peripheralIsReadyToSendWriteWithoutResponse:`
+  when the queue is full. It fails with `BlewError::Gatt` if no room comes
+  within 5 s, and with `NotConnected` if the peripheral disconnects meanwhile, even if
+  it has reconnected by the time the write would go out.
 - **Android: writes without response no longer fail the next GATT operation,
   and their failures reach the caller.**
   ([#52](https://github.com/mcginty/blew/issues/52)) Android holds a

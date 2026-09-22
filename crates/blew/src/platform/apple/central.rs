@@ -17,11 +17,13 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
 use bytes::Bytes;
-use dispatch2::{DispatchQueue, DispatchQueueAttr};
+use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
 use objc2::define_class;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, ProtocolObject};
@@ -40,7 +42,7 @@ use objc2_foundation::{
     NSArray, NSData, NSDictionary, NSError, NSNumber, NSObjectProtocol, NSString,
 };
 use tokio::runtime::Handle;
-use tokio::sync::{broadcast, oneshot, watch};
+use tokio::sync::{Notify, broadcast, oneshot, watch};
 use uuid::Uuid;
 
 use tracing::{debug, trace, warn};
@@ -52,7 +54,7 @@ use crate::gatt::props::{AttributePermissions, CharacteristicProperties};
 use crate::gatt::service::{GattCharacteristic, GattService};
 use crate::l2cap::{L2capChannel, L2capEncryption, types::Psm};
 use crate::platform::apple::helpers::{
-    ObjcSend, cbuuid_to_uuid, peripheral_device_id, retain_send, uuid_to_cbuuid,
+    ObjcSend, TurnQueue, cbuuid_to_uuid, peripheral_device_id, retain_send, uuid_to_cbuuid,
 };
 use crate::platform::apple::l2cap::bridge_l2cap_channel;
 use crate::types::{BleDevice, DeviceId};
@@ -102,6 +104,12 @@ struct CentralInner {
     reads: KeyedRequestMap<(DeviceId, Uuid), oneshot::Sender<BlewResult<Vec<u8>>>>,
     writes: KeyedRequestMap<(DeviceId, Uuid), oneshot::Sender<BlewResult<()>>>,
     notify_states: KeyedRequestMap<(DeviceId, Uuid), oneshot::Sender<BlewResult<()>>>,
+    /// Woken by `peripheralIsReadyToSendWriteWithoutResponse:` and by a
+    /// disconnect, for writes waiting on `canSendWriteWithoutResponse`.
+    write_ready: Notify,
+    /// Bumped by every disconnect, so a write waiting for room can tell that
+    /// the connection it was issued on has gone, even if the device is back.
+    disconnects: Arc<DisconnectCounts>,
     /// Pending `open_l2cap_channel` results, keyed by device ID.
     l2cap_pendings: KeyedRequestMap<DeviceId, oneshot::Sender<BlewResult<L2capChannel>>>,
     event_tx: broadcast::Sender<CentralEvent>,
@@ -130,6 +138,8 @@ impl CentralInner {
             reads: Default::default(),
             writes: Default::default(),
             notify_states: Default::default(),
+            write_ready: Notify::new(),
+            disconnects: Arc::default(),
             l2cap_pendings: Default::default(),
             event_tx,
             restored: Mutex::new(None),
@@ -182,6 +192,220 @@ impl CentralInner {
             )));
         }
     }
+}
+
+/// How long a write without response waits for CoreBluetooth to have room for
+/// it. Normally one connection event; this bound is only a backstop for a
+/// `peripheralIsReadyToSendWriteWithoutResponse:` that never comes.
+const WRITE_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Send a write without response once CoreBluetooth has room for it. Sent while
+/// `canSendWriteWithoutResponse` is false, delivery is best-effort (the
+/// `writeValue:forCharacteristic:type:` header), so the write would be lost
+/// with nothing reported.
+async fn write_without_response(
+    handle: &CentralHandle,
+    device_id: &DeviceId,
+    char_uuid: Uuid,
+    value: Vec<u8>,
+) -> BlewResult<()> {
+    let attempt = {
+        let (inner, device_id) = (Arc::clone(&handle.inner), device_id.clone());
+        Arc::new(move || try_write_without_response(&inner, &device_id, char_uuid, &value))
+    };
+    let sent = send_when_ready(
+        &*handle.queue,
+        &handle.inner.write_ready,
+        &handle.inner.disconnects,
+        device_id,
+        WRITE_READY_TIMEOUT,
+        attempt,
+    )
+    .await?;
+    if !sent {
+        warn!(%device_id, %char_uuid, "CoreBluetooth never had room for a write without response");
+        return Err(BlewError::Gatt {
+            device_id: device_id.clone(),
+            source: "CoreBluetooth never became ready to send a write without response".into(),
+        });
+    }
+    Ok(())
+}
+
+/// How many times each device has disconnected. A `DeviceId` survives a
+/// reconnect, so this is what tells one connection from the next.
+#[derive(Default)]
+struct DisconnectCounts(Mutex<HashMap<DeviceId, u64>>);
+
+impl DisconnectCounts {
+    fn current(&self, device_id: &DeviceId) -> u64 {
+        self.0.lock().get(device_id).copied().unwrap_or(0)
+    }
+
+    fn bump(&self, device_id: &DeviceId) {
+        *self.0.lock().entry(device_id.clone()).or_default() += 1;
+    }
+}
+
+/// One attempt at a write, run in a turn: `false` when there is no room yet.
+type SendAttempt = Arc<dyn Fn() -> BlewResult<bool> + Send + Sync>;
+
+/// [`retry_when_ready`] for a write issued on the connection `device_id` has
+/// now. Each attempt checks that connection and sends in one turn on `queue`,
+/// where `didDisconnectPeripheral:` bumps `disconnects`, so no disconnect lands
+/// between the check and the send. Once the connection drops the write fails
+/// with `NotConnected`, rather than go out on whichever connection replaced it.
+/// Only one turn runs at a time, so two writers can't both pass one
+/// `canSendWriteWithoutResponse`.
+///
+/// The deadline covers a turn's wait for the queue too. A turn its caller has
+/// given up on, by the deadline or by dropping the write, never sends: see
+/// [`TurnClaim`].
+async fn send_when_ready(
+    queue: &impl TurnQueue,
+    ready: &Notify,
+    disconnects: &Arc<DisconnectCounts>,
+    device_id: &DeviceId,
+    timeout: Duration,
+    send: SendAttempt,
+) -> BlewResult<bool> {
+    let connection = disconnects.current(device_id);
+    retry_when_ready(ready, timeout, |deadline| {
+        let (tx, mut rx) = oneshot::channel();
+        let claim = TurnClaim::default();
+        let (turn_claim, disconnects, device_id, send) = (
+            Arc::clone(&claim.0),
+            Arc::clone(disconnects),
+            device_id.clone(),
+            Arc::clone(&send),
+        );
+        queue.run(Box::new(move || {
+            if !TurnClaim::start(&turn_claim) {
+                return;
+            }
+            let result = if disconnects.current(&device_id) == connection {
+                send()
+            } else {
+                Err(BlewError::NotConnected(device_id))
+            };
+            let _ = tx.send(result);
+        }));
+        async move {
+            let dropped = || {
+                Err(BlewError::Internal(
+                    "the manager queue dropped a turn".into(),
+                ))
+            };
+            match tokio::time::timeout_at(deadline, &mut rx).await {
+                Ok(result) => result.unwrap_or_else(|_| dropped()),
+                Err(_) if claim.abandon() => Ok(false),
+                // Already running on the queue: its result is moments away.
+                Err(_) => rx.await.unwrap_or_else(|_| dropped()),
+            }
+        }
+    })
+    .await
+}
+
+/// Decides, once, between a queued turn and the caller waiting for it: the
+/// turn runs only if it starts before the caller abandons it, and a caller
+/// that finds it already started waits for its result. Dropping the claim
+/// abandons the turn, so a cancelled write never goes out.
+#[derive(Default)]
+struct TurnClaim(Arc<AtomicU8>);
+
+impl TurnClaim {
+    const QUEUED: u8 = 0;
+    const STARTED: u8 = 1;
+    const ABANDONED: u8 = 2;
+
+    /// Called by the turn. `false` means its caller gave up: do nothing.
+    fn start(state: &AtomicU8) -> bool {
+        state
+            .compare_exchange(
+                Self::QUEUED,
+                Self::STARTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Called by the caller. `false` means the turn has already started.
+    fn abandon(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::QUEUED,
+                Self::ABANDONED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+impl Drop for TurnClaim {
+    fn drop(&mut self) {
+        self.abandon();
+    }
+}
+
+/// Run `attempt` until it succeeds, again each time `ready` is notified.
+/// `Ok(false)` once `timeout` passes without success; `attempt` is handed the
+/// deadline to bound its own wait by. The wait for `ready` is created before
+/// each attempt: `notify_waiters` reaches every `Notified` that already exists,
+/// so a notification landing between a failed attempt and the wait isn't missed.
+async fn retry_when_ready<F: Future<Output = BlewResult<bool>>>(
+    ready: &Notify,
+    timeout: Duration,
+    mut attempt: impl FnMut(tokio::time::Instant) -> F,
+) -> BlewResult<bool> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let notified = ready.notified();
+        if attempt(deadline).await? {
+            return Ok(true);
+        }
+        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            return Ok(false);
+        }
+    }
+}
+
+/// One attempt, run in a turn on the manager queue: `false` when CoreBluetooth
+/// has no room yet.
+fn try_write_without_response(
+    inner: &CentralInner,
+    device_id: &DeviceId,
+    char_uuid: Uuid,
+    value: &[u8],
+) -> BlewResult<bool> {
+    let peripheral = inner
+        .peripherals
+        .lock()
+        .get(device_id)
+        .map(|p| unsafe { retain_send(&**p) })
+        .ok_or_else(|| BlewError::NotConnected(device_id.clone()))?;
+    let characteristic =
+        unsafe { find_characteristic(&peripheral, char_uuid) }.ok_or_else(|| {
+            BlewError::CharacteristicNotFound {
+                device_id: device_id.clone(),
+                char_uuid,
+            }
+        })?;
+    let cb_type = CBCharacteristicWriteType::WithoutResponse;
+    // Oversized payloads raise NSInvalidArgumentException; see write_characteristic.
+    let got = value.len();
+    let max = unsafe { peripheral.maximumWriteValueLengthForType(cb_type) };
+    if got > max {
+        return Err(BlewError::ValueTooLarge { got, max });
+    }
+    if !unsafe { peripheral.canSendWriteWithoutResponse() } {
+        return Ok(false);
+    }
+    let data = NSData::with_bytes(value);
+    unsafe { peripheral.writeValue_forCharacteristic_type(&data, &characteristic, cb_type) };
+    Ok(true)
 }
 
 define_class!(
@@ -340,7 +564,9 @@ define_class!(
             debug!(device_id = %id, "device disconnected");
             let inner = self.ivars();
             inner.peripherals.lock().remove(&id);
+            inner.disconnects.bump(&id);
             inner.fail_pending(&id);
+            inner.write_ready.notify_waiters();
             let cause = if central.state() == CBManagerState::PoweredOn {
                 match error {
                     Some(err) => {
@@ -580,6 +806,11 @@ define_class!(
             }
         }
 
+        #[unsafe(method(peripheralIsReadyToSendWriteWithoutResponse:))]
+        unsafe fn peripheralIsReadyToSendWriteWithoutResponse(&self, _peripheral: &CBPeripheral) {
+            self.ivars().write_ready.notify_waiters();
+        }
+
         #[unsafe(method(peripheral:didUpdateNotificationStateForCharacteristic:error:))]
         unsafe fn peripheral_didUpdateNotificationStateForCharacteristic_error(
             &self,
@@ -643,6 +874,8 @@ impl CentralDelegate {
 
 struct CentralHandle {
     manager: ObjcSend<CBCentralManager>,
+    /// The delegate's serial queue; see [`TurnQueue`].
+    queue: DispatchRetained<DispatchQueue>,
     /// Retained here so the CB manager's weak-ref delegate stays alive.
     delegate: ObjcSend<CentralDelegate>,
     inner: Arc<CentralInner>,
@@ -878,6 +1111,9 @@ impl CentralBackend for AppleCentral {
         let device_id = device_id.clone();
         async move {
             trace!(device_id = %device_id, %char_uuid, len = value.len(), ?write_type, "writing characteristic");
+            if write_type == WriteType::WithoutResponse {
+                return write_without_response(&handle, &device_id, char_uuid, value).await;
+            }
             let id_for_err = device_id.clone();
             let rx = {
                 let peripheral = handle
@@ -913,17 +1149,6 @@ impl CentralBackend for AppleCentral {
                 }
 
                 let data = NSData::from_vec(value);
-
-                if write_type == WriteType::WithoutResponse {
-                    unsafe {
-                        peripheral.writeValue_forCharacteristic_type(
-                            &data,
-                            &characteristic,
-                            cb_type,
-                        );
-                    };
-                    return Ok(());
-                }
 
                 let (tx, rx) = oneshot::channel();
                 let evicted = handle.inner.writes.insert((device_id, char_uuid), tx);
@@ -1104,6 +1329,7 @@ impl AppleCentral {
 
         Ok(AppleCentral(Arc::new(CentralHandle {
             manager,
+            queue,
             delegate,
             inner,
         })))
@@ -1171,4 +1397,296 @@ unsafe fn find_characteristic(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::future::ready as done;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    const TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// A manager queue whose turns run only when told to, in order.
+    #[derive(Default)]
+    struct FakeQueue(Mutex<VecDeque<Box<dyn FnOnce() + Send>>>);
+
+    impl TurnQueue for FakeQueue {
+        fn run(&self, turn: Box<dyn FnOnce() + Send>) {
+            self.0.lock().push_back(turn);
+        }
+    }
+
+    impl FakeQueue {
+        fn run_all(&self) {
+            loop {
+                let next = self.0.lock().pop_front();
+                let Some(turn) = next else { break };
+                turn();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_ready_write_goes_out_at_once() {
+        let ready = Notify::new();
+        assert!(
+            retry_when_ready(&ready, TIMEOUT, |_| done(Ok(true)))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_waits_for_the_ready_callback() {
+        let ready = Arc::new(Notify::new());
+        let room = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let write = tokio::spawn({
+            let (ready, room, attempts) = (ready.clone(), room.clone(), attempts.clone());
+            async move {
+                retry_when_ready(&ready, TIMEOUT, |_| {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    done(Ok(room.load(Ordering::SeqCst)))
+                })
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(!write.is_finished());
+
+        room.store(true, Ordering::SeqCst);
+        ready.notify_waiters();
+        assert!(write.await.unwrap().unwrap());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_ready_callback_between_attempt_and_wait_is_not_missed() {
+        let ready = Notify::new();
+        let mut first = true;
+        let sent = retry_when_ready(&ready, TIMEOUT, |_| {
+            if first {
+                first = false;
+                ready.notify_waiters();
+                return done(Ok(false));
+            }
+            done(Ok(true))
+        })
+        .await
+        .unwrap();
+        assert!(sent);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_ready_callback_that_never_comes_times_out() {
+        let ready = Notify::new();
+        assert!(
+            !retry_when_ready(&ready, TIMEOUT, |_| done(Ok(false)))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_attempt_error_ends_the_wait() {
+        let ready = Notify::new();
+        let err = retry_when_ready(&ready, TIMEOUT, |_| {
+            done(Err(BlewError::NotConnected(DeviceId::from("gone"))))
+        })
+        .await;
+        assert!(matches!(err, Err(BlewError::NotConnected(_))));
+    }
+
+    /// A peer whose room and sends a test controls.
+    struct Peer {
+        room: AtomicBool,
+        sends: AtomicUsize,
+    }
+
+    impl Peer {
+        fn new(room: bool) -> Arc<Self> {
+            Arc::new(Self {
+                room: AtomicBool::new(room),
+                sends: AtomicUsize::new(0),
+            })
+        }
+
+        fn send(self: &Arc<Self>) -> SendAttempt {
+            let peer = Arc::clone(self);
+            Arc::new(move || {
+                if !peer.room.load(Ordering::SeqCst) {
+                    return Ok(false);
+                }
+                peer.sends.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            })
+        }
+
+        fn sends(&self) -> usize {
+            self.sends.load(Ordering::SeqCst)
+        }
+    }
+
+    struct Central {
+        queue: Arc<FakeQueue>,
+        ready: Arc<Notify>,
+        disconnects: Arc<DisconnectCounts>,
+        device: DeviceId,
+    }
+
+    impl Central {
+        fn new() -> Self {
+            Self {
+                queue: Arc::default(),
+                ready: Arc::new(Notify::new()),
+                disconnects: Arc::default(),
+                device: DeviceId::from("peer"),
+            }
+        }
+
+        fn write(&self, send: SendAttempt) -> tokio::task::JoinHandle<BlewResult<bool>> {
+            let (queue, ready, disconnects, device) = (
+                self.queue.clone(),
+                self.ready.clone(),
+                self.disconnects.clone(),
+                self.device.clone(),
+            );
+            tokio::spawn(async move {
+                send_when_ready(&*queue, &ready, &disconnects, &device, TIMEOUT, send).await
+            })
+        }
+
+        /// What `didDisconnectPeripheral:` does, as a turn on the queue.
+        fn disconnect(&self) {
+            let (disconnects, ready, device) = (
+                self.disconnects.clone(),
+                self.ready.clone(),
+                self.device.clone(),
+            );
+            self.queue.run(Box::new(move || {
+                disconnects.bump(&device);
+                ready.notify_waiters();
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_goes_out_in_a_turn() {
+        let central = Central::new();
+        let peer = Peer::new(true);
+        let write = central.write(peer.send());
+        tokio::task::yield_now().await;
+        assert_eq!(peer.sends(), 0, "nothing is sent before its turn");
+
+        central.queue.run_all();
+        assert!(write.await.unwrap().unwrap());
+        assert_eq!(peer.sends(), 1);
+    }
+
+    /// The reviewer's race: a disconnect and reconnect land after the write
+    /// has decided to go but before it has gone. With the check and the send
+    /// in one turn, the disconnect is either before the turn or after it.
+    #[tokio::test]
+    async fn a_disconnect_queued_ahead_of_the_send_fails_it() {
+        let central = Central::new();
+        let peer = Peer::new(true);
+        central.disconnect();
+        // The reconnected peer has room; the stale write must still not use it.
+        let write = central.write(peer.send());
+        tokio::task::yield_now().await;
+
+        central.queue.run_all();
+        assert!(matches!(
+            write.await.unwrap(),
+            Err(BlewError::NotConnected(_))
+        ));
+        assert_eq!(peer.sends(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_waiting_across_a_reconnect_fails_instead_of_sending() {
+        let central = Central::new();
+        let peer = Peer::new(false);
+        let write = central.write(peer.send());
+        tokio::task::yield_now().await;
+        central.queue.run_all();
+        tokio::task::yield_now().await;
+        assert!(!write.is_finished(), "waiting for room");
+
+        // Disconnect, then a reconnect with room, before the waiter runs again.
+        central.disconnect();
+        peer.room.store(true, Ordering::SeqCst);
+        central.queue.run_all();
+        tokio::task::yield_now().await;
+        central.queue.run_all();
+
+        assert!(matches!(
+            write.await.unwrap(),
+            Err(BlewError::NotConnected(_))
+        ));
+        assert_eq!(peer.sends(), 0, "nothing goes out on the new connection");
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_after_the_send_leaves_it_sent() {
+        let central = Central::new();
+        let peer = Peer::new(true);
+        let write = central.write(peer.send());
+        tokio::task::yield_now().await;
+        central.disconnect();
+
+        central.queue.run_all();
+        assert!(write.await.unwrap().unwrap());
+        assert_eq!(peer.sends(), 1);
+    }
+
+    #[tokio::test]
+    async fn another_devices_disconnect_leaves_a_write_alone() {
+        let central = Central::new();
+        central.disconnects.bump(&DeviceId::from("other"));
+        let peer = Peer::new(true);
+        let write = central.write(peer.send());
+        tokio::task::yield_now().await;
+
+        central.queue.run_all();
+        assert!(write.await.unwrap().unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_queue_ends_the_write_at_the_deadline_and_never_sends() {
+        let central = Central::new();
+        let peer = Peer::new(true);
+        let write = central.write(peer.send());
+        tokio::time::sleep(TIMEOUT + Duration::from_secs(1)).await;
+
+        assert!(!write.await.unwrap().unwrap(), "gave up at the deadline");
+        central.queue.run_all();
+        assert_eq!(peer.sends(), 0, "the expired turn doesn't send later");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_write_never_sends() {
+        let central = Central::new();
+        let peer = Peer::new(true);
+        let write = central.write(peer.send());
+        tokio::task::yield_now().await;
+        write.abort();
+        let _ = write.await;
+
+        central.queue.run_all();
+        assert_eq!(peer.sends(), 0);
+    }
+
+    #[test]
+    fn a_started_turn_cannot_be_abandoned() {
+        let claim = TurnClaim::default();
+        assert!(TurnClaim::start(&claim.0));
+        assert!(
+            !claim.abandon(),
+            "the caller must wait for the result instead"
+        );
+    }
 }
