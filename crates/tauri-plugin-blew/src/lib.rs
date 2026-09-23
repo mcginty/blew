@@ -26,6 +26,9 @@ static PERMISSIONS_TX: OnceLock<broadcast::Sender<BlePermissionStatus>> = OnceLo
 #[cfg(target_os = "android")]
 static ADAPTER_TX: OnceLock<broadcast::Sender<BleAdapterStatus>> = OnceLock::new();
 
+#[cfg(target_os = "android")]
+static ANDROID_CONTEXT: std::sync::Once = std::sync::Once::new();
+
 /// Current status of the aggregate Android BLE runtime permissions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlePermissionStatus {
@@ -236,6 +239,29 @@ pub fn init_with_config<R: Runtime>(config: BlewPluginConfig) -> TauriPlugin<R> 
         .build()
 }
 
+/// Publish `ndk_context` for this process, once. Later calls, including the
+/// plugin's own `setup`, do nothing.
+///
+/// For hosts that run Rust in a process no activity has started, such as an
+/// FCM service. `ndk_context` aborts on a second publish and offers no way to
+/// ask whether one happened, so every publisher in the process must come
+/// through here: a direct `ndk_context::initialize_android_context` elsewhere
+/// still collides with the plugin's.
+///
+/// # Safety
+///
+/// `vm` is the process's `JavaVM*`; `application_context` is a JNI *global*
+/// reference to the `Application` context that is never deleted.
+#[cfg(target_os = "android")]
+pub unsafe fn install_android_context_once(
+    vm: *mut std::ffi::c_void,
+    application_context: *mut std::ffi::c_void,
+) {
+    ANDROID_CONTEXT.call_once(|| unsafe {
+        ndk_context::initialize_android_context(vm, application_context);
+    });
+}
+
 // Tauri 2.11 (tao 0.35) no longer calls `ndk_context::initialize_android_context`,
 // so we install it ourselves before init_jvm runs — both blew and `hickory-resolver`
 // (iroh's DNS dep on Android) read the JVM/activity through ndk_context.
@@ -244,6 +270,10 @@ fn install_android_context() -> Result<*mut std::ffi::c_void, Box<dyn std::error
     use std::ffi::c_void;
     use std::sync::mpsc;
     use tauri::wry::prelude::{dispatch, jni as wry_jni};
+
+    if ANDROID_CONTEXT.is_completed() {
+        return Ok(ndk_context::android_context().vm());
+    }
 
     let (tx, rx) = mpsc::channel();
     dispatch(move |env, activity, _webview| {
@@ -286,14 +316,22 @@ fn install_android_context() -> Result<*mut std::ffi::c_void, Box<dyn std::error
 
     let vm_ptr = vm.get_java_vm_pointer() as *mut c_void;
     let context_ptr = context_global.as_obj().as_raw() as *mut c_void;
-    unsafe {
-        ndk_context::initialize_android_context(vm_ptr, context_ptr);
+    let mut published = false;
+    ANDROID_CONTEXT.call_once(|| {
+        unsafe {
+            ndk_context::initialize_android_context(vm_ptr, context_ptr);
+        }
+        published = true;
+    });
+    if published {
+        // ndk_context borrows the context for the lifetime of the process; leak
+        // the global ref so the JNI ref the pointer refers to is never freed.
+        // The Application object lives that long anyway, so unlike an Activity
+        // nothing is kept alive that would otherwise have been collected.
+        std::mem::forget(context_global);
     }
-    // ndk_context borrows the context for the lifetime of the process; leak the
-    // global ref so the JNI ref the pointer refers to is never freed. The
-    // Application object lives that long anyway, so unlike an Activity nothing
-    // is kept alive that would otherwise have been collected.
-    std::mem::forget(context_global);
+    // Otherwise a host published between the check above and here, and our
+    // global ref drops unused.
     Ok(vm_ptr)
 }
 

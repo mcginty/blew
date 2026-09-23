@@ -59,6 +59,16 @@ All notable changes to `blew` are documented here. Format follows
   the backends' power-cycle cleanup, so keep re-adding services and restarting
   advertising on the Peripheral's `AdapterStateChanged`.
 
+- **tauri-plugin-blew: `install_android_context_once()` lets a host publish
+  `ndk_context` before any activity exists.** `ndk_context` aborts on a second
+  publish, so a host that published the context itself — for example from an
+  FCM service in a process Android started with no activity — had the plugin's
+  own publish in `setup` abort the app at launch. The plugin now publishes at
+  most once per process, and `setup` does nothing further when a host already
+  went through `install_android_context_once`. Every publisher in the process
+  must use it; a direct `ndk_context::initialize_android_context` still
+  collides.
+
 ### Changed
 
 - **Android: the module's `minSdk` is now 33 (Android 13).** The GATT client
