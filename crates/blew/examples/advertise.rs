@@ -69,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                          subscribed={subscribed}"
                     );
                 }
+                _ => {}
             }
         }
     });
@@ -105,6 +106,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         r.success();
                     }
                 }
+                // Dropping an unhandled request answers it with an ATT error.
+                _ => {}
             },
             Ok(None) => break, // request stream closed
             Err(_) => break,   // 30 s elapsed

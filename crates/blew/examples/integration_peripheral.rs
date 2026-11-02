@@ -259,6 +259,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     PeripheralRequest::Write { responder, .. } => {
                         if let Some(responder) = responder { responder.error(); }
                     }
+                    _ => {}
                 }
             }
             incoming = l2cap_channels.next() => {

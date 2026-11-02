@@ -25,6 +25,7 @@ static ANDROID_CONTEXT: std::sync::Once = std::sync::Once::new();
 
 /// Current status of the aggregate Android BLE runtime permissions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BlePermissionStatus {
     /// All BLE runtime permissions required for the current Android API level
     /// have been granted.
@@ -42,6 +43,7 @@ impl BlePermissionStatus {
 
 /// Power state of the Android Bluetooth adapter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BleAdapterStatus {
     /// The adapter finished powering on.
     PoweredOn,

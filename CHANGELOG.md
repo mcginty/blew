@@ -70,6 +70,19 @@ All notable changes to `blew` are documented here. Format follows
 
 ### Changed
 
+- **Breaking: public enums are `#[non_exhaustive]`.** `CentralEvent`,
+  `PeripheralStateEvent`, `PeripheralRequest`, `DisconnectCause`, `Delivery`,
+  `ScanMode`, `WriteType`, `LocalName`, the `testing` mock's `MockErrorKind`,
+  and tauri-plugin-blew's `BlePermissionStatus` and `BleAdapterStatus`. Several
+  planned additions are new variants — a peripheral-role connection event
+  ([#47](https://github.com/mcginty/blew/issues/47)), service-changed
+  ([#8](https://github.com/mcginty/blew/issues/8)) and RSSI
+  ([#5](https://github.com/mcginty/blew/issues/5)) events, scan modes
+  ([#15](https://github.com/mcginty/blew/issues/15)) — and each would otherwise
+  break every exhaustive `match` downstream. A `match` on one of these now
+  needs a wildcard arm. Variants can still be constructed, so tests that build
+  events by hand are unaffected. See the upgrade guide below.
+
 - **`AdapterStateChanged` documents what a power cycle invalidates.**
   ([#47](https://github.com/mcginty/blew/issues/47)) The peripheral event now
   states, per platform, what is gone by the time `powered: false` arrives and
@@ -1286,6 +1299,33 @@ tauri = "2.12"
 
 If you call `install_android_context_once()`, make sure no activity can start
 in that process afterwards: tao's own publish would abort it.
+
+---
+
+## Upgrade guide — `#[non_exhaustive]` enums
+
+**If you `match` on a blew event, request, cause or status enum**, add a
+wildcard arm. The compiler points at each one (`E0004: pattern '_' not
+covered`).
+
+```rust
+// Before
+match request {
+    PeripheralRequest::Read { responder, .. } => responder.respond(value),
+    PeripheralRequest::Write { responder, .. } => { /* ... */ }
+}
+
+// After
+match request {
+    PeripheralRequest::Read { responder, .. } => responder.respond(value),
+    PeripheralRequest::Write { responder, .. } => { /* ... */ }
+    // Dropping an unhandled request answers it with an ATT error.
+    _ => {}
+}
+```
+
+For `DisconnectCause`, map the wildcard to whatever your code treats as an
+unknown cause.
 
 ---
 
