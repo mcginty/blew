@@ -39,7 +39,7 @@ use objc2_core_bluetooth::{
     CBPeripheral, CBPeripheralDelegate, CBService, CBUUID,
 };
 use objc2_foundation::{
-    NSArray, NSData, NSDictionary, NSError, NSNumber, NSObjectProtocol, NSString,
+    NSArray, NSData, NSDictionary, NSError, NSNumber, NSObjectProtocol, NSString, NSUUID,
 };
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, broadcast, oneshot, watch};
@@ -881,6 +881,31 @@ struct CentralHandle {
     inner: Arc<CentralInner>,
 }
 
+impl CentralHandle {
+    /// The `CBPeripheral` for `device_id`, asking CoreBluetooth for it when
+    /// blew no longer holds one.
+    ///
+    /// A disconnect drops the peripheral from `peripherals`, and only a scan
+    /// result puts it back, but the identifier stays valid: without the
+    /// fallback a device that disconnected, or one remembered from an earlier
+    /// run, can't be connected again until a scan happens to report it (#57).
+    fn known_peripheral(&self, device_id: &DeviceId) -> Option<ObjcSend<CBPeripheral>> {
+        if let Some(p) = self.inner.peripherals.lock().get(device_id) {
+            return Some(unsafe { retain_send(&**p) });
+        }
+        let uuid = Uuid::parse_str(device_id.as_str()).ok()?;
+        let ids = NSArray::from_retained_slice(&[NSUUID::from_bytes(*uuid.as_bytes())]);
+        let found = unsafe { self.manager.retrievePeripheralsWithIdentifiers(&ids) };
+        let peripheral = found.to_vec().into_iter().next()?;
+        debug!(device_id = %device_id, "retrieved peripheral by identifier");
+        let mut peripherals = self.inner.peripherals.lock();
+        let held = peripherals
+            .entry(device_id.clone())
+            .or_insert_with(|| unsafe { retain_send(&*peripheral) });
+        Some(unsafe { retain_send(&**held) })
+    }
+}
+
 unsafe impl Send for CentralHandle {}
 unsafe impl Sync for CentralHandle {}
 
@@ -949,13 +974,7 @@ impl CentralBackend for AppleCentral {
             let id_for_err = device_id.clone();
             let peripheral_to_cancel;
             let rx = {
-                let peripheral = handle
-                    .inner
-                    .peripherals
-                    .lock()
-                    .get(&device_id)
-                    .map(|p| unsafe { retain_send(&**p) });
-                let Some(peripheral) = peripheral else {
+                let Some(peripheral) = handle.known_peripheral(&device_id) else {
                     return Err(BlewError::DeviceNotFound(device_id));
                 };
 
