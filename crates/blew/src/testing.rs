@@ -48,6 +48,7 @@ pub struct MockL2capPolicy {
 
 /// Error kinds for [`MockL2capPolicy`]. Avoids `BlewError`'s non-`Clone` variants.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum MockErrorKind {
     /// Maps to [`BlewError::NotSupported`].
     NotSupported,

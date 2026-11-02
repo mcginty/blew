@@ -22,6 +22,7 @@ pub struct PeripheralConfig {
 
 /// Non-request events from the peripheral role. Clone-able; multiple subscribers welcome.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum PeripheralStateEvent {
     /// The local Bluetooth adapter was powered on or off.
     ///
@@ -111,6 +112,7 @@ pub enum PeripheralStateEvent {
 ///
 /// [`notify_characteristic`]: crate::peripheral::Peripheral::notify_characteristic
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Delivery {
     /// The central's ATT layer acknowledged the value with a Handle Value
     /// Confirmation.
@@ -131,6 +133,7 @@ pub enum Delivery {
 /// the request stream is handed out via
 /// [`Peripheral::take_requests`](crate::peripheral::Peripheral::take_requests).
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum PeripheralRequest {
     /// A remote central sent an ATT Read Request.
     Read {
@@ -287,6 +290,7 @@ pub struct AdvertisingConfig {
 /// **iOS:** CoreBluetooth drops the local name from advertisements while the
 /// app is in the background, whichever variant is used.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LocalName {
     /// No name in the advertising data, which leaves its bytes for the service
     /// UUIDs; peers identify the peripheral by those. After connecting, a peer

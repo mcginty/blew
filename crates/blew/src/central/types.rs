@@ -48,6 +48,7 @@ impl Default for CentralConfig {
 
 /// Reason a peripheral disconnected. Used by [`CentralEvent::DeviceDisconnected`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DisconnectCause {
     /// We called `disconnect()` locally.
     LocalClose,
@@ -70,6 +71,7 @@ pub enum DisconnectCause {
 /// `CentralEvent` is `Clone`; notification payloads use [`Bytes`] to avoid copies
 /// when fanning out to multiple subscribers.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum CentralEvent {
     /// The local Bluetooth adapter was powered on or off.
     ///
@@ -99,6 +101,7 @@ pub enum CentralEvent {
 
 /// Scan duty cycle / power trade-off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ScanMode {
     /// Highest duty cycle -- discovers devices fastest but uses the most power
     /// and radio bandwidth.
@@ -128,6 +131,7 @@ pub struct ScanFilter {
 
 /// How a characteristic write is delivered to the remote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WriteType {
     /// ATT Write Request -- the peripheral sends an acknowledgement.
     WithResponse,
