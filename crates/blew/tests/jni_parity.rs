@@ -164,6 +164,7 @@ fn rust_type_to_kotlin(ty: &str) -> String {
         "jbyte" => "Byte",
         "JByteArray" => "ByteArray",
         "JObjectArray" => "Array",
+        "JContext" => "Context",
         "()" => "Unit",
         other => other,
     }

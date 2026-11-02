@@ -70,6 +70,34 @@ All notable changes to `blew` are documented here. Format follows
 
 ### Changed
 
+- **Breaking (Android): `init_jvm` takes a `Context`, and blew no longer uses
+  `ndk-context`.** ([#56](https://github.com/mcginty/blew/issues/56))
+  `init_jvm(vm)` became `init_jvm(env, &context) -> jni::errors::Result<()>`,
+  called from a Kotlin `external fun` that passes a `Context`. The new
+  `blew::platform::android::JContext` type is that parameter. blew used to read
+  the JVM and the application context from `ndk_context`, which tao 0.37
+  (Tauri 2.12) publishes and earlier versions don't. A second publish aborts
+  the process, so either choice broke one range of Tauri versions. blew now
+  keeps its own global reference to the application context. A failure is
+  returned rather than panicking. The documented bare-Android setup, which
+  called `init_jvm` from `JNI_OnLoad`, panicked because nothing had published
+  `ndk_context`; it now uses an `external fun` called from `onCreate`. See the
+  upgrade guide below.
+
+- **tauri-plugin-blew: works on every Tauri 2.x again.** `BlewPlugin`'s
+  constructor hands blew the application context over JNI. Tauri runs it
+  inside `register_android_plugin`, which blocks until it returns, so blew is
+  still initialized before plugin `setup` finishes and an app's own setup hook
+  can construct a `Central`. The plugin no longer reads `ndk_context`, so the
+  `tauri >= 2.12` requirement is gone and the dependency is back to
+  `tauri = "2"`. Checked by building the plugin for Android against Tauri
+  2.0.0, 2.0.6, 2.11.5 and 2.12.4.
+
+- **tauri-plugin-blew: `install_android_context_once()` is deprecated.**
+  Neither blew nor the plugin reads `ndk_context` any more. On Tauri 2.12 and
+  later, calling it aborts the app if an activity later starts in the same
+  process, because tao publishes `ndk_context` itself.
+
 - **Breaking: public enums are `#[non_exhaustive]`.** `CentralEvent`,
   `PeripheralStateEvent`, `PeripheralRequest`, `DisconnectCause`, `Delivery`,
   `ScanMode`, `WriteType`, `LocalName`, the `testing` mock's `MockErrorKind`,
@@ -197,7 +225,8 @@ All notable changes to `blew` are documented here. Format follows
   published it again; `ndk_context` aborts on a second publish
   (`assertion failed: previous.is_none()`). `setup` now only reads back what
   tao published, and the plugin requires `tauri >= 2.12`, since on 2.11
-  nothing publishes. See the upgrade guide below.
+  nothing publishes. See the upgrade guide below. (Superseded: the plugin no
+  longer touches `ndk_context` and supports every Tauri 2.x; see Changed.)
 
 - **Apple: the L2CAP reactor no longer spins at 100% CPU once its last
   channel closes, and an application `write()` wakes it at once.**
@@ -1285,6 +1314,10 @@ blew never worked below 33: its first GATT write threw `NoSuchMethodError`.
 
 ## Upgrade guide — `tauri-plugin-blew` requires Tauri 2.12
 
+> **No longer applies.** The plugin now takes the application context from
+> Kotlin instead of reading `ndk_context`, and works on every Tauri 2.x again.
+> See "Android `init_jvm` takes a `Context`" below.
+
 **If your app is on Tauri 2.11 or earlier**, upgrade it. The plugin now relies
 on tao 0.37 (Tauri 2.12) publishing `ndk_context` before plugin `setup`, and
 on 2.11 `setup` panics because nothing has.
@@ -1326,6 +1359,50 @@ match request {
 
 For `DisconnectCause`, map the wildcard to whatever your code treats as an
 unknown cause.
+
+---
+
+## Upgrade guide — Android `init_jvm` takes a `Context`
+
+**If you use `tauri-plugin-blew`**, there is nothing to change. If you pinned
+`tauri = "2.12"` only for the plugin, you can relax it again.
+
+**If you call `init_jvm` yourself** (a bare Android host), move the call out of
+`JNI_OnLoad`, which has no `Context`, into a Kotlin `external fun` you call
+from `Application.onCreate` or `Activity.onCreate`:
+
+```rust
+// Before
+#[unsafe(no_mangle)]
+pub extern "system" fn JNI_OnLoad(vm: jni::JavaVM, _: *mut std::ffi::c_void) -> jni::sys::jint {
+    blew::platform::android::init_jvm(vm);
+    jni::sys::JNI_VERSION_1_6
+}
+
+// After
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_example_app_BlewBootstrap_init<'local>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    context: blew::platform::android::JContext<'local>,
+) {
+    env.with_env(|env| blew::platform::android::init_jvm(env, &context))
+        .resolve::<jni::errors::ThrowRuntimeExAndDefault>();
+}
+```
+
+```kotlin
+// After
+object BlewBootstrap {
+    @JvmStatic external fun init(context: Context)
+}
+
+// in onCreate, after System.loadLibrary("your_app"):
+BlewBootstrap.init(applicationContext)
+```
+
+`init_jvm` also hands `BleCentralManager` and `BlePeripheralManager` their
+Context, so you no longer need to call their `init` yourself.
 
 ---
 

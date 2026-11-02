@@ -46,6 +46,17 @@ class JniNativeContractTest {
     }
 
     @Test
+    fun `every bind_java_type binding is parsed`() {
+        val sources = rustSources()
+        assertEquals(
+            "a bind_java_type! use is not in the `pub Name => java.Class` shorthand this test parses; " +
+                "update BINDING in this test to match",
+            sources.sumOf { BINDING_MARKER.findAll(it.text).count() },
+            sources.sumOf { BINDING.findAll(it.text).count() },
+        )
+    }
+
+    @Test
     fun `Kotlin natives and Rust exports agree on symbol and descriptor`() {
         val failures = mutableListOf<String>()
         val kotlin = kotlinNatives(failures)
@@ -95,8 +106,30 @@ class JniNativeContractTest {
         return natives
     }
 
+    /**
+     * Rust types the workspace binds to one Java class with `bind_java_type!`,
+     * by their unqualified name. A name bound twice, or shadowing a built-in
+     * entry of [RUST_DESCRIPTORS], is a failure: it would no longer have one
+     * JVM meaning.
+     */
+    private fun boundJavaTypes(failures: MutableList<String>): Map<String, String> {
+        val bound = mutableMapOf<String, String>()
+        for (source in rustSources()) {
+            for (match in BINDING.findAll(source.text)) {
+                val (name, javaClass) = match.destructured
+                val descriptor = "L" + javaClass.replace('.', '/') + ";"
+                val previous = bound.put(name, descriptor)
+                if (name in RUST_DESCRIPTORS || (previous != null && previous != descriptor)) {
+                    failures += "${source.path}: bind_java_type! `$name` is ambiguous; give it a distinct name"
+                }
+            }
+        }
+        return bound
+    }
+
     private fun rustExports(failures: MutableList<String>): Map<String, Native> {
         val exports = mutableMapOf<String, Native>()
+        val descriptors = RUST_DESCRIPTORS + boundJavaTypes(failures)
         for (source in rustSources()) {
             for (match in EXPORT.findAll(source.text)) {
                 val (attributes, symbol, params, returnType) = match.destructured
@@ -119,8 +152,9 @@ class JniNativeContractTest {
                 if (rustTypeName(types[1]) != "JClass") {
                     failures += "$origin: $symbol takes `${types[1]}` where a static native receives its JClass"
                 }
-                val args = types.drop(2).map { descriptorOfRust(it, origin, failures) }
-                val ret = returnType.ifEmpty { null }?.let { descriptorOfRust(it, origin, failures) } ?: "V"
+                val args = types.drop(2).map { descriptorOfRust(it, descriptors, origin, failures) }
+                val ret =
+                    returnType.ifEmpty { null }?.let { descriptorOfRust(it, descriptors, origin, failures) } ?: "V"
                 exports[symbol] = Native(args.joinToString("", prefix = "(", postfix = ")") + ret, origin)
             }
         }
@@ -129,12 +163,14 @@ class JniNativeContractTest {
 
     private fun descriptorOfRust(
         type: String,
+        descriptors: Map<String, String>,
         origin: String,
         failures: MutableList<String>,
     ): String =
-        RUST_DESCRIPTORS[rustTypeName(type)] ?: run {
+        descriptors[rustTypeName(type)] ?: run {
             failures += "$origin: no descriptor for Rust type `$type`; " +
-                "add it to RUST_DESCRIPTORS if it maps to exactly one JVM type"
+                "add it to RUST_DESCRIPTORS if it maps to exactly one JVM type, " +
+                "or bind the Java class with bind_java_type!"
             "?"
         }
 
@@ -216,6 +252,11 @@ class JniNativeContractTest {
 
         val GENERICS = Regex("<[^>]*>")
 
+        val BINDING_MARKER = Regex("""\bbind_java_type!""")
+
+        val BINDING =
+            Regex("""\bbind_java_type!\s*\{\s*(?:pub(?:\([^)]*\))?\s+)?(\w+)\s*=>\s*"?([\w.$]+)"?\s*,?\s*\}""")
+
         /**
          * Wrappers that are ABI-identical to the raw `JNIEnv*` the JVM passes
          * first. Only add a type here if it is `#[repr(transparent)]` over it.
@@ -225,7 +266,8 @@ class JniNativeContractTest {
         /**
          * Rust parameter types whose JVM type is unambiguous. `JObject` and
          * `JObjectArray` are deliberately absent: they fit many descriptors, so
-         * a hook using one fails here rather than passing unchecked.
+         * a hook using one fails here rather than passing unchecked. Types the
+         * workspace binds with `bind_java_type!` are added by [boundJavaTypes].
          */
         val RUST_DESCRIPTORS =
             mapOf(

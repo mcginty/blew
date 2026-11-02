@@ -419,7 +419,7 @@ that re-adds converges, and one that doesn't keeps its services.
 
 ## Android backend design (`platform/android/`)
 
-Uses `jni 0.22` and `ndk-context 0.1`. The Android BLE API is Java/Kotlin-only, so the backend bridges Rust ↔ Kotlin via JNI.
+Uses `jni 0.22`. The Android BLE API is Java/Kotlin-only, so the backend bridges Rust ↔ Kotlin via JNI.
 
 **Architecture:**
 - **Kotlin singletons** (`BleCentralManager`, `BlePeripheralManager`) live in `crates/blew/android/` (co-located with the Rust JNI hooks so they link-time version together). They wrap `BluetoothLeScanner`, `BluetoothGatt`, `BluetoothGattServer`, and `BluetoothLeAdvertiser`.
@@ -444,12 +444,14 @@ so a mismatch across the boundary compiles and passes CI on both sides —
   when that callback first fires, and a type mismatch raises nothing — the
   export reads arguments the JVM never passed. Hook parameters must use a type
   with exactly one JVM meaning (`jint`, `JString`, `JByteArray`, …); a bare
-  `JObject` fails the test rather than passing unchecked.
+  `JObject` fails the test rather than passing unchecked. For any other class,
+  bind it with `jni::bind_java_type! { pub JContext => android.content.Context }`
+  shorthand: the test reads those bindings from the workspace.
 
 Both cross-check their match count against a plain text count, so a
 declaration reshaped past the parser fails loudly instead of going unchecked.
 
-**Classloader gotcha:** Rust background threads use the system classloader, which cannot find APK classes. `init_jvm()` caches `GlobalRef`s to both Kotlin classes on the main thread (which has the app classloader). All JNI calls use `central_class()` / `peripheral_class()` from `jni_globals.rs` instead of string class names.
+**Classloader gotcha:** Rust background threads use the system classloader, which cannot find APK classes. `init_jvm(env, &context)` is called from Kotlin (`BlewPlugin`'s constructor under Tauri), keeps a global ref to the application context, and caches `GlobalRef`s to both Kotlin classes loaded through its classloader. All JNI calls use `central_class()` / `peripheral_class()` from `jni_globals.rs` instead of string class names, and anything else that needs the app classloader goes through `app_context()`. **blew never reads `ndk_context`**: tao ≥0.37 (Tauri 2.12) publishes it, ≤0.35 doesn't, and it aborts on a second publish, so depending on it either way breaks one range of Tauri versions (#56).
 
 **Threading model:** Android BLE callbacks arrive on Binder threads. JNI hooks push events into tokio `mpsc` channels and return immediately. Rust async code awaits these channels. JNI `AttachGuard` is NOT `Send` — always drop it in a block before any `.await` point:
 
@@ -629,10 +631,10 @@ order lets a waiting start begin an advertisement nothing can stop.
 
 A thin Tauri 2 integration wrapper. The Kotlin BLE classes now live in `crates/blew/android/`; this crate just points Tauri's Gradle build at that path and initializes the JNI bridge.
 
-**Rust side** (`src/lib.rs`): On Android, stores the JVM reference in blew's `OnceLock` via `blew::platform::android::init_jvm()`, then registers the Android plugin. `build.rs` computes the path to `../blew/android` and passes it to `tauri_plugin::Builder::android_path()`.
+**Rust side** (`src/lib.rs`): On Android, `setup` only calls `register_android_plugin`. That call is synchronous: it constructs `BlewPlugin` on the main thread and waits, and the constructor calls `BlewPluginNative.init(applicationContext)`, whose export runs `blew::platform::android::init_jvm`. So blew is initialized before plugin `setup` returns, and an app's own setup hook can construct a `Central`. `build.rs` computes the path to `../blew/android` and passes it to `tauri_plugin::Builder::android_path()`.
 
 **Kotlin side** (lives at `crates/blew/android/src/main/java/org/jakebot/blew/`):
-- `BlewPlugin.kt` — `@TauriPlugin`, initializes BLE managers, requests runtime permissions (BLUETOOTH_SCAN/CONNECT/ADVERTISE on Android 12+; ACCESS_FINE_LOCATION on pre-12 only). `BLUETOOTH_SCAN` is declared with `neverForLocation` so scan results are delivered regardless of the OS-level Location Services toggle.
+- `BlewPlugin.kt` — `@TauriPlugin`, initializes blew from its constructor, requests runtime permissions (BLUETOOTH_SCAN/CONNECT/ADVERTISE on Android 12+; ACCESS_FINE_LOCATION on pre-12 only). `BLUETOOTH_SCAN` is declared with `neverForLocation` so scan results are delivered regardless of the OS-level Location Services toggle.
 - `BleCentralManager.kt` — Singleton wrapping scanner + GATT client. `ScanCallback` → `nativeOnDeviceDiscovered`. `BluetoothGattCallback` → `nativeOnConnectionStateChanged`, `nativeOnServicesDiscovered`, `nativeOnCharacteristicRead/Write/Changed`, `nativeOnMtuChanged`.
 - `BlePeripheralManager.kt` — Singleton wrapping GATT server + advertiser. `BluetoothGattServerCallback` → `nativeOnReadRequest`, `nativeOnWriteRequest`, `nativeOnSubscriptionChanged`, `nativeOnConnectionStateChanged`, `nativeOnAdapterStateChanged`.
 

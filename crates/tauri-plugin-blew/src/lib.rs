@@ -222,13 +222,11 @@ pub fn init_with_config<R: Runtime>(config: BlewPluginConfig) -> TauriPlugin<R> 
 
     tauri::plugin::Builder::<R>::new("blew")
         .setup(|_app, api| {
+            // Synchronous: `BlewPlugin`'s constructor initialises blew
+            // through `BlewPluginNative.init` before this returns, so an
+            // app's own setup hook can construct a role.
             #[cfg(target_os = "android")]
-            {
-                let vm_ptr = android_vm();
-                let vm = unsafe { jni::JavaVM::from_raw(vm_ptr.cast()) };
-                blew::platform::android::init_jvm(vm);
-                api.register_android_plugin(PLUGIN_IDENTIFIER, "BlewPlugin")?;
-            }
+            api.register_android_plugin(PLUGIN_IDENTIFIER, "BlewPlugin")?;
             let _ = api;
             Ok(())
         })
@@ -246,14 +244,20 @@ pub fn init_with_config<R: Runtime>(config: BlewPluginConfig) -> TauriPlugin<R> 
 /// activity's `onCreate` publishes `ndk_context` unconditionally, so if an
 /// activity starts in a process after this was called, tao's publish aborts
 /// the app. On Android an activity can start in any process, so only call
-/// this where you know none ever will. The plugin's own `setup` never
-/// publishes; it reads back what tao published.
+/// this where you know none ever will.
+///
+/// Neither blew nor this plugin reads `ndk_context` any more; this exists
+/// only for other crates in the process that do.
 ///
 /// # Safety
 ///
 /// `vm` is the process's `JavaVM*`; `application_context` is a JNI *global*
 /// reference to the `Application` context that is never deleted.
 #[cfg(target_os = "android")]
+#[deprecated(
+    note = "blew no longer reads ndk_context. On Tauri >= 2.12, calling this aborts \
+            the app if an activity later starts in the process."
+)]
 pub unsafe fn install_android_context_once(
     vm: *mut std::ffi::c_void,
     application_context: *mut std::ffi::c_void,
@@ -263,13 +267,22 @@ pub unsafe fn install_android_context_once(
     });
 }
 
-// tao >= 0.37 publishes ndk_context in the activity's `onCreate`, before any
-// plugin setup runs, and ndk_context aborts on a second publish -- so setup
-// only reads it back. Both blew and `hickory-resolver` (iroh's DNS dep on
-// Android) read the JVM and the application context through it.
+/// JNI entry point invoked from `BlewPluginNative.init(context)` in
+/// `BlewPlugin`'s constructor, which runs inside `register_android_plugin`.
+///
+/// # Safety
+///
+/// Invoked by the JVM through the normal JNI calling convention; safe provided
+/// the signature matches the Kotlin `external fun` declaration.
 #[cfg(target_os = "android")]
-fn android_vm() -> *mut std::ffi::c_void {
-    ndk_context::android_context().vm()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_org_jakebot_blew_BlewPluginNative_init(
+    mut env: jni::EnvUnowned,
+    _class: jni::objects::JClass,
+    context: blew::platform::android::JContext,
+) {
+    env.with_env(|env| blew::platform::android::init_jvm(env, &context))
+        .resolve::<jni::errors::ThrowRuntimeExAndDefault>();
 }
 
 /// JNI entry point invoked from `BlewPluginNative.autoRequestPermissionsEnabled()`
