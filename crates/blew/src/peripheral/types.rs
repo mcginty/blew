@@ -24,9 +24,52 @@ pub struct PeripheralConfig {
 #[derive(Debug, Clone)]
 pub enum PeripheralStateEvent {
     /// The local Bluetooth adapter was powered on or off.
+    ///
+    /// # What a power-off invalidates
+    ///
+    /// By the time `powered: false` arrives, every backend has already:
+    ///
+    /// - dropped every connected central, reporting each subscription it held
+    ///   as a [`SubscriptionChanged`](Self::SubscriptionChanged) with
+    ///   `subscribed: false`;
+    /// - failed operations that were waiting on the stack (Apple and Android;
+    ///   Linux has none that wait on the adapter).
+    ///
+    /// What happens to the rest differs by platform:
+    ///
+    /// | | Services | Advertising | L2CAP listener |
+    /// |---|---|---|---|
+    /// | Android | gone; re-add them | stopped; start it again | unspecified |
+    /// | Linux | kept, and published again by the next `start_advertising` | stopped; start it again | unspecified |
+    /// | Apple | kept on a plain power-off; gone if the state falls below `PoweredOff` (resetting, unauthorized, …) | may resume by itself | the accept stream ends with [`NotPowered`]; publish again |
+    ///
+    /// Apple's row follows the SDK header, which Apple's online documentation
+    /// contradicts (it says a power-off always clears the database), and is
+    /// unconfirmed on a device.
+    ///
+    /// # Recovering on `powered: true`
+    ///
+    /// Re-adding every service and starting advertising again is correct on
+    /// Android and Linux: `add_service` replaces a service with the same UUID
+    /// on Linux rather than duplicating it. On Apple, re-adding a service the
+    /// database kept may be refused or worse; whether a fresh service with an
+    /// existing UUID is accepted is unverified. A `start_advertising` that
+    /// fails with [`AlreadyAdvertising`] after a power cycle means the
+    /// platform resumed it. The `testing` mock models the strictest case, so
+    /// an application tested against it rebuilds everything.
+    ///
+    /// [`NotPowered`]: crate::BlewError::NotPowered
+    /// [`AlreadyAdvertising`]: crate::BlewError::AlreadyAdvertising
     AdapterStateChanged { powered: bool },
 
     /// A remote central subscribed to or unsubscribed from a characteristic's notifications.
+    ///
+    /// A central that disconnects, or one lost to an adapter power-off, is
+    /// reported unsubscribed from everything it held. On Linux, BlueZ names
+    /// no central, so `client_id` is empty, and an unsubscribe is reported
+    /// only when blew next finds the session ended: on the next
+    /// `notify_characteristic` to that characteristic, on
+    /// `stop_advertising`, or on a power-off.
     SubscriptionChanged {
         client_id: DeviceId,
         char_uuid: Uuid,

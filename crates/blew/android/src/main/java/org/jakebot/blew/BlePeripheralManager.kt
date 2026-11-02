@@ -246,11 +246,21 @@ object BlePeripheralManager {
             // The disconnect callback may still arrive for the same device;
             // whichever gets the entry out of the map reports it, once.
             if (connectedDevices.remove(addr) != null) {
-                subscriptions.remove(addr)
-                nativeOnConnectionStateChanged(addr, false)
+                reportDisconnected(addr)
             }
         }
         nativeOnAdapterStateChanged(false)
+    }
+
+    /**
+     * A central that is gone can't unsubscribe, so its subscriptions are
+     * reported ended here; nothing else would tell the application.
+     */
+    private fun reportDisconnected(addr: String) {
+        for (charUuid in subscriptions.remove(addr)) {
+            nativeOnSubscriptionChanged(addr, charUuid.toString(), false)
+        }
+        nativeOnConnectionStateChanged(addr, false)
     }
 
     @Volatile
@@ -363,8 +373,7 @@ object BlePeripheralManager {
                     // [onAdapterOff] drops connections the stack never reports
                     // losing; taking the entry is what decides who reports it.
                     if (connectedDevices.remove(addr) != null) {
-                        subscriptions.remove(addr)
-                        nativeOnConnectionStateChanged(addr, false)
+                        reportDisconnected(addr)
                     }
                 }
             }

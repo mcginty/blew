@@ -55,8 +55,19 @@ class SubscriptionTest {
         assertNull(table.withSubscription(addr, char) { it })
 
         table.update(addr, char, cccd(0x01, 0x00))
-        table.remove(addr)
+        assertEquals(listOf(char), table.remove(addr))
         assertNull(table.withSubscription(addr, char) { it })
+        assertEquals(emptyList<UUID>(), table.remove(addr))
+    }
+
+    @Test
+    fun removeReportsOnlyLiveSubscriptions() {
+        val table = SubscriptionTable()
+        val other = UUID.fromString("0000abce-0000-1000-8000-00805f9b34fb")
+        table.update(addr, char, cccd(0x01, 0x00))
+        table.update(addr, other, cccd(0x02, 0x00))
+        table.update(addr, other, cccd(0x00, 0x00))
+        assertEquals(listOf(char), table.remove(addr))
     }
 
     @Test

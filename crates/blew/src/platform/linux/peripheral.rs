@@ -70,7 +70,7 @@ impl PeripheralInner {
         // Taken under the lock, dropped -- unregistering them -- after it.
         let taken = self.published.lock().unpublish();
         drop(taken);
-        self.notifiers.lock().clear();
+        self.drop_notifiers();
     }
 
     /// The adapter powered off, taking the advertisement and GATT application
@@ -83,7 +83,26 @@ impl PeripheralInner {
         // peripheral with no services behind it.
         let taken = self.published.lock().power_lost();
         drop(taken);
-        self.notifiers.lock().clear();
+        self.drop_notifiers();
+    }
+
+    /// End every notify session, reporting each as an unsubscribe: their
+    /// centrals can no longer receive anything, and nothing else would say so.
+    /// One per session, matching the one `subscribed: true` each was reported
+    /// with, and with the same empty `client_id`.
+    fn drop_notifiers(&self) {
+        let dropped = std::mem::take(&mut *self.notifiers.lock());
+        for (char_uuid, sessions) in dropped {
+            for _ in sessions {
+                let _ = self
+                    .state_tx
+                    .send(PeripheralStateEvent::SubscriptionChanged {
+                        client_id: DeviceId(String::new()),
+                        char_uuid,
+                        subscribed: false,
+                    });
+            }
+        }
     }
 }
 
@@ -717,9 +736,24 @@ impl PeripheralBackend for LinuxPeripheral {
             if any_stopped {
                 // A notifier another send holds is live: an indication can
                 // keep it locked for the whole confirmation wait.
+                let mut ended = 0_usize;
                 handle.notifiers.lock().entry(char_uuid).and_modify(|v| {
+                    let before = v.len();
                     v.retain(|arc| arc.try_lock().map_or(true, |n| !n.is_stopped()));
+                    ended = before - v.len();
                 });
+                // BlueZ says nothing when a session ends, so this is the first
+                // point blew learns of the unsubscribe.
+                for _ in 0..ended {
+                    emit_state(
+                        &handle,
+                        PeripheralStateEvent::SubscriptionChanged {
+                            client_id: DeviceId(String::new()),
+                            char_uuid,
+                            subscribed: false,
+                        },
+                    );
+                }
             }
             if let Some(e) = emit_failed {
                 return Err(e);

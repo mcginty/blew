@@ -70,6 +70,23 @@ All notable changes to `blew` are documented here. Format follows
 
 ### Changed
 
+- **`AdapterStateChanged` documents what a power cycle invalidates.**
+  ([#47](https://github.com/mcginty/blew/issues/47)) The peripheral event now
+  states, per platform, what is gone by the time `powered: false` arrives and
+  what to rebuild on `powered: true`; the central event says the same for
+  connections and scans.
+
+- **`testing`: the mock's adapter power-off takes down what the real backends
+  do.** ([#47](https://github.com/mcginty/blew/issues/47)) It used to flip a
+  flag and emit the event, so a test could pass while an application never
+  rebuilt anything. `mock_emit_adapter_state(false)` on the peripheral now
+  drops the connection (the central sees `LinkLoss`), reports the central's
+  subscriptions ended, clears the services and advertisement, and ends the
+  L2CAP accept stream with `NotPowered`; on the central it disconnects with
+  `AdapterOff`. While powered off, `add_service` and `start_advertising` fail
+  with `NotPowered`, and `add_service` now replaces a service with the same
+  UUID instead of adding a second copy, as Linux does.
+
 - **Android: the module's `minSdk` is now 33 (Android 13).** The GATT client
   already called `writeCharacteristic(char, value, type)` and
   `writeDescriptor(desc, value)`, which exist only from API 33, so on Android
@@ -138,6 +155,22 @@ All notable changes to `blew` are documented here. Format follows
   the device again — while `discovered_devices()` still listed it. `connect()`
   now asks CoreBluetooth for the peripheral by identifier
   (`retrievePeripheralsWithIdentifiers:`) when blew no longer holds one.
+
+- **Android and Linux: a peripheral reports a lost central's subscriptions
+  ended.** ([#47](https://github.com/mcginty/blew/issues/47)) Only Apple sent
+  `SubscriptionChanged { subscribed: false }` for a central that disconnected
+  or went with an adapter power-off; Android dropped the subscriptions
+  silently and Linux never reported an unsubscribe at all. Android now reports
+  each one before the disconnect. Linux, where BlueZ names no central and says
+  nothing when a session ends, reports one per session it finds ended: on the
+  next `notify_characteristic`, on `stop_advertising`, or on a power-off,
+  which it reports before the adapter event.
+
+- **Android: a connection lost to the adapter powering off reports
+  `DisconnectCause::AdapterOff`.** ([#47](https://github.com/mcginty/blew/issues/47))
+  The stack reports these with an ordinary status, so they came out as
+  `LinkLoss` or `Unknown(n)`. The central now checks the adapter, as Linux
+  does.
 
 - **Android: `CentralConfig::connect_timeout` belongs to the `Central` it was
   given to.** ([#50](https://github.com/mcginty/blew/issues/50)) It was stored
