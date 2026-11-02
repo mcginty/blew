@@ -37,7 +37,6 @@ struct CentralState {
     pending_discover: Mutex<HashMap<String, oneshot::Sender<BlewResult<Vec<GattService>>>>>,
     discovered: Mutex<Vec<BleDevice>>,
     mtu_cache: Mutex<HashMap<String, u16>>,
-    connect_timeout: Mutex<Option<Duration>>,
 }
 
 static STATE: OnceLock<CentralState> = OnceLock::new();
@@ -46,27 +45,16 @@ fn state() -> &'static CentralState {
     STATE.get().expect("AndroidCentral not initialized")
 }
 
-fn init_statics(connect_timeout: Option<Duration>) {
+fn init_statics() {
     let (event_tx, _) = broadcast::channel(256);
-    let first_init = STATE
-        .set(CentralState {
-            event_tx,
-            pending_ops: OpSlots::default(),
-            connects: Mutex::new(ConnectAttempts::default()),
-            pending_discover: Mutex::new(HashMap::new()),
-            discovered: Mutex::new(Vec::new()),
-            mtu_cache: Mutex::new(HashMap::new()),
-            connect_timeout: Mutex::new(connect_timeout),
-        })
-        .is_ok();
-    if !first_init {
-        // OnceLock is already populated (AndroidCentral initialised more than
-        // once in the process). Update the timeout since the existing
-        // callbacks/maps are still valid for the new instance.
-        if let Some(s) = STATE.get() {
-            *s.connect_timeout.lock() = connect_timeout;
-        }
-    }
+    let _ = STATE.set(CentralState {
+        event_tx,
+        pending_ops: OpSlots::default(),
+        connects: Mutex::new(ConnectAttempts::default()),
+        pending_discover: Mutex::new(HashMap::new()),
+        discovered: Mutex::new(Vec::new()),
+        mtu_cache: Mutex::new(HashMap::new()),
+    });
     super::l2cap_state::init_statics();
 }
 
@@ -237,6 +225,9 @@ pub struct AndroidCentral {
     /// relax a channel this one opens. See the warning on
     /// `l2cap_state::L2capState::client_config`.
     l2cap_encryption: L2capEncryption,
+    /// Per instance for the same reason (#50): a second `Central` built with
+    /// the default must not reset a deadline this one chose.
+    connect_timeout: Option<Duration>,
 }
 
 impl AndroidCentral {
@@ -254,11 +245,12 @@ impl AndroidCentral {
         if !super::are_ble_permissions_granted() {
             return Err(BlewError::PermissionDenied);
         }
-        init_statics(config.connect_timeout);
+        init_statics();
         super::l2cap_state::set_client_config(config.l2cap.clone());
         debug!(connect_timeout = ?config.connect_timeout, "AndroidCentral initialized");
         Ok(AndroidCentral {
             l2cap_encryption: config.l2cap.encryption,
+            connect_timeout: config.connect_timeout,
         })
     }
 
@@ -376,6 +368,7 @@ impl CentralBackend for AndroidCentral {
     fn connect(&self, device_id: &DeviceId) -> impl Future<Output = BlewResult<()>> + Send {
         let addr = device_id.as_str().to_owned();
         let did = device_id.clone();
+        let timeout = self.connect_timeout;
         async move {
             let s = state();
             // The generation travels to Kotlin with the request and comes back
@@ -410,7 +403,6 @@ impl CentralBackend for AndroidCentral {
                 return Err(jni_err(&err));
             }
 
-            let timeout = *s.connect_timeout.lock();
             let result = match timeout {
                 Some(dur) => match tokio::time::timeout(dur, rx).await {
                     Ok(Ok(result)) => result,

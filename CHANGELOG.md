@@ -139,6 +139,12 @@ All notable changes to `blew` are documented here. Format follows
   now asks CoreBluetooth for the peripheral by identifier
   (`retrievePeripheralsWithIdentifiers:`) when blew no longer holds one.
 
+- **Android: `CentralConfig::connect_timeout` belongs to the `Central` it was
+  given to.** ([#50](https://github.com/mcginty/blew/issues/50)) It was stored
+  process-wide, so constructing a second `Central` silently replaced the first
+  one's connect deadline with its own (often the 15 s default). It now lives on
+  each instance, as it already did on Apple and Linux.
+
 - **tauri-plugin-blew: no longer aborts every Android launch on Tauri 2.12.**
   ([#56](https://github.com/mcginty/blew/issues/56)) tao 0.37 publishes
   `ndk_context` itself in the activity's `onCreate`, and the plugin's `setup`
