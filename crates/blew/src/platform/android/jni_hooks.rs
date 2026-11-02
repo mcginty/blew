@@ -42,7 +42,7 @@ use crate::peripheral::types::{
 };
 use crate::types::{BleDevice, DeviceId};
 
-use super::jni_globals::{jvm, peripheral_class};
+use super::jni_globals::{central_class, jvm, peripheral_class};
 
 /// Run `f`, catching any panic before it unwinds across the FFI boundary.
 /// A panic through `extern "C"` is undefined behavior, so every JNI hook
@@ -428,7 +428,21 @@ pub unsafe extern "C" fn Java_org_jakebot_blew_BleCentralManager_nativeOnConnect
                 gatt_status,
                 "GATT connection state changed"
             );
+            // The stack reports a link the adapter took down with an ordinary
+            // status (often 8, a link loss), so ask the adapter, as Linux does.
+            // A failed query keeps the status's own reading.
+            let adapter_off = connected != JNI_TRUE
+                && !env
+                    .call_static_method(
+                        central_class(),
+                        jni_str!("isPowered"),
+                        jni_sig!("()Z"),
+                        &[],
+                    )
+                    .and_then(jni::JValueOwned::z)
+                    .unwrap_or(true);
             let cause = match gatt_status {
+                _ if adapter_off => DisconnectCause::AdapterOff,
                 0 | 22 => DisconnectCause::LocalClose,
                 8 => DisconnectCause::LinkLoss,
                 19 => DisconnectCause::RemoteClose,

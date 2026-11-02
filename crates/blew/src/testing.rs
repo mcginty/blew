@@ -100,6 +100,26 @@ impl LinkState {
     }
 }
 
+impl LinkState {
+    /// End the connection, returning the characteristics the central was
+    /// subscribed to. Dropping their senders ends the central's streams.
+    fn drop_connection(&mut self) -> (bool, Vec<Uuid>) {
+        let was_connected = std::mem::take(&mut self.connected);
+        let lost = self.subscriptions.drain().map(|(uuid, _)| uuid).collect();
+        (was_connected, lost)
+    }
+}
+
+fn report_unsubscribed(tx: &broadcast::Sender<PeripheralStateEvent>, lost: Vec<Uuid>) {
+    for char_uuid in lost {
+        let _ = tx.send(PeripheralStateEvent::SubscriptionChanged {
+            client_id: DeviceId::from("mock-central"),
+            char_uuid,
+            subscribed: false,
+        });
+    }
+}
+
 type SharedLink = Arc<Mutex<LinkState>>;
 /// Central side of a [`MockLink`].
 pub struct MockLinkEndpoint {
@@ -222,8 +242,22 @@ impl MockCentral {
     }
 
     /// Emit an `AdapterStateChanged` event and update the powered flag.
+    ///
+    /// Powering off first does what the real backends do: the connection
+    /// drops with [`DisconnectCause::AdapterOff`], and the peripheral sees the
+    /// central's subscriptions end.
     pub fn mock_emit_adapter_state(&self, powered: bool) {
         *self.powered.lock() = powered;
+        if !powered {
+            let (was_connected, lost) = self.link.lock().drop_connection();
+            report_unsubscribed(&self.periph_state_tx, lost);
+            if was_connected {
+                let _ = self.event_tx.send(CentralEvent::DeviceDisconnected {
+                    device_id: DeviceId::from("mock-peripheral"),
+                    cause: DisconnectCause::AdapterOff,
+                });
+            }
+        }
         let _ = self
             .event_tx
             .send(CentralEvent::AdapterStateChanged { powered });
@@ -655,8 +689,39 @@ impl MockPeripheral {
     }
 
     /// Emit an `AdapterStateChanged` event and update the powered flag.
+    ///
+    /// Powering off first takes down what the strictest backend loses, so a
+    /// test passes only if the application rebuilds on power-on: the central
+    /// disconnects (seeing [`DisconnectCause::LinkLoss`]), its subscriptions
+    /// are reported ended, the services and advertisement are gone, and the
+    /// L2CAP accept stream ends with [`BlewError::NotPowered`]. See
+    /// [`PeripheralStateEvent::AdapterStateChanged`].
     pub fn mock_emit_adapter_state(&self, powered: bool) {
         *self.powered.lock() = powered;
+        if !powered {
+            let (was_connected, lost, accept_tx) = {
+                let mut link = self.link.lock();
+                let (was_connected, lost) = link.drop_connection();
+                link.services.clear();
+                link.char_values.clear();
+                link.advertising = false;
+                link.adv_config = None;
+                link.l2cap_psm = None;
+                (was_connected, lost, link.l2cap_accept_tx.take())
+            };
+            if let Some(tx) = accept_tx {
+                let _ = tx.send(Err(BlewError::NotPowered));
+            }
+            report_unsubscribed(&self.state_tx, lost);
+            if was_connected {
+                let _ = self
+                    .central_sender_keepalive
+                    .send(CentralEvent::DeviceDisconnected {
+                        device_id: DeviceId::from("mock-peripheral"),
+                        cause: DisconnectCause::LinkLoss,
+                    });
+            }
+        }
         let _ = self
             .state_tx
             .send(PeripheralStateEvent::AdapterStateChanged { powered });
@@ -698,20 +763,29 @@ impl PeripheralBackend for MockPeripheral {
     }
 
     fn add_service(&self, service: &GattService) -> impl Future<Output = BlewResult<()>> + Send {
+        if !*self.powered.lock() {
+            return std::future::ready(Err(BlewError::NotPowered));
+        }
         let mut link = self.link.lock();
         for ch in &service.characteristics {
             if !ch.value.is_empty() {
                 link.char_values.insert(ch.uuid, ch.value.clone());
             }
         }
+        // Replaces by UUID, as Linux does, so a re-add after a power cycle
+        // never duplicates.
+        link.services.retain(|s| s.uuid != service.uuid);
         link.services.push(service.clone());
-        async { Ok(()) }
+        std::future::ready(Ok(()))
     }
 
     fn start_advertising(
         &self,
         config: &AdvertisingConfig,
     ) -> impl Future<Output = BlewResult<()>> + Send {
+        if !*self.powered.lock() {
+            return std::future::ready(Err(BlewError::NotPowered));
+        }
         let mut link = self.link.lock();
         if link.advertising {
             return std::future::ready(Err(BlewError::AlreadyAdvertising));
@@ -1551,6 +1625,161 @@ mod tests {
             }
             other => panic!("expected AlreadySubscribed, got {other:?}"),
         }
+    }
+
+    fn notify_service(char_uuid: Uuid) -> GattService {
+        GattService {
+            uuid: Uuid::from_u128(0x1234),
+            primary: true,
+            characteristics: vec![GattCharacteristic {
+                uuid: char_uuid,
+                properties: CharacteristicProperties::NOTIFY,
+                permissions: AttributePermissions::READ,
+                value: vec![],
+                descriptors: vec![],
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_peripheral_power_off_takes_everything_down() {
+        let (c, p) = MockLink::pair();
+        let central = Central::from_backend(c.central);
+        let peripheral = Peripheral::from_backend(p.peripheral);
+        let char_uuid = Uuid::from_u128(0x4747);
+        let device_id = DeviceId::from("mock-peripheral");
+
+        peripheral
+            .add_service(&notify_service(char_uuid))
+            .await
+            .unwrap();
+        peripheral
+            .start_advertising(&AdvertisingConfig::default())
+            .await
+            .unwrap();
+        let (_psm, mut accepts) = peripheral.l2cap_listener().await.unwrap();
+        let mut events = central.events();
+        central.connect(&device_id).await.unwrap();
+        central
+            .subscribe_characteristic(&device_id, char_uuid)
+            .await
+            .unwrap();
+        let mut state = peripheral.state_events();
+
+        peripheral.mock_emit_adapter_state(false);
+
+        match state.next().await {
+            Some(PeripheralStateEvent::SubscriptionChanged {
+                char_uuid: u,
+                subscribed: false,
+                ..
+            }) => assert_eq!(u, char_uuid),
+            other => panic!("expected the subscription to end first, got {other:?}"),
+        }
+        assert!(matches!(
+            state.next().await,
+            Some(PeripheralStateEvent::AdapterStateChanged { powered: false })
+        ));
+        assert!(matches!(
+            accepts.next().await,
+            Some(Err(BlewError::NotPowered))
+        ));
+        let disconnected = loop {
+            match events.next().await {
+                Some(CentralEvent::DeviceDisconnected { cause, .. }) => break cause,
+                Some(_) => {}
+                None => panic!("central stream ended"),
+            }
+        };
+        assert_eq!(disconnected, DisconnectCause::LinkLoss);
+
+        assert!(matches!(
+            peripheral.add_service(&notify_service(char_uuid)).await,
+            Err(BlewError::NotPowered)
+        ));
+
+        peripheral.mock_emit_adapter_state(true);
+        assert_eq!(
+            peripheral
+                .notify_characteristic(&device_id, char_uuid, vec![1])
+                .await
+                .unwrap(),
+            Delivery::NoSubscriber
+        );
+        central.connect(&device_id).await.unwrap();
+        assert!(
+            central
+                .discover_services(&device_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a power cycle drops the services"
+        );
+
+        peripheral
+            .add_service(&notify_service(char_uuid))
+            .await
+            .unwrap();
+        peripheral
+            .add_service(&notify_service(char_uuid))
+            .await
+            .unwrap();
+        assert_eq!(
+            central.discover_services(&device_id).await.unwrap().len(),
+            1,
+            "re-adding a service replaces it"
+        );
+        peripheral
+            .start_advertising(&AdvertisingConfig::default())
+            .await
+            .expect("advertising stopped with the adapter");
+    }
+
+    #[tokio::test]
+    async fn contract_central_power_off_disconnects_with_adapter_off() {
+        let (c, p) = MockLink::pair();
+        let central = Central::from_backend(c.central);
+        let peripheral = Peripheral::from_backend(p.peripheral);
+        let char_uuid = Uuid::from_u128(0x4748);
+        let device_id = DeviceId::from("mock-peripheral");
+
+        peripheral
+            .add_service(&notify_service(char_uuid))
+            .await
+            .unwrap();
+        let mut events = central.events();
+        central.connect(&device_id).await.unwrap();
+        central
+            .subscribe_characteristic(&device_id, char_uuid)
+            .await
+            .unwrap();
+        let mut state = peripheral.state_events();
+
+        central.mock_emit_adapter_state(false);
+
+        assert!(matches!(
+            state.next().await,
+            Some(PeripheralStateEvent::SubscriptionChanged {
+                subscribed: false,
+                ..
+            })
+        ));
+        let mut saw_disconnect = false;
+        loop {
+            match events.next().await {
+                Some(CentralEvent::DeviceDisconnected { cause, .. }) => {
+                    assert_eq!(cause, DisconnectCause::AdapterOff);
+                    saw_disconnect = true;
+                }
+                Some(CentralEvent::AdapterStateChanged { powered: false }) => break,
+                Some(_) => {}
+                None => panic!("central stream ended"),
+            }
+        }
+        assert!(
+            saw_disconnect,
+            "the disconnect is reported before the adapter event"
+        );
     }
 
     #[tokio::test]

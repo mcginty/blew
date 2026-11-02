@@ -65,8 +65,10 @@ internal class SubscriptionTable {
         return subscription != null
     }
 
-    fun remove(addr: String) {
-        devices.remove(addr)
+    /** Forgets the device, returning the characteristics it was subscribed to. */
+    fun remove(addr: String): List<UUID> {
+        val chars = devices.remove(addr) ?: return emptyList()
+        return synchronized(chars) { chars.keys.toList() }
     }
 
     /**

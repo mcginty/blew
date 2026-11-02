@@ -72,6 +72,13 @@ pub enum DisconnectCause {
 #[derive(Debug, Clone)]
 pub enum CentralEvent {
     /// The local Bluetooth adapter was powered on or off.
+    ///
+    /// Every connection is lost with the adapter, and each is reported as a
+    /// [`DeviceDisconnected`](Self::DeviceDisconnected) with
+    /// [`DisconnectCause::AdapterOff`]; the platforms don't order these
+    /// against `powered: false`. Operations on those connections fail. Treat
+    /// a scan as stopped and start it again on `powered: true`; nothing
+    /// reconnects by itself.
     AdapterStateChanged { powered: bool },
     /// A new peripheral was discovered or its advertising data was updated.
     DeviceDiscovered(BleDevice),
