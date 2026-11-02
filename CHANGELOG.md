@@ -131,6 +131,14 @@ All notable changes to `blew` are documented here. Format follows
 
 ### Fixed
 
+- **Apple: `connect()` reaches a device that disconnected, or one remembered
+  from an earlier run.** ([#57](https://github.com/mcginty/blew/issues/57))
+  A disconnect dropped the `CBPeripheral`, and only a scan result put it back,
+  so reconnecting failed with `DeviceNotFound` until a scan happened to report
+  the device again — while `discovered_devices()` still listed it. `connect()`
+  now asks CoreBluetooth for the peripheral by identifier
+  (`retrievePeripheralsWithIdentifiers:`) when blew no longer holds one.
+
 - **tauri-plugin-blew: no longer aborts every Android launch on Tauri 2.12.**
   ([#56](https://github.com/mcginty/blew/issues/56)) tao 0.37 publishes
   `ndk_context` itself in the activity's `onCreate`, and the plugin's `setup`
