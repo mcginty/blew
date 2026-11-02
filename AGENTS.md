@@ -29,6 +29,7 @@ mise run fmt:check                       # check formatting
 mise run deny                            # license/vulnerability audit
 mise run ci:compile-kotlin               # compile the Android Kotlin sources
 mise run ci:test-kotlin                  # JVM tests: GATT ownership + Rust/Kotlin JNI contract
+mise run ci:android-smoke all aarch64    # launch the Tauri smoke app (smoke/android) on a running emulator
 cargo run --example scan -p blew         # scan for 10s
 cargo run --example advertise -p blew    # advertise GATT service
 ```

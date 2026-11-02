@@ -1,0 +1,27 @@
+[package]
+name = "blew-android-smoke"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Launches a Tauri app with tauri-plugin-blew on Android and reports whether blew initialised"
+
+# Kept out of the blew workspace: it is only ever built for Android by the
+# android-smoke CI job, and a Tauri app in the workspace would make every
+# desktop build and test pay for it.
+[workspace]
+
+[lib]
+name = "blew_android_smoke_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2.12", features = [] }
+tauri-plugin-blew = { path = "../../crates/tauri-plugin-blew" }
+blew = { path = "../../crates/blew" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15"
+log = "0.4"
