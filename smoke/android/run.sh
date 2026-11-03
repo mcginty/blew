@@ -28,16 +28,27 @@ build() {
     cargo tauri android build --debug --apk --target "$target"
 }
 
+# Capture before matching. Under pipefail, `adb logcat | grep -q` reports a
+# match as a failure once the log is long enough: grep exits on the match and
+# adb dies of SIGPIPE writing the rest.
+logged() {
+    local log
+    log=$(adb logcat -d -s blew-smoke:V)
+    grep -qE "$1" <<<"$log"
+}
+
 # The crash buffer truncates the process name ("ebot.blew.smoke"), and a Java
 # FATAL EXCEPTION names the full package, so match the common tail.
 crashed() {
-    adb logcat -d -b crash | grep -q 'blew\.smoke'
+    local log
+    log=$(adb logcat -d -b crash)
+    grep -q 'blew\.smoke' <<<"$log"
 }
 
 # A panic on a Tokio worker kills only its task, so the process can outlive
 # one; the marker is the only sign of it.
 failed() {
-    adb logcat -d -s blew-smoke:V | grep -qE 'BLEW_SMOKE_(FAIL|PANIC)'
+    logged 'BLEW_SMOKE_(FAIL|PANIC)'
 }
 
 launch() {
@@ -63,7 +74,7 @@ launch() {
             verdict=crash
             break
         fi
-        if adb logcat -d -s blew-smoke:V | grep -q BLEW_SMOKE_OK; then
+        if logged BLEW_SMOKE_OK; then
             verdict=ok
             break
         fi
