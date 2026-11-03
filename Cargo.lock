@@ -132,7 +132,7 @@ dependencies = [
 
 [[package]]
 name = "blew"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "bitflags 2.13.2",
  "bluer",
