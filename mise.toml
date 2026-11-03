@@ -90,6 +90,12 @@ cargo ndk -t arm64-v8a check -p tauri-plugin-blew
 gradle -p crates/blew/android/ci compileDebugKotlin --no-daemon
 """
 
+[tasks."ci:android-smoke"]
+description = "Build the Tauri smoke app and launch it on a running emulator/device (args: [build|launch|all] [aarch64|x86_64])"
+# The Gradle that Tauri's Android template pins can't read newer JDKs' class files.
+tools = { java = "temurin-17", "cargo:tauri-cli" = "2" }
+run = "smoke/android/run.sh"
+
 [tasks."ci:test-kotlin"]
 description = "Run the JVM Kotlin unit tests (GATT ownership, JNI contract)"
 tools = { gradle = "8", java = "temurin-17" }
