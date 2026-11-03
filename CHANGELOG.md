@@ -5,6 +5,8 @@ All notable changes to `blew` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-11-03
+
 ### Added
 
 - **Android: `java_vm()` and `application_context()` expose the handles
