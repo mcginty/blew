@@ -142,3 +142,28 @@ pub(crate) fn peripheral_class() -> &'static Global<JClass<'static>> {
 pub(crate) fn app_context() -> &'static Global<JObject<'static>> {
     APP_CONTEXT.get().expect("JNI app context not initialized")
 }
+
+/// The `JavaVM` [`init_jvm`] stored, or `None` before it has run.
+///
+/// For other crates in the process that need JNI. On Tauri < 2.12, where
+/// nothing publishes `ndk_context`, this and [`application_context`] are what
+/// a host needs to publish it so `ndk_context` readers such as iroh's system
+/// DNS lookup work. blew itself never touches `ndk_context`.
+#[must_use]
+pub fn java_vm() -> Option<&'static JavaVM> {
+    JVM.get()
+}
+
+/// The global reference to the application context [`init_jvm`] kept, or
+/// `None` before it has run.
+///
+/// blew holds the reference for the life of the process and never deletes
+/// it, so its raw pointer stays valid until exit. See [`java_vm`].
+#[must_use]
+pub fn application_context() -> Option<&'static Global<JObject<'static>>> {
+    if is_initialized() {
+        APP_CONTEXT.get()
+    } else {
+        None
+    }
+}

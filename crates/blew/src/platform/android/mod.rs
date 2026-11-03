@@ -5,7 +5,7 @@ pub(crate) mod l2cap_state;
 pub mod peripheral;
 
 pub use central::AndroidCentral;
-pub use jni_globals::{JContext, init_jvm, is_initialized};
+pub use jni_globals::{JContext, application_context, init_jvm, is_initialized, java_vm};
 pub use peripheral::AndroidPeripheral;
 
 /// Check whether the app is running on an Android emulator.

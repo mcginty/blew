@@ -235,29 +235,32 @@ pub fn init_with_config<R: Runtime>(config: BlewPluginConfig) -> TauriPlugin<R> 
 
 /// Publish `ndk_context` for this process, once. Later calls do nothing.
 ///
-/// For hosts that run Rust in a process no activity has started, such as an
-/// FCM service. `ndk_context` aborts on a second publish and offers no way to
-/// ask whether one happened, so every host publisher in the process must come
-/// through here.
+/// Neither blew nor this plugin reads `ndk_context`; this exists for other
+/// crates in the process that do, such as iroh's system DNS lookup. On
+/// Tauri < 2.12 nothing else publishes it, so without this those crates fall
+/// back (iroh to public resolvers). Pass the handles blew already holds:
 ///
-/// **This cannot coordinate with tao.** Since tao 0.37 (Tauri 2.12), every
-/// activity's `onCreate` publishes `ndk_context` unconditionally, so if an
-/// activity starts in a process after this was called, tao's publish aborts
-/// the app. On Android an activity can start in any process, so only call
-/// this where you know none ever will.
+/// ```ignore
+/// let vm = blew::platform::android::java_vm().expect("plugin registered");
+/// let ctx = blew::platform::android::application_context().expect("plugin registered");
+/// unsafe { tauri_plugin_blew::install_android_context_once(vm.get_raw().cast(), ctx.as_raw().cast()) };
+/// ```
 ///
-/// Neither blew nor this plugin reads `ndk_context` any more; this exists
-/// only for other crates in the process that do.
+/// `ndk_context` aborts on a second publish and offers no way to ask whether
+/// one happened, so every host publisher in the process must come through
+/// here.
+///
+/// **Only call this on Tauri < 2.12.** It cannot coordinate with tao: since
+/// tao 0.37 (Tauri 2.12), every activity's `onCreate` publishes `ndk_context`
+/// unconditionally, so if an activity starts in a process after this was
+/// called, tao's publish aborts the app. On 2.12 and later tao's publish
+/// already serves `ndk_context` readers, so there is nothing to do.
 ///
 /// # Safety
 ///
 /// `vm` is the process's `JavaVM*`; `application_context` is a JNI *global*
 /// reference to the `Application` context that is never deleted.
 #[cfg(target_os = "android")]
-#[deprecated(
-    note = "blew no longer reads ndk_context. On Tauri >= 2.12, calling this aborts \
-            the app if an activity later starts in the process."
-)]
 pub unsafe fn install_android_context_once(
     vm: *mut std::ffi::c_void,
     application_context: *mut std::ffi::c_void,

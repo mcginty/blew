@@ -5,6 +5,26 @@ All notable changes to `blew` are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Android: `java_vm()` and `application_context()` expose the handles
+  `init_jvm` stored.** Both live in `blew::platform::android` and return `None`
+  until `init_jvm` has run. They are for other crates in the process that need
+  JNI. On Tauri < 2.12 nothing publishes `ndk_context`, so iroh can't read the
+  system's DNS servers and falls back to public resolvers. A host can now
+  publish it from these handles through
+  `tauri_plugin_blew::install_android_context_once()`. blew still never
+  touches `ndk_context`.
+
+### Changed
+
+- **tauri-plugin-blew: `install_android_context_once()` is no longer
+  deprecated.** It is the supported way to publish `ndk_context` on
+  Tauri < 2.12, for `ndk_context` readers such as iroh's DNS lookup. Its docs
+  show how to use it with blew's new accessors. Don't call it on Tauri 2.12 or
+  later: tao publishes `ndk_context` there itself, and a second publish aborts
+  the app.
+
 ## [0.6.1] — 2026-11-03
 
 0.5.1 was published by mistake with the same contents as 0.6.1 and has
