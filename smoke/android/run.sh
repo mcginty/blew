@@ -34,6 +34,12 @@ crashed() {
     adb logcat -d -b crash | grep -q 'blew\.smoke'
 }
 
+# A panic on a Tokio worker kills only its task, so the process can outlive
+# one; the marker is the only sign of it.
+failed() {
+    adb logcat -d -s blew-smoke:V | grep -qE 'BLEW_SMOKE_(FAIL|PANIC)'
+}
+
 launch() {
     local apk
     apk=$(find gen/android/app/build/outputs/apk -name '*.apk' | head -1)
@@ -47,10 +53,9 @@ launch() {
     adb logcat -b crash -c || true
     adb shell am start -W -n "$package/.MainActivity"
 
-    local verdict="" log deadline=$((SECONDS + timeout_secs))
+    local verdict="" deadline=$((SECONDS + timeout_secs))
     while ((SECONDS < deadline)); do
-        log=$(adb logcat -d -s blew-smoke:V)
-        if grep -qE 'BLEW_SMOKE_(FAIL|PANIC)' <<<"$log"; then
+        if failed; then
             verdict=fail
             break
         fi
@@ -58,17 +63,19 @@ launch() {
             verdict=crash
             break
         fi
-        if grep -q BLEW_SMOKE_OK <<<"$log"; then
+        if adb logcat -d -s blew-smoke:V | grep -q BLEW_SMOKE_OK; then
             verdict=ok
             break
         fi
         sleep 2
     done
 
-    # A crash shortly after the verdict still counts.
+    # A failure shortly after the verdict still counts.
     if [[ "$verdict" == ok ]]; then
         sleep 5
-        if crashed || [[ -z "$(adb shell pidof "$package" || true)" ]]; then
+        if failed; then
+            verdict=fail
+        elif crashed || [[ -z "$(adb shell pidof "$package" || true)" ]]; then
             verdict=crash
         fi
     fi
