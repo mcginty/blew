@@ -25,6 +25,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   BLEW_SMOKE_LATEST: ${{ (github.event_name == 'schedule' || inputs.latest) && '1' || '0' }}
+  EMULATOR_API_LEVEL: 35
+  EMULATOR_TARGET: google_apis
+  EMULATOR_ARCH: x86_64
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -47,21 +50,34 @@ jobs:
         with:
           # See ci.yml: the default 'tools' package no longer exists.
           packages: platform-tools
+      # run.sh picks the newest NDK under $ANDROID_HOME/ndk.
       - name: Build the smoke APK
-        env:
-          NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
         run: mise run ci:android-smoke build x86_64
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+      # The emulator action downloads the system image on every run, and a
+      # corrupt download once failed the job before the app ever launched.
+      # sdkmanager skips a package that is already installed, so a hit skips
+      # the download. actions/cache saves only after a successful job, so a bad
+      # image can't be cached.
+      # Resolved in the shell: the runner's ANDROID_HOME is not in the `env`
+      # context.
+      - name: Locate the emulator system image
+        run: echo "SYSTEM_IMAGE_DIR=$ANDROID_HOME/system-images/android-$EMULATOR_API_LEVEL/$EMULATOR_TARGET/$EMULATOR_ARCH" >> "$GITHUB_ENV"
+      - name: Cache the emulator system image
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SYSTEM_IMAGE_DIR }}
+          key: system-image-${{ env.EMULATOR_API_LEVEL }}-${{ env.EMULATOR_TARGET }}-${{ env.EMULATOR_ARCH }}
       - name: Launch on emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 35
-          arch: x86_64
-          target: google_apis
+          api-level: ${{ env.EMULATOR_API_LEVEL }}
+          arch: ${{ env.EMULATOR_ARCH }}
+          target: ${{ env.EMULATOR_TARGET }}
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
           script: smoke/android/run.sh launch x86_64
