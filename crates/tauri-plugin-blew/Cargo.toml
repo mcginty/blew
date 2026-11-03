@@ -18,7 +18,7 @@ tauri = "2"
 tracing = "0.1"
 
 [target.'cfg(target_os = "android")'.dependencies]
-blew = { path = "../blew", version = "0.5.1-beta.8" }
+blew = { path = "../blew", version = "0.5.1" }
 jni = "0.22"
 # Only for the deprecated `install_android_context_once`.
 ndk-context = "0.1"
