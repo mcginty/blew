@@ -151,7 +151,6 @@ dependencies = [
  "dispatch2",
  "futures-core",
  "jni 0.22.4",
- "ndk-context",
  "objc2",
  "objc2-core-bluetooth",
  "objc2-core-foundation",
