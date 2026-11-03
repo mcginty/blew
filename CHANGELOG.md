@@ -5,39 +5,44 @@ All notable changes to `blew` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-11-03
+
+0.5.1 was published by mistake with the same contents as 0.6.1 and has
+been yanked.
+
+### Changed
+
+- **Breaking (Android): `init_jvm` takes a `Context`, and blew no longer uses
+  `ndk-context`.** ([#56](https://github.com/mcginty/blew/issues/56))
+  `init_jvm(vm)` became `init_jvm(env, &context) -> jni::errors::Result<()>`,
+  called from a Kotlin `external fun` that passes a `Context`. The new
+  `blew::platform::android::JContext` type is that parameter. blew used to read
+  the JVM and the application context from `ndk_context`, which tao 0.37
+  (Tauri 2.12) publishes and earlier versions don't. A second publish aborts
+  the process, so either choice broke one range of Tauri versions. blew now
+  keeps its own global reference to the application context. A failure is
+  returned rather than panicking. The documented bare-Android setup, which
+  called `init_jvm` from `JNI_OnLoad`, panicked because nothing had published
+  `ndk_context`; it now uses an `external fun` called from `onCreate`. See the
+  upgrade guide below.
+
+- **tauri-plugin-blew: works on every Tauri 2.x again.** `BlewPlugin`'s
+  constructor hands blew the application context over JNI. Tauri runs it
+  inside `register_android_plugin`, which blocks until it returns, so blew is
+  still initialized before plugin `setup` finishes and an app's own setup hook
+  can construct a `Central`. The plugin no longer reads `ndk_context`, so the
+  `tauri >= 2.12` requirement is gone and the dependency is back to
+  `tauri = "2"`. Checked by building the plugin for Android against Tauri
+  2.0.0, 2.0.6, 2.11.5 and 2.12.4.
+
+- **tauri-plugin-blew: `install_android_context_once()` is deprecated.**
+  Neither blew nor the plugin reads `ndk_context` any more. On Tauri 2.12 and
+  later, calling it aborts the app if an activity later starts in the same
+  process, because tao publishes `ndk_context` itself.
+
+## [0.6.0] — 2026-11-02
+
 ### Added
-
-- **L2CAP channel encryption is configurable via `L2capConfig::encryption`.**
-  ([#19](https://github.com/mcginty/blew/issues/19)) Every backend used to
-  hardcode the weakest setting — `publishL2CAPChannelWithEncryption(false)` on
-  Apple, `listenUsingInsecureL2capChannel()` / `createInsecureL2capChannel()` on
-  Android, `BT_SECURITY_LOW` on Linux — with no way to ask for anything else.
-  The new `L2capEncryption` enum (`Insecure`, `RequireEncryption`,
-  `RequireAuthentication`) is read from `CentralConfig::l2cap` when opening a
-  channel and from `PeripheralConfig::l2cap` when publishing a listener. The
-  default stays `Insecure`, so nothing changes unless you set it.
-
-  Platforms are far coarser than the enum, so a backend picks the nearest level
-  it can express that is never *weaker* than what was requested, and returns the
-  new `BlewError::L2capEncryptionUnsupported` when no such level exists rather
-  than quietly handing back a less protected channel. Concretely: Linux maps the
-  three levels onto `BT_SECURITY_LOW` / `MEDIUM` / `HIGH` exactly; Android has
-  only insecure-vs-secure, so `RequireEncryption` gets the secure socket too
-  (stronger than asked); Apple's peripheral role takes a single boolean and so
-  refuses `RequireAuthentication`; and CoreBluetooth's `openL2CAPChannel:` has
-  no security argument at all, so the Apple central role refuses anything but
-  `Insecure`.
-
-- **Android: `Peripheral::adapter_name` and `Peripheral::set_adapter_name`.**
-  blew leaves the rename `LocalName::AllowPermanent` makes in place, and
-  restoring the previous name is the application's call — but from Rust there
-  was no way to read the adapter's name before advertising, or to write it
-  back afterwards. These Android-only methods do both. `set_adapter_name`
-  returns once the new name has taken effect, and fails if the stack refuses
-  it or it hasn't landed within a second. One rename waits at a time: while
-  one is waiting, a second `set_adapter_name` or a named `start_advertising`
-  fails immediately instead of queueing. The `testing` mock mirrors both, and advertising under
-  `AllowPermanent` renames its adapter as Android does.
 
 - **Android: `request_enable_bluetooth()` asks the user to turn Bluetooth on.**
   Available as `tauri_plugin_blew::request_enable_bluetooth()` and
@@ -69,34 +74,6 @@ All notable changes to `blew` are documented here. Format follows
   app. Only call it where no activity ever will start.
 
 ### Changed
-
-- **Breaking (Android): `init_jvm` takes a `Context`, and blew no longer uses
-  `ndk-context`.** ([#56](https://github.com/mcginty/blew/issues/56))
-  `init_jvm(vm)` became `init_jvm(env, &context) -> jni::errors::Result<()>`,
-  called from a Kotlin `external fun` that passes a `Context`. The new
-  `blew::platform::android::JContext` type is that parameter. blew used to read
-  the JVM and the application context from `ndk_context`, which tao 0.37
-  (Tauri 2.12) publishes and earlier versions don't. A second publish aborts
-  the process, so either choice broke one range of Tauri versions. blew now
-  keeps its own global reference to the application context. A failure is
-  returned rather than panicking. The documented bare-Android setup, which
-  called `init_jvm` from `JNI_OnLoad`, panicked because nothing had published
-  `ndk_context`; it now uses an `external fun` called from `onCreate`. See the
-  upgrade guide below.
-
-- **tauri-plugin-blew: works on every Tauri 2.x again.** `BlewPlugin`'s
-  constructor hands blew the application context over JNI. Tauri runs it
-  inside `register_android_plugin`, which blocks until it returns, so blew is
-  still initialized before plugin `setup` finishes and an app's own setup hook
-  can construct a `Central`. The plugin no longer reads `ndk_context`, so the
-  `tauri >= 2.12` requirement is gone and the dependency is back to
-  `tauri = "2"`. Checked by building the plugin for Android against Tauri
-  2.0.0, 2.0.6, 2.11.5 and 2.12.4.
-
-- **tauri-plugin-blew: `install_android_context_once()` is deprecated.**
-  Neither blew nor the plugin reads `ndk_context` any more. On Tauri 2.12 and
-  later, calling it aborts the app if an activity later starts in the same
-  process, because tao publishes `ndk_context` itself.
 
 - **Breaking: public enums are `#[non_exhaustive]`.** `CentralEvent`,
   `PeripheralStateEvent`, `PeripheralRequest`, `DisconnectCause`, `Delivery`,
@@ -143,42 +120,6 @@ All notable changes to `blew` are documented here. Format follows
   ERROR_GATT_WRITE_REQUEST_BUSY (201)` rather than `kick returned false`).
   Callbacks that arrive after their operation timed out, and results nobody on
   the Rust side is waiting for, are logged at debug and dropped.
-
-- **`AdvertisingConfig::local_name` is now a `LocalName`, defaulting to no
-  name.** ([#29](https://github.com/mcginty/blew/issues/29),
-  [#21](https://github.com/mcginty/blew/pull/21)) Every advertisement used to
-  carry a name. On Android that meant renaming the device's Bluetooth adapter —
-  `AdvertiseData` can only include the adapter's own name — which is
-  device-global and persistent: it is the name the car, the headphones and every
-  pairing dialog show. On every backend the name also competed with a 128-bit
-  service UUID for the 31-byte legacy advertisement.
-
-  `LocalName` makes the choice explicit, by how long the name may last:
-  `None` (the default) advertises no name; `Temporary(name)` advertises one
-  only inside the advertisement; `AllowPermanent(name)` also permits renaming
-  the device where that is the only mechanism. Apple and Linux treat the two
-  naming variants identically. Android refuses `Temporary` with the new
-  `BlewError::LocalNameUnsupported` rather than quietly advertising no name,
-  so the device-wide rename can't be reached without asking for it by name.
-  The rename is left in place: blew doesn't restore the previous name, which
-  can't be done reliably from inside one app, so that is up to the
-  application. 0.4.0-beta.5 and beta.6 had an interim `Option<String>` here,
-  where `Some` renamed the Android adapter.
-- **`Peripheral::notify_characteristic` returns a `Delivery` instead of `()`.**
-  ([#9](https://github.com/mcginty/blew/issues/9)) `Ok(())` meant something
-  different on every backend — queued on Apple, handed to BlueZ on Linux, and on
-  Android accepted by the stack without waiting for `onNotificationSent` — and
-  there was no way to learn that a central had confirmed an indication.
-  `Delivery::Confirmed` means the central's ATT layer acknowledged the value,
-  `Delivery::Sent` means the platform took it with no acknowledgement, and
-  `Delivery::NoSubscriber` means nothing was sent because the central isn't
-  subscribed, which stays a success. Android now resolves only once
-  `onNotificationSent` reports, so an indication to a central that subscribed
-  for indications returns `Confirmed` once the central confirms it, and fails
-  if the central disconnects or doesn't confirm within the ATT transaction
-  timeout, rather than reporting success. Linux and Apple can only ever report
-  `Sent`: CoreBluetooth has no indication confirmation, and BlueZ's D-Bus API
-  reports a confirmed indication and a timed-out one the same way.
 
 - **Android: the Gradle module follows the Tauri 2.12 plugin template.** It
   sets the JVM target through `kotlin { compilerOptions { … } }` instead of
@@ -238,6 +179,7 @@ All notable changes to `blew` are documented here. Format follows
   never ended it, so writes waited for a stream event or the 1 s backstop.
   The reactor now owns a permanent `CFRunLoopSource` that keeps the run loop
   able to sleep, and a wake signals it, which ends the wait.
+
 - **Apple: writes without response wait for CoreBluetooth to have room,
   instead of being dropped.** The central sent every no-response write at
   once and returned `Ok`. When `canSendWriteWithoutResponse` is false,
@@ -247,6 +189,7 @@ All notable changes to `blew` are documented here. Format follows
   when the queue is full. It fails with `BlewError::Gatt` if no room comes
   within 5 s, and with `NotConnected` if the peripheral disconnects meanwhile, even if
   it has reconnected by the time the write would go out.
+
 - **Android: writes without response no longer fail the next GATT operation,
   and their failures reach the caller.**
   ([#52](https://github.com/mcginty/blew/issues/52)) Android holds a
@@ -301,6 +244,7 @@ All notable changes to `blew` are documented here. Format follows
   `AlreadyAdvertising`, where before the second call silently displaced the
   first. A service's characteristics are used for notifications only once
   CoreBluetooth confirms it.
+
 - **Linux: advertising again after a Bluetooth power cycle works, and re-adding
   a service no longer serves it twice.**
   ([#46](https://github.com/mcginty/blew/issues/46)) Powering the adapter off
@@ -322,6 +266,7 @@ All notable changes to `blew` are documented here. Format follows
   and once more per cycle. This holds whether or not the adapter cycled. The
   queue itself survives a power-off, so an application that doesn't re-add
   gets the same services back on its next `start_advertising`.
+
 - **Android: turning Bluetooth off and on no longer leaves the peripheral
   holding a dead GATT server.**
   ([#44](https://github.com/mcginty/blew/issues/44)) Nothing dropped the
@@ -355,6 +300,84 @@ All notable changes to `blew` are documented here. Format follows
   answered by the earlier one's callback — reported as registered on a
   callback that said nothing about it — while its own answer was dropped. blew
   now refuses it until the outstanding callback lands or the adapter cycles.
+
+## [0.5.0] — 2026-09-19
+
+### Added
+
+- **L2CAP channel encryption is configurable via `L2capConfig::encryption`.**
+  ([#19](https://github.com/mcginty/blew/issues/19)) Every backend used to
+  hardcode the weakest setting — `publishL2CAPChannelWithEncryption(false)` on
+  Apple, `listenUsingInsecureL2capChannel()` / `createInsecureL2capChannel()` on
+  Android, `BT_SECURITY_LOW` on Linux — with no way to ask for anything else.
+  The new `L2capEncryption` enum (`Insecure`, `RequireEncryption`,
+  `RequireAuthentication`) is read from `CentralConfig::l2cap` when opening a
+  channel and from `PeripheralConfig::l2cap` when publishing a listener. The
+  default stays `Insecure`, so nothing changes unless you set it.
+
+  Platforms are far coarser than the enum, so a backend picks the nearest level
+  it can express that is never *weaker* than what was requested, and returns the
+  new `BlewError::L2capEncryptionUnsupported` when no such level exists rather
+  than quietly handing back a less protected channel. Concretely: Linux maps the
+  three levels onto `BT_SECURITY_LOW` / `MEDIUM` / `HIGH` exactly; Android has
+  only insecure-vs-secure, so `RequireEncryption` gets the secure socket too
+  (stronger than asked); Apple's peripheral role takes a single boolean and so
+  refuses `RequireAuthentication`; and CoreBluetooth's `openL2CAPChannel:` has
+  no security argument at all, so the Apple central role refuses anything but
+  `Insecure`.
+
+- **Android: `Peripheral::adapter_name` and `Peripheral::set_adapter_name`.**
+  blew leaves the rename `LocalName::AllowPermanent` makes in place, and
+  restoring the previous name is the application's call — but from Rust there
+  was no way to read the adapter's name before advertising, or to write it
+  back afterwards. These Android-only methods do both. `set_adapter_name`
+  returns once the new name has taken effect, and fails if the stack refuses
+  it or it hasn't landed within a second. One rename waits at a time: while
+  one is waiting, a second `set_adapter_name` or a named `start_advertising`
+  fails immediately instead of queueing. The `testing` mock mirrors both, and advertising under
+  `AllowPermanent` renames its adapter as Android does.
+
+### Changed
+
+- **`AdvertisingConfig::local_name` is now a `LocalName`, defaulting to no
+  name.** ([#29](https://github.com/mcginty/blew/issues/29),
+  [#21](https://github.com/mcginty/blew/pull/21)) Every advertisement used to
+  carry a name. On Android that meant renaming the device's Bluetooth adapter —
+  `AdvertiseData` can only include the adapter's own name — which is
+  device-global and persistent: it is the name the car, the headphones and every
+  pairing dialog show. On every backend the name also competed with a 128-bit
+  service UUID for the 31-byte legacy advertisement.
+
+  `LocalName` makes the choice explicit, by how long the name may last:
+  `None` (the default) advertises no name; `Temporary(name)` advertises one
+  only inside the advertisement; `AllowPermanent(name)` also permits renaming
+  the device where that is the only mechanism. Apple and Linux treat the two
+  naming variants identically. Android refuses `Temporary` with the new
+  `BlewError::LocalNameUnsupported` rather than quietly advertising no name,
+  so the device-wide rename can't be reached without asking for it by name.
+  The rename is left in place: blew doesn't restore the previous name, which
+  can't be done reliably from inside one app, so that is up to the
+  application. 0.4.0-beta.5 and beta.6 had an interim `Option<String>` here,
+  where `Some` renamed the Android adapter.
+
+- **`Peripheral::notify_characteristic` returns a `Delivery` instead of `()`.**
+  ([#9](https://github.com/mcginty/blew/issues/9)) `Ok(())` meant something
+  different on every backend — queued on Apple, handed to BlueZ on Linux, and on
+  Android accepted by the stack without waiting for `onNotificationSent` — and
+  there was no way to learn that a central had confirmed an indication.
+  `Delivery::Confirmed` means the central's ATT layer acknowledged the value,
+  `Delivery::Sent` means the platform took it with no acknowledgement, and
+  `Delivery::NoSubscriber` means nothing was sent because the central isn't
+  subscribed, which stays a success. Android now resolves only once
+  `onNotificationSent` reports, so an indication to a central that subscribed
+  for indications returns `Confirmed` once the central confirms it, and fails
+  if the central disconnects or doesn't confirm within the ATT transaction
+  timeout, rather than reporting success. Linux and Apple can only ever report
+  `Sent`: CoreBluetooth has no indication confirmation, and BlueZ's D-Bus API
+  reports a confirmed indication and a timed-out one the same way.
+
+### Fixed
+
 - **Linux: an indication to a central that walked away no longer stalls sends
   for 35 s.** ([#41](https://github.com/mcginty/blew/issues/41)) A bonded
   central keeps its subscription when it disconnects, and BlueZ drops values
@@ -369,6 +392,7 @@ All notable changes to `blew` are documented here. Format follows
   BlueZ doesn't say which centrals subscribed to a characteristic. Nothing else
   changes: the call still returns `Sent`, and the wait still says nothing about
   delivery.
+
 - **Android: a central that subscribes for indications now gets indications.**
   ([#18](https://github.com/mcginty/blew/issues/18)) The peripheral reduced
   the central's CCCD write to "subscribed or not" and then sent every
@@ -379,6 +403,7 @@ All notable changes to `blew` are documented here. Format follows
   central that enables both gets notifications. A central that rewrites its
   CCCD while a send is waiting its turn gets the kind it asked for last. There
   is no API change.
+
 - **Linux: a characteristic that declares `INDICATE` can be subscribed to.**
   ([#18](https://github.com/mcginty/blew/issues/18)) The peripheral registered
   a characteristic with BlueZ as notify-only whenever it declared `NOTIFY`, and
@@ -395,6 +420,7 @@ All notable changes to `blew` are documented here. Format follows
   error. A concurrent send on the same characteristic also no longer forgets a
   subscriber whose session another send is holding, which a slow indication
   made easy to hit.
+
 - **Android: notifying a busy device no longer fails after a few seconds, and
   a refused notification is no longer retried as busy.** Kotlin serialized sends
   per device with a semaphore released by `onNotificationSent`, and Rust polled
@@ -409,6 +435,7 @@ All notable changes to `blew` are documented here. Format follows
   error, but the gate stays held, so a send can never overlap one still in the
   stack or be completed by an earlier send's late callback. A device whose
   callback never arrives fails later sends with a timeout until it disconnects.
+
 - **Android: a named advertisement no longer goes out under the previous
   name.** ([#21](https://github.com/mcginty/blew/pull/21), reported by
   @Resilum-owner) The adapter applies a rename asynchronously, but the scan
@@ -422,6 +449,7 @@ All notable changes to `blew` are documented here. Format follows
   taken effect within a second, `start_advertising` fails instead of
   advertising the previous name. A stop that lands during the wait cancels
   the start, so it can't begin an advertisement nothing is left to stop.
+
 - **Linux: a discovered device's name, UUIDs, manufacturer data and service
   data are no longer read too early.** BlueZ announces a device the moment its
   first advertisement lands and fills the rest of the properties as later
@@ -432,6 +460,7 @@ All notable changes to `blew` are documented here. Format follows
   `DeviceDiscovered` when the advertised payload changes. RSSI updates the
   snapshot without an event, since it moves with every packet and says nothing
   new about the peer.
+
 - **Linux: restarting a scan works, and no longer inherits the previous
   scan's service filter.** Two problems on the same path. The discovery filter
   was only sent when `ScanFilter` named at least one service, but bluer caches
@@ -444,6 +473,7 @@ All notable changes to `blew` are documented here. Format follows
   reconfiguring, which previously made a filtered `start_scan` → `start_scan`
   fail outright. `stop_scan` waits for the same teardown, so a `stop_scan` →
   `start_scan` sequence cannot race it.
+
 - **Android: connection ownership now spans the entire GATT lifecycle.**
   Each attempt owns its callback, client, operation queue, pending nonces and
   MTU. Callback effects and retirement are serialized, and generations qualify
