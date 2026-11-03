@@ -1,9 +1,9 @@
 name: Android smoke
 
 # Launches a real Tauri app with tauri-plugin-blew on an emulator. Catches what
-# only an activity start exercises: the ndk_context publish/read-back order
-# between tao and the plugin (#56), init_jvm's classloader lookups, and the
-# Kotlin managers' init.
+# only an activity start exercises: the plugin taking the app Context from
+# Kotlin alongside tao's own ndk_context publish (#56), init_jvm's classloader
+# lookups, and the Kotlin managers' init.
 #
 # PRs and pushes build from smoke/android/Cargo.lock. The nightly run updates
 # to the newest tauri/tao/wry first, since #56 came from a tao release that a

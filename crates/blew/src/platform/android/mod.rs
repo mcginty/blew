@@ -5,7 +5,7 @@ pub(crate) mod l2cap_state;
 pub mod peripheral;
 
 pub use central::AndroidCentral;
-pub use jni_globals::{init_jvm, is_initialized};
+pub use jni_globals::{JContext, init_jvm, is_initialized};
 pub use peripheral::AndroidPeripheral;
 
 /// Check whether the app is running on an Android emulator.
@@ -145,15 +145,13 @@ pub fn request_enable_bluetooth() {
 fn load_plugin_class<'local>(
     env: &mut jni::Env<'local>,
 ) -> Result<jni::objects::JClass<'local>, jni::errors::Error> {
-    use jni::objects::{JObject, JValue};
+    use jni::objects::JValue;
     use jni::{jni_sig, jni_str};
     // Only the classloader is needed here; the Activity any dialog is shown on
     // is `BlewPlugin`'s own, on the Kotlin side.
-    let context =
-        unsafe { JObject::from_raw(env, ndk_context::android_context().context().cast()) };
     let class_loader = env
         .call_method(
-            &context,
+            jni_globals::app_context(),
             jni_str!("getClassLoader"),
             jni_sig!("()Ljava/lang/ClassLoader;"),
             &[],

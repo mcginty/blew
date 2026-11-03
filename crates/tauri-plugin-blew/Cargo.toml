@@ -14,11 +14,12 @@ categories = ["hardware-support", "network-programming"]
 tauri-plugin = { version = "2", features = ["build"] }
 
 [dependencies]
-tauri = "2.12"
+tauri = "2"
 tracing = "0.1"
 
 [target.'cfg(target_os = "android")'.dependencies]
 blew = { path = "../blew", version = "0.5.1-beta.8" }
 jni = "0.22"
+# Only for the deprecated `install_android_context_once`.
 ndk-context = "0.1"
 tokio = { version = "1", features = ["sync"] }

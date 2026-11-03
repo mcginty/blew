@@ -33,7 +33,7 @@ functionality.
 |----------|---------|---------|------------|-------|
 | macOS / iOS | CoreBluetooth (via `objc2`) | Yes | Yes | Yes |
 | Linux | BlueZ (via `bluer`) | Yes | Yes | Yes |
-| Android | JNI + Kotlin (via `jni` and `ndk-context`) | Yes | Yes | Yes |
+| Android | JNI + Kotlin (via `jni`) | Yes | Yes | Yes |
 
 ## Examples
 

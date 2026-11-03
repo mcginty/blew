@@ -156,6 +156,12 @@ class BlewPlugin(
             }
     }
 
+    // Tauri constructs the plugin inside `register_android_plugin`, which
+    // blocks until this returns, so blew is ready by the end of plugin setup.
+    init {
+        BlewPluginNative.init(activity.applicationContext)
+    }
+
     override fun load(webView: WebView) {
         super.load(webView)
 
@@ -193,6 +199,8 @@ class BlewPlugin(
 }
 
 internal object BlewPluginNative {
+    @JvmStatic external fun init(context: Context)
+
     @JvmStatic external fun autoRequestPermissionsEnabled(): Boolean
 
     @JvmStatic external fun onPermissionsChanged(granted: Boolean)

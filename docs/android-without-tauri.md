@@ -7,18 +7,22 @@ This is the minimal path.
 
 ## 1. Vendor the Kotlin runtime
 
-The crate ships four Kotlin files at
-`crates/blew/android/src/main/java/org/jakebot/blew/`. Copy them into your
-Android app's source tree under the **same package** (`org.jakebot.blew`) —
-the JNI hooks look up classes by that fully-qualified name:
+The crate ships its Kotlin at
+`crates/blew/android/src/main/java/org/jakebot/blew/`. Copy every file there
+except `BlewPlugin.kt` (it's Tauri-specific) into your Android app's source
+tree under the **same package** (`org.jakebot.blew`) — the JNI hooks look up
+classes by that fully-qualified name:
 
+- `AdapterRename.kt`
 - `BleCentralManager.kt`
 - `BlePeripheralManager.kt`
+- `GattConnections.kt`
 - `GattOperationQueue.kt`
+- `GattServerHost.kt`
 - `L2capSocketManager.kt`
+- `Subscription.kt`
 
-(Skip `BlewPlugin.kt` — it's Tauri-specific.) These classes are pure
-Android + `kotlinx.coroutines`, no Tauri dependency. Add
+These classes are pure Android + `kotlinx.coroutines`, no Tauri dependency. Add
 `implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:<current>")`
 to your app's `build.gradle` if it isn't already there.
 
@@ -29,34 +33,49 @@ Copy the `<uses-permission>` and `<uses-feature>` entries from
 `AndroidManifest.xml` (the manifest-merger will combine them if you make the
 vendored Kotlin its own Gradle library module).
 
-## 3. Initialize the JVM reference from Rust
+## 3. Hand blew the JVM and a Context
 
-Add a `JNI_OnLoad` entry point to your crate's `src/lib.rs`:
+`init_jvm` needs an Android `Context`, which `JNI_OnLoad` doesn't have, so call
+it from a Kotlin `external fun` instead. Declare one anywhere in your app:
+
+```kotlin
+package com.example.app
+
+import android.content.Context
+
+object BlewBootstrap {
+    @JvmStatic external fun init(context: Context)
+}
+```
+
+and implement it in your crate's `src/lib.rs`:
 
 ```rust
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
-pub extern "system" fn JNI_OnLoad(
-    vm: jni::JavaVM,
-    _reserved: *mut std::ffi::c_void,
-) -> jni::sys::jint {
-    blew::platform::android::init_jvm(vm);
-    jni::sys::JNI_VERSION_1_6
+pub extern "system" fn Java_com_example_app_BlewBootstrap_init<'local>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    context: blew::platform::android::JContext<'local>,
+) {
+    env.with_env(|env| blew::platform::android::init_jvm(env, &context))
+        .resolve::<jni::errors::ThrowRuntimeExAndDefault>();
 }
 ```
 
-`init_jvm` caches global refs to the two manager classes using the activity's
-classloader (system classloaders on Rust threads can't see APK classes).
-Call it exactly once.
+`init_jvm` keeps the application context, caches global refs to the two
+manager classes through its classloader (the system classloader on Rust
+threads can't see APK classes), and hands the Kotlin managers their Context.
+A failure is thrown back to Kotlin as a `RuntimeException`. Calling it again is
+a no-op.
 
-## 4. Initialize the Kotlin managers and request permissions
+## 4. Initialize and request permissions
 
-In your `Activity.onCreate` (or `Application.onCreate`):
+In your `Application.onCreate` (or `Activity.onCreate`):
 
 ```kotlin
-System.loadLibrary("your_app")         // triggers Rust JNI_OnLoad
-BleCentralManager.init(applicationContext)
-BlePeripheralManager.init(applicationContext)
+System.loadLibrary("your_app")
+BlewBootstrap.init(applicationContext)
 
 // Then trigger runtime permission requests via ActivityCompat.requestPermissions
 // for BLUETOOTH_SCAN / CONNECT / ADVERTISE (API 31+) and ACCESS_FINE_LOCATION
@@ -77,4 +96,4 @@ if !are_ble_permissions_granted() { /* ask the user */ }
 Use [`cargo-ndk`](https://github.com/bbqsrc/cargo-ndk) (or equivalent) to build
 the `.so` for each ABI you ship and drop the outputs in
 `app/src/main/jniLibs/<abi>/`. `System.loadLibrary("your_app")` from step 4
-then loads the shared library and fires `JNI_OnLoad`.
+then loads it.

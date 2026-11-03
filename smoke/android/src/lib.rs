@@ -1,9 +1,9 @@
 //! Android launch smoke test for `tauri-plugin-blew`.
 //!
-//! The failures this catches happen while a real activity starts: tao
-//! publishes `ndk_context` in `onCreate`, the plugin's `setup` reads it back,
-//! and `init_jvm` loads the Kotlin managers through the application's
-//! classloader. None of that runs outside an app on a device, so CI installs
+//! The failures this catches happen while a real activity starts:
+//! `BlewPlugin`'s constructor hands Rust the application Context while
+//! `register_android_plugin` runs, and `init_jvm` loads the Kotlin managers
+//! through its classloader, alongside whatever tao does in `onCreate` (#56). None of that runs outside an app on a device, so CI installs
 //! this on an emulator and reads the verdict from logcat: `BLEW_SMOKE_OK`, or
 //! `BLEW_SMOKE_FAIL` with the reason. A crash prints neither.
 
@@ -55,7 +55,7 @@ async fn smoke() -> Result<String, String> {
         return Err("BLE permissions not granted (install with `adb install -g`)".into());
     }
     // From a Tokio worker, not the main thread: the JNI calls here only find
-    // the Kotlin classes through what init_jvm cached from ndk_context.
+    // the Kotlin classes through the classloader init_jvm cached.
     let central: Central = Central::new()
         .await
         .map_err(|e| format!("Central::new: {e}"))?;
